@@ -3,33 +3,17 @@
 # Point SLOPSMITH_DIR at your slopsmith checkout (default: ../slopsmith).
 # `make dev` brings up slopsmith with this plugin mounted via a compose overlay;
 # edits to screen.js are live on the next page load.
-#
-# Put your per-machine settings (DLC_PATH, SLOPSMITH_PORT, SLOPSMITH_DIR) in
-# a .env file next to this Makefile. It's gitignored and auto-loaded by both
-# Make and Docker Compose, so `make dev` works without inline env vars.
-# See .env.example for the full list.
-
-# Load .env if present and export every variable it defines to the child
-# processes Make spawns (compose needs them visible in its env, not just Make's).
--include .env
-export
 
 SLOPSMITH_DIR  ?= $(abspath ../slopsmith)
 SLOPSMITH_PORT ?= 8000
 PLUGIN_DIR     := $(abspath .)
 OVERLAY        := $(PLUGIN_DIR)/docker-compose.slopsmith.yml
+# PLUGIN_DIR is exported so the overlay's ${PLUGIN_DIR} resolves to this repo.
+# Compose resolves relative volume paths from the first -f file's dir, not
+# the overlay's, which is why an absolute path is required.
+export PLUGIN_DIR
+export SLOPSMITH_PORT
 COMPOSE        := docker compose -f $(SLOPSMITH_DIR)/docker-compose.yml -f $(OVERLAY)
-
-# PipeWire software monitor — routes your instrument input to speakers so you
-# hear yourself while practicing. Hardware direct-monitor on your audio
-# interface (if you have one) is always better; this is the zero-hardware fix.
-#
-# Picks a Rocksmith adapter automatically if present; override MONITOR_SRC to
-# target something else (e.g. your USB audio interface's capture node).
-MONITOR_SRC         ?= $(shell pactl list short sources 2>/dev/null | awk '/Rocksmith/ {print $$2; exit}')
-MONITOR_SINK        ?= $(shell pactl get-default-sink 2>/dev/null)
-MONITOR_LATENCY_MS  ?= 50
-MONITOR_ID_FILE     := /tmp/slopsmith-monitor.id
 
 .DEFAULT_GOAL := help
 
@@ -85,45 +69,3 @@ shell: check-slopsmith ## Open a shell in the running slopsmith container
 verify-mount: check-slopsmith ## Confirm the plugin is visible inside the container
 	@$(COMPOSE) exec web ls -la /opt/user-plugins/note_detect 2>&1 | head -10 \
 	    || echo "container not running — try 'make dev' first"
-
-.PHONY: monitor-on
-monitor-on: ## Route instrument input to speakers via PipeWire loopback ($(MONITOR_LATENCY_MS)ms)
-	@command -v pactl >/dev/null 2>&1 || { echo "error: pactl not found (install pulseaudio-utils)"; exit 1; }
-	@test -n "$(MONITOR_SRC)"  || { echo "error: no Rocksmith adapter detected. Set MONITOR_SRC=<source-name> (see: pactl list short sources)"; exit 1; }
-	@test -n "$(MONITOR_SINK)" || { echo "error: could not determine default sink"; exit 1; }
-	@if [ -f $(MONITOR_ID_FILE) ]; then \
-	    echo "monitor already running (module $$(cat $(MONITOR_ID_FILE))). run 'make monitor-off' first."; \
-	    exit 1; \
-	fi
-	@id=$$(pactl load-module module-loopback source=$(MONITOR_SRC) sink=$(MONITOR_SINK) latency_msec=$(MONITOR_LATENCY_MS)); \
-	    echo $$id > $(MONITOR_ID_FILE); \
-	    echo "loopback up (module $$id)"; \
-	    echo "  source:  $(MONITOR_SRC)"; \
-	    echo "  sink:    $(MONITOR_SINK)"; \
-	    echo "  latency: $(MONITOR_LATENCY_MS)ms"; \
-	    echo "tear down: make monitor-off"
-
-.PHONY: monitor-off
-monitor-off: ## Tear down the monitor loopback
-	@if [ ! -f $(MONITOR_ID_FILE) ]; then echo "no monitor running"; exit 0; fi
-	@id=$$(cat $(MONITOR_ID_FILE)); \
-	    pactl unload-module $$id 2>/dev/null \
-	        && echo "unloaded module $$id" \
-	        || echo "module $$id was already gone (removing stale id file)"; \
-	    rm -f $(MONITOR_ID_FILE)
-
-.PHONY: monitor-status
-monitor-status: ## Show current monitor state and detected audio devices
-	@if [ -f $(MONITOR_ID_FILE) ]; then \
-	    echo "monitor active: module $$(cat $(MONITOR_ID_FILE))"; \
-	else \
-	    echo "monitor not active"; \
-	fi
-	@echo
-	@echo "Detected instrument input (MONITOR_SRC):"
-	@echo "  $(MONITOR_SRC)"
-	@echo "Default output sink (MONITOR_SINK):"
-	@echo "  $(MONITOR_SINK)"
-	@echo
-	@echo "All input sources:"
-	@pactl list short sources 2>/dev/null | grep -v '\.monitor' || true
