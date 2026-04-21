@@ -2280,9 +2280,15 @@ function _ndMatchNotes() {
         const hit = Math.abs(closestDt) <= tolerance * 1000 && Math.abs(centsErr) <= centsTolerance;
         _ndEventLog.push({ dtMs: closestDt, centsErr, hit, time: t });
         if (_ndEventLog.length > _ND_EVENT_WINDOW) _ndEventLog.shift();
-        // If calibrating and this was a hit (or close-enough by timing), sample it.
-        if (_ndCalibrating && Math.abs(centsErr) <= centsTolerance) {
+        // Calibration: use ANY detection event for timing samples. Filtering
+        // by pitch tolerance here was the reason the counter hung at 0/15 —
+        // if YIN is mistracking pitch, the detection timing is still valid
+        // (player played at their target moment; YIN just got the note wrong),
+        // so it's a useful timing sample for latency calibration.
+        if (_ndCalibrating) {
             _ndCalibrationSamples.push(closestDt);
+            const btn = document.getElementById('nd-calibrate-btn');
+            if (btn) btn.textContent = `Calibrating… ${_ndCalibrationSamples.length} / ${_ND_CAL_TARGET}`;
             if (_ndCalibrationSamples.length >= _ND_CAL_TARGET) {
                 _ndFinishCalibration();
             }
