@@ -2794,12 +2794,15 @@ highway.addDrawHook(function(ctx, W, H) {
             ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
             ctx.stroke();
             ctx.restore();
-        } else if (result === 'miss') {
+        } else if (result === 'miss' || result === 'pitch_miss' || result === 'timing_miss') {
+            // pitch_miss: slightly brighter red (detection happened, pitch off)
+            // timing_miss: dimmer red (nothing fired at all)
+            const colour = result === 'timing_miss' ? '#aa2233' : '#ff3344';
             ctx.save();
             ctx.globalAlpha = fade * 0.5;
-            ctx.shadowColor = '#ff3344';
+            ctx.shadowColor = colour;
             ctx.shadowBlur = 12 * p.scale;
-            ctx.strokeStyle = '#ff3344';
+            ctx.strokeStyle = colour;
             ctx.lineWidth = 2 * p.scale;
             const sz = 8 * p.scale;
             ctx.beginPath();
