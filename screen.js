@@ -2129,6 +2129,12 @@ async function _ndProcessFrame(buffer) {
     _ndDetectedMidi = _ndFreqToMidi(result.freq);
     _ndDetectedConfidence = result.confidence;
 
+    // If the Calibration Wizard is armed on the mic step, this detection is
+    // the response to the on-screen flash — record the sample and unarm.
+    // Routed before scoring so the wizard capture isn't affected by chart
+    // matching logic.
+    if (typeof _ndWizOnDetection === 'function') _ndWizOnDetection();
+
     // _ndMatchNotes walks the chart candidates and assigns
     // _ndDetectedString/_ndDetectedFret via _ndResolveDisplayFingering
     // (chart-aware, with geometric fallback).
@@ -2381,6 +2387,257 @@ function _ndApplyCalibration(ms) {
     _ndEventLog = []; // reset rolling window to re-measure cleanly
 }
 
+// ── Calibration Wizard ────────────────────────────────────────────────────
+// Isolated per-variable calibration, as opposed to the playback-based
+// Calibrate button which measures the whole pipeline at once.
+//
+// Step 1 — mic input latency: flash the screen at a known time, wait for the
+// next detection event. Delta = user visual reaction + mic input lag.
+// Subtract an assumed visual-reaction baseline; remainder is mic lag.
+//
+// Step 2 — audio output latency: play a click via Web Audio API at a known
+// time, wait for the user to press SPACE. Delta = user audio reaction + audio
+// output lag. Subtract assumed audio-reaction baseline; remainder is output
+// lag. Writes to slopsmith core's av_offset_ms setting.
+//
+// Reaction-time baselines are fixed approximations for a first cut. A future
+// step-0 could measure the user's actual reaction baseline (flash → keypress,
+// no instrument needed) and use that for subtraction instead.
+const _ND_WIZ_SAMPLES_TARGET = 5;
+const _ND_WIZ_VISUAL_REACTION_MS = 200;  // flash → play-a-note motor response
+const _ND_WIZ_AUDIO_REACTION_MS  = 180;  // hear-a-click → keypress motor response
+let _ndWizState = 'closed';   // 'closed' | 'intro' | 'mic' | 'audio' | 'review'
+let _ndWizArmed = null;       // 'mic' | 'audio' — currently waiting for response
+let _ndWizArmTime = 0;        // performance.now() when stimulus fired
+let _ndWizMicSamples = [];
+let _ndWizAudioSamples = [];
+let _ndWizAudioCtx = null;    // lazy-created for the click playback
+
+function _ndOpenWizard() {
+    _ndWizState = 'intro';
+    _ndWizMicSamples = [];
+    _ndWizAudioSamples = [];
+    _ndWizRender();
+}
+
+function _ndCloseWizard() {
+    _ndWizState = 'closed';
+    _ndWizArmed = null;
+    const m = document.getElementById('nd-wizard-modal');
+    if (m) m.remove();
+}
+
+function _ndWizRender() {
+    let modal = document.getElementById('nd-wizard-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'nd-wizard-modal';
+        modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+        document.body.appendChild(modal);
+    }
+
+    const median = (arr) => {
+        if (!arr.length) return 0;
+        const s = arr.slice().sort((a, b) => a - b);
+        return s[Math.floor(s.length / 2)];
+    };
+
+    const micRaw = median(_ndWizMicSamples);
+    const audioRaw = median(_ndWizAudioSamples);
+    const micLat = Math.max(0, Math.round(micRaw - _ND_WIZ_VISUAL_REACTION_MS));
+    const audioLat = Math.max(0, Math.round(audioRaw - _ND_WIZ_AUDIO_REACTION_MS));
+
+    const wrap = (inner) => `
+        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl text-gray-200">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold">Calibration Wizard</h3>
+                <button onclick="_ndCloseWizard()" class="text-gray-400 hover:text-white">✕</button>
+            </div>
+            ${inner}
+        </div>`;
+
+    if (_ndWizState === 'intro') {
+        modal.innerHTML = wrap(`
+            <p class="text-sm text-gray-300 mb-3">Two short steps, each measures one thing:</p>
+            <ol class="text-sm text-gray-400 mb-4 space-y-1 list-decimal list-inside">
+                <li><strong class="text-gray-200">Mic input latency</strong> — the screen flashes, you play a note. Measures how long from you plucking to the plugin seeing it.</li>
+                <li><strong class="text-gray-200">Audio output latency</strong> — the plugin clicks, you press SPACE when you hear it. Measures how long from audio being "played" to reaching your ears.</li>
+            </ol>
+            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Reaction time is subtracted with a fixed baseline (200 ms visual, 180 ms audio). Your actual reaction varies ~±50 ms, so treat the final numbers as a starting point — fine-tune with the <code>[</code> / <code>]</code> keys or the sliders.</p>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel</button>
+                <button onclick="_ndWizNext()" class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white">Start</button>
+            </div>
+        `);
+    } else if (_ndWizState === 'mic') {
+        const n = _ndWizMicSamples.length;
+        const armed = _ndWizArmed === 'mic';
+        modal.innerHTML = wrap(`
+            <p class="text-sm text-gray-400 mb-2">Step 1 of 2 — <strong class="text-gray-200">Mic input latency</strong></p>
+            <div id="nd-wiz-flash" class="rounded-xl border-2 border-gray-700 h-32 flex items-center justify-center mb-3 transition-colors duration-75">
+                <span class="text-gray-400 text-sm">
+                    ${armed ? 'Get ready…' : (n >= _ND_WIZ_SAMPLES_TARGET ? 'Done.' : `When it flashes GREEN, play any note immediately.`)}
+                </span>
+            </div>
+            <div class="text-xs text-gray-500 mb-3">
+                Samples: ${n} / ${_ND_WIZ_SAMPLES_TARGET}
+                ${n >= 2 ? `· raw median ${Math.round(micRaw)} ms · minus ${_ND_WIZ_VISUAL_REACTION_MS} ms reaction ≈ <strong class="text-gray-300">${micLat} ms</strong> mic lat` : ''}
+            </div>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndWizArmMic()" ${armed || n >= _ND_WIZ_SAMPLES_TARGET ? 'disabled' : ''} class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 disabled:opacity-50">${n === 0 ? 'Start' : 'Again'}</button>
+                <button onclick="_ndWizNext()" ${n < 3 ? 'disabled' : ''} class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white disabled:opacity-50">Next (${n} / ${_ND_WIZ_SAMPLES_TARGET})</button>
+            </div>
+        `);
+    } else if (_ndWizState === 'audio') {
+        const n = _ndWizAudioSamples.length;
+        const armed = _ndWizArmed === 'audio';
+        modal.innerHTML = wrap(`
+            <p class="text-sm text-gray-400 mb-2">Step 2 of 2 — <strong class="text-gray-200">Audio output latency</strong></p>
+            <div class="rounded-xl border-2 border-gray-700 h-32 flex items-center justify-center mb-3">
+                <span class="text-gray-400 text-sm text-center px-4">
+                    ${armed ? 'Listening… press SPACE when you hear the click.' : (n >= _ND_WIZ_SAMPLES_TARGET ? 'Done.' : 'A click will play. Press SPACE as soon as you hear it.')}
+                </span>
+            </div>
+            <div class="text-xs text-gray-500 mb-3">
+                Samples: ${n} / ${_ND_WIZ_SAMPLES_TARGET}
+                ${n >= 2 ? `· raw median ${Math.round(audioRaw)} ms · minus ${_ND_WIZ_AUDIO_REACTION_MS} ms reaction ≈ <strong class="text-gray-300">${audioLat} ms</strong> audio lag` : ''}
+            </div>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndWizArmAudio()" ${armed || n >= _ND_WIZ_SAMPLES_TARGET ? 'disabled' : ''} class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 disabled:opacity-50">${n === 0 ? 'Start' : 'Again'}</button>
+                <button onclick="_ndWizNext()" ${n < 3 ? 'disabled' : ''} class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white disabled:opacity-50">Review</button>
+            </div>
+        `);
+    } else if (_ndWizState === 'review') {
+        modal.innerHTML = wrap(`
+            <p class="text-sm text-gray-400 mb-3">Measured:</p>
+            <div class="bg-dark-800 rounded-xl p-3 mb-4 space-y-2">
+                <div class="flex justify-between text-sm">
+                    <span class="text-gray-400">Mic input lag → plugin <code>_ndLatencyOffset</code></span>
+                    <strong class="text-gray-200">${micLat} ms</strong>
+                </div>
+                <div class="flex justify-between text-sm">
+                    <span class="text-gray-400">Audio output lag → core <code>av_offset_ms</code></span>
+                    <strong class="text-gray-200">${audioLat} ms</strong>
+                </div>
+            </div>
+            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Apply writes both values. You can still fine-tune with <code>[</code> / <code>]</code> on the player or the sliders in Settings.</p>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
+                <button onclick="_ndWizApply(${micLat}, ${audioLat})" class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white">Apply both</button>
+            </div>
+        `);
+    }
+}
+
+function _ndWizNext() {
+    if (_ndWizState === 'intro') _ndWizState = 'mic';
+    else if (_ndWizState === 'mic') _ndWizState = 'audio';
+    else if (_ndWizState === 'audio') _ndWizState = 'review';
+    _ndWizRender();
+}
+
+function _ndWizArmMic() {
+    _ndWizArmed = 'mic';
+    _ndWizRender();
+    const delay = 1500 + Math.random() * 2000;
+    setTimeout(() => {
+        if (_ndWizArmed !== 'mic') return;
+        _ndWizArmTime = performance.now();
+        const flash = document.getElementById('nd-wiz-flash');
+        if (flash) {
+            flash.style.borderColor = '#00ff88';
+            flash.style.backgroundColor = 'rgba(0,255,136,0.3)';
+            setTimeout(() => {
+                if (flash) { flash.style.borderColor = ''; flash.style.backgroundColor = ''; }
+            }, 200);
+        }
+    }, delay);
+}
+
+function _ndWizArmAudio() {
+    _ndWizArmed = 'audio';
+    _ndWizRender();
+    const delay = 1500 + Math.random() * 2000;
+    setTimeout(() => {
+        if (_ndWizArmed !== 'audio') return;
+        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const ctx = _ndWizAudioCtx;
+        // Short sharp click: 1 kHz sine with a fast envelope
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.frequency.value = 1000;
+        osc.type = 'square';
+        gain.gain.value = 0;
+        osc.connect(gain).connect(ctx.destination);
+        const now = ctx.currentTime;
+        gain.gain.setValueAtTime(0, now);
+        gain.gain.linearRampToValueAtTime(0.3, now + 0.002);
+        gain.gain.linearRampToValueAtTime(0, now + 0.08);
+        osc.start(now);
+        osc.stop(now + 0.1);
+        _ndWizArmTime = performance.now();
+    }, delay);
+}
+
+// Hook into detection events for mic step (non-invasive — checks _ndWizArmed
+// at the frame-processed call site; if armed for 'mic' and we just got any
+// detection, record the sample).
+function _ndWizOnDetection() {
+    if (_ndWizArmed !== 'mic') return;
+    const dt = performance.now() - _ndWizArmTime;
+    // Guard against spurious detections firing before the flash (e.g. user
+    // warming up). Require dt > 50 ms to avoid false zeroes.
+    if (dt < 50) return;
+    _ndWizMicSamples.push(dt);
+    _ndWizArmed = null;
+    _ndWizRender();
+}
+
+function _ndWizOnSpace() {
+    if (_ndWizArmed !== 'audio') return;
+    const dt = performance.now() - _ndWizArmTime;
+    if (dt < 50) return;
+    _ndWizAudioSamples.push(dt);
+    _ndWizArmed = null;
+    _ndWizRender();
+}
+
+async function _ndWizApply(micLatMs, audioLatMs) {
+    // Write mic lat to plugin latency offset
+    _ndLatencyOffset = Math.max(0, Math.min(1, micLatMs / 1000));
+    _ndSaveSettings();
+    const sl = document.querySelector('#nd-settings-panel input[type=range]');
+    const lbl = document.getElementById('nd-latency-val');
+    if (sl) sl.value = micLatMs;
+    if (lbl) lbl.textContent = micLatMs;
+
+    // Write audio output lag to slopsmith core A/V sync offset
+    try {
+        await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ av_offset_ms: audioLatMs }),
+        });
+        // Reflect in the core's HUD/slider if the core exposes setAvOffsetMs
+        if (typeof setAvOffsetMs === 'function') setAvOffsetMs(audioLatMs);
+    } catch (e) {
+        console.warn('Failed to save A/V offset:', e);
+    }
+
+    _ndResetScoring();
+    _ndCloseWizard();
+}
+
+// Global keydown shim for the wizard's SPACE capture. Player shortcuts
+// already steal SPACE for togglePlay; we intercept only when wizard is armed.
+document.addEventListener('keydown', (e) => {
+    if (_ndWizArmed === 'audio' && e.code === 'Space') {
+        e.preventDefault();
+        e.stopPropagation();
+        _ndWizOnSpace();
+    }
+}, true);
+
 // Mark missed notes that have passed the timing window
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
@@ -2554,9 +2811,13 @@ function _ndShowSettings() {
         <input type="range" min="0" max="1000" value="${Math.round(_ndLatencyOffset * 1000)}"
                class="w-full accent-green-400 mb-2"
                oninput="_ndLatencyOffset=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
-        <div class="flex items-center gap-2 mb-2">
+        <div class="flex items-center gap-2 mb-2 flex-wrap">
+            <button onclick="_ndOpenWizard()"
+                class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs text-white font-semibold"
+                title="Step-by-step wizard that measures mic input lag and audio output lag as two separate, isolated quantities">Calibration Wizard</button>
             <button id="nd-calibrate-btn" onclick="_ndStartCalibration()"
-                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300">Calibrate</button>
+                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300"
+                title="Older one-shot calibration based on drift during normal playback (kept for reference).">Calibrate from playback</button>
             <button onclick="_ndResetScoring()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300"
                 title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
