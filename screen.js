@@ -2308,7 +2308,16 @@ function _ndMatchNotes() {
         // Record best pitch attempt seen for this note — used by _ndCheckMisses
         // to split "wrong pitch" from "no detection" when the window expires.
         const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
-        const detectedCents = (_ndDetectedMidi - expectedMidi) * 100;
+        const rawCents = (_ndDetectedMidi - expectedMidi) * 100;
+        // Octave-up harmonic tolerance: bass pickups often attenuate the
+        // fundamental so YIN locks on the 2nd harmonic, reporting the note an
+        // octave high. When the raw detection doesn't match but halving it
+        // does (i.e. the halved MIDI equals expected), credit the chart note.
+        // Chart-context-aware: only applies when the halving *explains* a
+        // match, so we don't silently conflate different octaves in passages
+        // where the player genuinely plays the octave up.
+        const octCents = (_ndDetectedMidi - 12 - expectedMidi) * 100;
+        const detectedCents = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
         const prev = _ndNotePitchAttempts.get(key);
         if (prev === undefined || Math.abs(detectedCents) < Math.abs(prev)) {
             _ndNotePitchAttempts.set(key, detectedCents);
@@ -2987,7 +2996,9 @@ function _ndUpdateHUD() {
 
     if (detectedEl) {
         if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
-            const names = ['E2','A2','D3','G3','B3','E4'];
+            const names = _ndCurrentArrangement === 'bass'
+                ? ['E1','A1','D2','G2','','']
+                : ['E2','A2','D3','G3','B3','E4'];
             detectedEl.textContent = `${names[_ndDetectedString] || '?'} fret ${_ndDetectedFret}`;
         } else {
             detectedEl.textContent = '';
