@@ -2415,15 +2415,21 @@ function _ndWizStartRun(mode) {
 function _ndWizFireBeat(isCountIn, mode) {
     const now = performance.now();
 
-    // Visual pulse (both modes get the flash so the user has something to
-    // look at; audio run also emits a click).
+    // Visual pulse (both modes get the flash so the user always has a visual
+    // reference; audio run also emits a click). Extended ~180 ms so the eye
+    // can register it even at 75 BPM.
     const el = document.getElementById('nd-wiz-metro-flash');
     if (el) {
-        el.style.backgroundColor = isCountIn ? '#444' : '#00ff88';
-        el.style.boxShadow = isCountIn ? 'none' : '0 0 24px #00ff88';
+        const color = isCountIn ? '#666' : '#00ff88';
+        el.style.backgroundColor = color;
+        el.style.boxShadow = isCountIn ? 'none' : '0 0 32px #00ff88';
         setTimeout(() => {
-            if (el) { el.style.backgroundColor = '#1a1a1a'; el.style.boxShadow = 'none'; }
-        }, 90);
+            // Guard against the run being cancelled mid-fade
+            if (document.getElementById('nd-wiz-metro-flash') === el) {
+                el.style.backgroundColor = '#1a1a1a';
+                el.style.boxShadow = 'none';
+            }
+        }, 180);
     }
 
     if (mode === 'audio') {
@@ -2443,7 +2449,15 @@ function _ndWizFireBeat(isCountIn, mode) {
     }
 
     if (!isCountIn) _ndWizBeats.push(now);
-    _ndWizRender();
+
+    // Update ONLY the counter — don't re-render the modal, that would
+    // replace the flash element while its fade-off timer is still running
+    // (which is why the flash was previously invisible).
+    const counter = document.getElementById('nd-wiz-counter');
+    if (counter) {
+        const beatsExpected = _ND_METRO_BEATS_TOTAL - _ND_METRO_COUNTIN;
+        counter.textContent = `${_ndWizBeats.length} / ${beatsExpected}`;
+    }
 }
 
 function _ndWizFinishRun(mode) {
@@ -2558,10 +2572,10 @@ function _ndWizRender() {
     } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
         const mode = _ndWizStep.slice('running-'.length);
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-4">${mode === 'visual' ? 'Play on each GREEN pulse. (No audio click.)' : 'Play on each click.'}</p>
-            <div id="nd-wiz-metro-flash" class="rounded-xl h-32 mb-3 transition-all duration-75" style="background-color:#1a1a1a;"></div>
+            <p class="text-sm text-gray-300 mb-4">${mode === 'visual' ? 'Play on each GREEN pulse. (No audio click.)' : 'Play on each click. The box also flashes green.'}</p>
+            <div id="nd-wiz-metro-flash" class="rounded-xl h-32 mb-3 transition-all duration-150 border-2 border-gray-800" style="background-color:#1a1a1a;"></div>
             <div class="text-center text-lg font-mono text-gray-300 mb-3">
-                ${beatsDone} / ${beatsExpected}
+                <span id="nd-wiz-counter">${beatsDone} / ${beatsExpected}</span>
             </div>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndWizCancelTimers();_ndWizStep='intro';_ndWizRender()"
