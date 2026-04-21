@@ -76,7 +76,17 @@ test('5-string low B (31 Hz) with moderate noise (amp 0.3) stays within ±50 cen
     assert.ok(err < CENT_TOLERANCE, `low-B drift ${err.toFixed(1)} cents exceeds ${CENT_TOLERANCE}`);
 });
 
-// The former test.todo about recovering a suppressed-fundamental 41 Hz
-// signal "beyond vanilla YIN" is now exercised by `hps.test.js` — HPS
-// is a user-selectable method for exactly this rig profile. Cepstrum
-// was scoped out for this PR; tracked in #16.
+test('bass with missing fundamental + noise returns a detection (non-silent) — documents silent-miss failure mode', () => {
+    // "Missing fundamental" approximates pickups that attenuate sub-100Hz content.
+    // Without the fundamental YIN often returns -1 (no detection) under noise,
+    // which maps to "miss" in the plugin with no diagnostic. TR's harmonic
+    // correction would infer the fundamental from higher harmonics.
+    const base = harmonicMix(41.2, [[2, 0.5], [3, 0.3], [4, 0.2]], SR, 4096 / SR);
+    const sig = withNoise(base, 0.4, 99);
+    const r = core.yinDetect(sig, SR);
+    assert.ok(
+        r.freq > 0,
+        `missing-fundamental bass returned freq=${r.freq} (silent miss). ` +
+        `A bass-aware detector would infer ~41.2 Hz from the harmonic stack.`
+    );
+});
