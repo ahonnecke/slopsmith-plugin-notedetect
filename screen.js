@@ -194,12 +194,25 @@ const _ndInstances = _ndShared.instances;
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
-// Plugin semver — keep in sync with package.json / plugin.json. Stamped
-// into every diagnostic export so a JSON blob can be tied back to the
-// exact build that produced it. The script tag has no `import`/`fetch`
-// hook to read package.json at load time, so this is the single
-// hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.10.0';
+// Rolling diagnostic stats — each entry is the closest-chart-note-match for a
+// detection event. Used for the HUD readout and calibration.
+//   dtMs:   plugin_now - chart_note_time (ms). Positive = detection late.
+//   centsErr: detected pitch - expected pitch, in cents.
+//   hit:    whether it was within both tolerances (pass for scoring).
+const _ND_EVENT_WINDOW = 30;
+let _ndEventLog = [];
+// Calibration: when armed, we accumulate ONLY hit dtMs values and after N
+// samples propose an _ndLatencyOffset adjustment.
+let _ndCalibrating = false;
+let _ndCalibrationSamples = [];
+const _ND_CAL_TARGET = 15;
+
+// Note tracking
+let _ndNoteResults = new Map(); // key -> 'hit'|'miss'
+let _ndDetectedMidi = -1;
+let _ndDetectedConfidence = 0;
+let _ndDetectedString = -1;
+let _ndDetectedFret = -1;
 
 // Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets.
 // Guitar: 6 strings, low E2 to high E4. Bass: 4 strings, low E1 to high G2
@@ -2237,7 +2250,34 @@ function _ndMatchNotes() {
     _ndDetectedString = disp.string;
     _ndDetectedFret = disp.fret;
 
-    // Check each candidate
+    // Diagnostic: find the closest-in-time candidate and record how far off
+    // detection was (timing + pitch). Even if the note doesn't pass tolerance,
+    // the readout shows why so the user can calibrate.
+    let closest = null;
+    let closestDt = Infinity;
+    for (const cn of candidateNotes) {
+        const dt = (t - cn.t) * 1000; // ms; positive = detection is late
+        if (Math.abs(dt) < Math.abs(closestDt)) {
+            closest = cn;
+            closestDt = dt;
+        }
+    }
+    if (closest) {
+        const expectedMidi = _ndMidiFromStringFret(closest.s, closest.f);
+        const centsErr = (_ndDetectedMidi - expectedMidi) * 100;
+        const hit = Math.abs(closestDt) <= tolerance * 1000 && Math.abs(centsErr) <= centsTolerance;
+        _ndEventLog.push({ dtMs: closestDt, centsErr, hit, time: t });
+        if (_ndEventLog.length > _ND_EVENT_WINDOW) _ndEventLog.shift();
+        // If calibrating and this was a hit (or close-enough by timing), sample it.
+        if (_ndCalibrating && Math.abs(centsErr) <= centsTolerance) {
+            _ndCalibrationSamples.push(closestDt);
+            if (_ndCalibrationSamples.length >= _ND_CAL_TARGET) {
+                _ndFinishCalibration();
+            }
+        }
+    }
+
+    // Check each candidate (all-against-all match, as before)
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
         if (_ndNoteResults.has(key)) continue; // already judged
@@ -2253,6 +2293,67 @@ function _ndMatchNotes() {
             _ndUpdateSectionStat('hit');
         }
     }
+}
+
+// Aggregate stats over the rolling event log. Returns null if not enough data.
+function _ndStats() {
+    if (_ndEventLog.length < 3) return null;
+    const dts = _ndEventLog.map(e => e.dtMs);
+    const cs = _ndEventLog.map(e => e.centsErr);
+    const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+    const std = (a, m) => Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / a.length);
+    const dtMean = mean(dts);
+    const cMean = mean(cs);
+    return {
+        dtMean, dtStd: std(dts, dtMean),
+        cMean, cStd: std(cs, cMean),
+        n: _ndEventLog.length,
+    };
+}
+
+// Calibration flow — arm stat collection, compute median drift, propose an
+// adjustment to _ndLatencyOffset.
+function _ndStartCalibration() {
+    _ndCalibrationSamples = [];
+    _ndCalibrating = true;
+    const btn = document.getElementById('nd-calibrate-btn');
+    const msg = document.getElementById('nd-calibrate-msg');
+    if (btn) { btn.textContent = `Calibrating… 0 / ${_ND_CAL_TARGET}`; btn.disabled = true; }
+    if (msg) msg.textContent = 'Play along with the song. The plugin will collect samples automatically.';
+}
+
+function _ndFinishCalibration() {
+    _ndCalibrating = false;
+    const samples = _ndCalibrationSamples.slice().sort((a, b) => a - b);
+    const medianMs = samples[Math.floor(samples.length / 2)];
+    // Median is the systematic offset between where the plugin thinks "now" is
+    // and the nearest chart note the player hit. _ndLatencyOffset shifts the
+    // comparison clock back by that amount; so to close the gap, add the
+    // median drift to the current offset.
+    const currentMs = Math.round(_ndLatencyOffset * 1000);
+    const proposedMs = Math.max(0, Math.min(1000, Math.round(currentMs + medianMs)));
+    const btn = document.getElementById('nd-calibrate-btn');
+    const msg = document.getElementById('nd-calibrate-msg');
+    if (btn) { btn.textContent = 'Calibrate'; btn.disabled = false; }
+    if (msg) {
+        msg.innerHTML = `Median drift: <strong>${medianMs >= 0 ? '+' : ''}${Math.round(medianMs)} ms</strong>. ` +
+            `Apply <strong>${currentMs}</strong> → <strong>${proposedMs}</strong> ms? ` +
+            `<button class="ml-1 px-2 py-0.5 bg-accent hover:bg-accent-light rounded text-white" onclick="_ndApplyCalibration(${proposedMs})">Apply</button>` +
+            `<button class="ml-1 px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-gray-300" onclick="document.getElementById('nd-calibrate-msg').textContent=''">Discard</button>`;
+    }
+}
+
+function _ndApplyCalibration(ms) {
+    _ndLatencyOffset = Math.max(0, Math.min(1, ms / 1000));
+    _ndSaveSettings();
+    // Reflect in the slider if the settings panel is open
+    const sl = document.querySelector('#nd-settings-panel input[type=range]');
+    const lbl = document.getElementById('nd-latency-val');
+    if (sl) sl.value = Math.round(_ndLatencyOffset * 1000);
+    if (lbl) lbl.textContent = Math.round(_ndLatencyOffset * 1000);
+    const msg = document.getElementById('nd-calibrate-msg');
+    if (msg) msg.textContent = `Applied. Audio Latency Offset is now ${ms} ms.`;
+    _ndEventLog = []; // reset rolling window to re-measure cleanly
 }
 
 // Mark missed notes that have passed the timing window
@@ -2358,7 +2459,224 @@ function _ndCheckMisses() {
             if (gen !== sessionGen || !enabled) {
                 stopAudio();
             }
-        });
+        }
+    }
+}
+
+function _ndUpdateSectionStat(type) {
+    if (!_ndCurrentSection) return;
+    let sec = _ndSectionStats.find(s => s.name === _ndCurrentSection);
+    if (!sec) {
+        sec = { name: _ndCurrentSection, hits: 0, misses: 0 };
+        _ndSectionStats.push(sec);
+    }
+    if (type === 'hit') sec.hits++;
+    else sec.misses++;
+}
+
+// ── Settings Panel ─────────────────────────────────────────────────────────
+
+function _ndShowSettings() {
+    let panel = document.getElementById('nd-settings-panel');
+    if (panel) { panel.remove(); return; }
+
+    const channelLabels = { mono: 'Mono (mix)', left: 'Left (Ch 1 — dry/DI)', right: 'Right (Ch 2 — wet)' };
+
+    panel = document.createElement('div');
+    panel.id = 'nd-settings-panel';
+    panel.className = 'fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl text-sm';
+    panel.innerHTML = `
+        <div class="flex justify-between items-center mb-3">
+            <span class="text-gray-200 font-semibold">Note Detection Settings</span>
+            <button onclick="document.getElementById('nd-settings-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+
+        <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
+        <select id="nd-device-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
+                onchange="_ndOnDeviceChange(this.value)">
+            <option value="">Default</option>
+        </select>
+
+        <label class="block text-gray-400 text-xs mb-1">Input Channel</label>
+        <select id="nd-channel-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
+                onchange="_ndOnChannelChange(this.value)">
+            <option value="mono" ${_ndSelectedChannel === 'mono' ? 'selected' : ''}>Mono (mix both channels)</option>
+            <option value="left" ${_ndSelectedChannel === 'left' ? 'selected' : ''}>Left (Ch 1) — typically dry/DI</option>
+            <option value="right" ${_ndSelectedChannel === 'right' ? 'selected' : ''}>Right (Ch 2) — typically wet/FX</option>
+        </select>
+
+        <label class="block text-gray-400 text-xs mb-1">Input Level</label>
+        <div class="relative h-3 bg-dark-600 rounded overflow-hidden mb-1">
+            <div id="nd-vu-bar" class="h-full rounded transition-all duration-75 bg-green-500" style="width:0%"></div>
+            <div id="nd-vu-peak" class="absolute top-0 w-0.5 h-full bg-white/70" style="left:0%"></div>
+        </div>
+        <div class="flex justify-between text-[9px] text-gray-600 mb-3">
+            <span>-inf</span><span>-18dB</span><span>-6dB</span><span>0dB</span>
+        </div>
+
+        <label class="block text-gray-400 text-xs mb-1">Detection Method</label>
+        <select id="nd-method-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-3"
+                onchange="_ndSetMethod(this.value)">
+            <option value="yin" ${_ndDetectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
+            <option value="crepe" ${_ndDetectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
+        </select>
+
+        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndLatencyOffset * 1000)}</span>ms</label>
+        <input type="range" min="0" max="1000" value="${Math.round(_ndLatencyOffset * 1000)}"
+               class="w-full accent-green-400 mb-2"
+               oninput="_ndLatencyOffset=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
+        <div class="flex items-center gap-2 mb-2">
+            <button id="nd-calibrate-btn" onclick="_ndStartCalibration()"
+                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300">Calibrate</button>
+            <div id="nd-calibrate-msg" class="text-[10px] text-gray-400 flex-1 leading-tight"></div>
+        </div>
+        <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+            Compensates for USB/audio interface delay. Calibrate plays along for ${_ND_CAL_TARGET} hits, then proposes a new value. The HUD Δt readout shows live drift between your detections and chart notes.
+        </div>
+
+        <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
+        <input type="range" min="30" max="300" value="${Math.round(_ndTimingTolerance * 1000)}"
+               class="w-full accent-green-400 mb-3"
+               oninput="_ndTimingTolerance=this.value/1000;document.getElementById('nd-timing-val').textContent=this.value;_ndSaveSettings()">
+
+        <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span id="nd-pitch-val">${_ndPitchTolerance}</span> cents</label>
+        <input type="range" min="10" max="100" value="${_ndPitchTolerance}"
+               class="w-full accent-green-400 mb-3"
+               oninput="_ndPitchTolerance=+this.value;document.getElementById('nd-pitch-val').textContent=this.value;_ndSaveSettings()">
+
+        <label class="block text-gray-400 text-xs mb-1">Input Gain: <span id="nd-gain-val">${_ndInputGain.toFixed(1)}</span>x</label>
+        <input type="range" min="1" max="50" value="${Math.round(_ndInputGain * 10)}"
+               class="w-full accent-green-400 mb-3"
+               oninput="_ndInputGain=this.value/10;document.getElementById('nd-gain-val').textContent=_ndInputGain.toFixed(1);_ndSaveSettings()">
+
+        <div class="text-[10px] text-gray-600 mt-1 leading-tight">
+            Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
+        </div>
+    `;
+
+    document.body.appendChild(panel);
+    _ndPopulateDevices();
+}
+
+function _ndOnDeviceChange(deviceId) {
+    _ndSelectedDeviceId = deviceId;
+    _ndSaveSettings();
+    _ndRestartAudio();
+}
+
+function _ndOnChannelChange(channel) {
+    _ndSelectedChannel = channel;
+    _ndSaveSettings();
+    _ndRestartAudio();
+}
+
+async function _ndPopulateDevices() {
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const sel = document.getElementById('nd-device-select');
+        if (!sel) return;
+        sel.innerHTML = '<option value="">Default</option>';
+        for (const d of devices) {
+            if (d.kind !== 'audioinput') continue;
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = d.label || `Input ${d.deviceId.slice(0, 8)}`;
+            if (d.deviceId === _ndSelectedDeviceId) opt.selected = true;
+            sel.appendChild(opt);
+        }
+    } catch (e) { /* permission not yet granted */ }
+}
+
+async function _ndRestartAudio() {
+    _ndStopAudio();
+    if (_ndEnabled) await _ndStartAudio();
+}
+
+function _ndSetMethod(method) {
+    _ndDetectionMethod = method;
+    _ndSaveSettings();
+    if (method === 'crepe') _ndLoadCrepe();
+}
+
+// ── Visual Feedback ────────────────────────────────────────────────────────
+// Uses a DOM overlay HUD (works with both 2D and 3D highway) plus
+// draw hook indicators on the 2D highway when project()/fretX() are available.
+
+let _ndHitFlash = 0;   // green flash alpha
+let _ndMissFlash = 0;  // red flash alpha
+let _ndLastHitCount = 0;
+let _ndLastMissCount = 0;
+
+// DOM HUD overlay — positioned over the player, works with any renderer
+function _ndCreateHUD() {
+    if (document.getElementById('nd-hud')) return;
+    const hud = document.createElement('div');
+    hud.id = 'nd-hud';
+    hud.className = 'absolute top-3 right-16 z-[20] pointer-events-none text-right';
+    // Append inside the player so it layers correctly (player is z-index:100 fixed)
+    const player = document.getElementById('player');
+    if (!player) return;
+    hud.innerHTML = `
+        <div id="nd-hud-accuracy" class="text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
+        <div id="nd-hud-streak" class="text-xs text-gray-400 mt-0.5"></div>
+        <div id="nd-hud-counts" class="text-[10px] text-gray-600 mt-0.5"></div>
+        <div id="nd-hud-detected" class="text-[10px] text-cyan-400 mt-1 font-mono"></div>
+        <div id="nd-hud-stats" class="text-[10px] text-gray-500 mt-1 font-mono"></div>
+    `;
+    player.appendChild(hud);
+}
+
+function _ndRemoveHUD() {
+    const hud = document.getElementById('nd-hud');
+    if (hud) hud.remove();
+    const flash = document.getElementById('nd-flash-overlay');
+    if (flash) flash.remove();
+}
+
+function _ndCreateFlashOverlay() {
+    if (document.getElementById('nd-flash-overlay')) return;
+    const player = document.getElementById('player');
+    if (!player) return;
+    const flash = document.createElement('div');
+    flash.id = 'nd-flash-overlay';
+    flash.style.cssText = 'position:absolute;inset:0;z-index:20;pointer-events:none;border:4px solid transparent;transition:border-color 0.05s;';
+    player.appendChild(flash);
+}
+
+// Update DOM HUD at 30fps (lighter than rAF)
+let _ndHudInterval = null;
+
+function _ndStartHUD() {
+    _ndCreateHUD();
+    _ndCreateFlashOverlay();
+    _ndLastHitCount = 0;
+    _ndLastMissCount = 0;
+    if (_ndHudInterval) clearInterval(_ndHudInterval);
+    _ndHudInterval = setInterval(_ndUpdateHUD, 33);
+}
+
+function _ndStopHUD() {
+    if (_ndHudInterval) { clearInterval(_ndHudInterval); _ndHudInterval = null; }
+    _ndRemoveHUD();
+}
+
+function _ndUpdateHUD() {
+    if (!_ndEnabled) return;
+
+    const total = _ndHits + _ndMisses;
+    const accEl = document.getElementById('nd-hud-accuracy');
+    const streakEl = document.getElementById('nd-hud-streak');
+    const countsEl = document.getElementById('nd-hud-counts');
+    const detectedEl = document.getElementById('nd-hud-detected');
+    const flashEl = document.getElementById('nd-flash-overlay');
+
+    if (accEl && total > 0) {
+        const accuracy = Math.round((_ndHits / total) * 100);
+        const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
+        accEl.textContent = accuracy + '%';
+        accEl.style.color = color;
+    } else if (accEl) {
+        accEl.textContent = '';
     }
 
     // ── Level meter ───────────────────────────────────────────────────
@@ -2373,6 +2691,26 @@ function _ndCheckMisses() {
             detectedEl.textContent = `${names[_ndDetectedString] || '?'} fret ${_ndDetectedFret}`;
         } else {
             detectedEl.textContent = '';
+        }
+    }
+
+    const statsEl = document.getElementById('nd-hud-stats');
+    if (statsEl) {
+        const s = _ndStats();
+        if (s) {
+            // Colour the timing line red if drift is outside the plugin's own
+            // timing tolerance, yellow if within but systematic, green if near
+            // zero. Gives one-glance feedback on whether calibration is needed.
+            const tolMs = _ndTimingTolerance * 1000;
+            const dtColor = Math.abs(s.dtMean) < 20 ? '#6edf8f'
+                          : Math.abs(s.dtMean) < tolMs ? '#ffcc00' : '#ff6b6b';
+            const dtSign = s.dtMean >= 0 ? '+' : '';
+            const cSign  = s.cMean  >= 0 ? '+' : '';
+            statsEl.innerHTML =
+                `<span style="color:${dtColor}">Δt ${dtSign}${Math.round(s.dtMean)} ±${Math.round(s.dtStd)} ms</span> ` +
+                `<span class="text-gray-500">· ${cSign}${Math.round(s.cMean)} ±${Math.round(s.cStd)} ¢ · n=${s.n}</span>`;
+        } else {
+            statsEl.textContent = '';
         }
     }
 
