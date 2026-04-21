@@ -2772,7 +2772,7 @@ function _ndShowSettings() {
                 title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
         </div>
         <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-            Compensates for USB/audio interface delay. Calibrate plays along for ${_ND_CAL_TARGET} hits, then proposes a new value. The HUD Δt readout shows live drift between your detections and chart notes.
+            Compensates for USB / audio interface delay. Use <strong>Calibration Wizard</strong> for objective measurement, or fine-tune by hand with the slider. The HUD Δt readout shows live drift while you play.
         </div>
 
         <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
@@ -3221,7 +3221,6 @@ function _ndResetScoring() {
     _ndDetectedString = -1;
     _ndDetectedFret = -1;
     _ndEventLog = [];
-    _ndCalibrationSamples = [];
     _ndNotePitchAttempts.clear();
 }
 
