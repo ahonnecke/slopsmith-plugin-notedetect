@@ -210,6 +210,7 @@ const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
 let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
 let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
+let _ndUnderBufferWarned = false;
 
 function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
@@ -2089,6 +2090,10 @@ async function _ndProcessFrame(buffer) {
     }
 
     if (result.freq <= 0 || result.confidence < 0.3) {
+        if (result.underBuffered && !_ndUnderBufferWarned) {
+            console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
+            _ndUnderBufferWarned = true;
+        }
         _ndDetectedMidi = -1;
         _ndDetectedConfidence = 0;
         _ndDetectedString = -1;
