@@ -2130,6 +2130,15 @@ async function _ndProcessFrame(buffer) {
     // matching logic.
     if (typeof _ndWizOnDetection === 'function') _ndWizOnDetection();
 
+    // If the tuner modal is open, route the detection through the tuner's
+    // string-assignment logic instead of chart matching. Tuner doesn't care
+    // about chart context — it only cares which open string this pitch is
+    // closest to, and by how many cents.
+    if (_ndTunerOpen) {
+        if (typeof _ndTunerOnDetection === 'function') _ndTunerOnDetection(result.freq);
+        return;
+    }
+
     // _ndMatchNotes walks the chart candidates and assigns
     // _ndDetectedString/_ndDetectedFret via _ndResolveDisplayFingering
     // (chart-aware, with geometric fallback).
@@ -2604,6 +2613,188 @@ function _ndWizRender() {
     }
 }
 
+// ── Tuner ──────────────────────────────────────────────────────────────────
+// Standalone per-string tuning mode. User plays each open string; plugin
+// assigns it to the nearest expected open-string pitch in the active
+// arrangement's tuning table and shows cents offset. Decoupled from chart
+// matching — only cares about pitch vs. expected open-string pitch.
+//
+// Lifecycle:
+//   _ndOpenTuner()  — starts audio if not already running (remembers prior
+//                     state so closing restores it), renders the modal,
+//                     kicks off a ~15fps display refresh interval.
+//   _ndCloseTuner() — tears all that down, restores detection's prior state.
+//
+// Detection feed:
+//   _ndTunerOnDetection(freq) is called from _ndProcessFrame whenever the
+//   tuner is open. We compute the nearest open-string fingering (via MIDI
+//   proximity, threshold 1.5 semitones so fretted notes are ignored) and
+//   record the latest reading for that string. Readings older than 1500 ms
+//   display as "silent" so the meter returns to rest when the player stops.
+
+const _ND_TUNER_WINDOW_MS  = 1500;        // reading is "stale" after this
+const _ND_TUNER_STRING_TOL = 1.5;         // semitones; outside → not an open string
+let _ndTunerOpen = false;
+let _ndTunerPriorEnabled = false;         // was detection on before we opened?
+let _ndTunerReadings = new Map();         // string idx -> {freq, cents, expectedHz, timestamp}
+let _ndTunerRefreshInterval = null;
+
+async function _ndOpenTuner() {
+    _ndTunerPriorEnabled = _ndEnabled;
+    _ndTunerReadings = new Map();
+    _ndTunerOpen = true;
+
+    // Make sure audio + YIN are running. If detection wasn't already on,
+    // start the audio pipeline but without scoring/HUD — tuner runs in a
+    // detection-only mode.
+    if (!_ndEnabled) {
+        const ok = await _ndStartAudio();
+        if (!ok) {
+            _ndTunerOpen = false;
+            return;
+        }
+        // Pull the current song's tuning info so the tuner's expected pitches
+        // reflect Drop D / Eb / etc. rather than always being Standard.
+        const info = highway.getSongInfo && highway.getSongInfo();
+        if (info && info.tuning) _ndTuningOffsets = info.tuning;
+        if (info && info.arrangement) _ndSetArrangement(info.arrangement);
+    }
+
+    _ndTunerRender();
+    if (_ndTunerRefreshInterval) clearInterval(_ndTunerRefreshInterval);
+    _ndTunerRefreshInterval = setInterval(_ndTunerUpdateReadings, 66); // ~15 fps
+}
+
+function _ndCloseTuner() {
+    _ndTunerOpen = false;
+    if (_ndTunerRefreshInterval) { clearInterval(_ndTunerRefreshInterval); _ndTunerRefreshInterval = null; }
+    const m = document.getElementById('nd-tuner-modal');
+    if (m) m.remove();
+    // Restore detection's prior state. If it wasn't on, shut audio down again.
+    if (!_ndTunerPriorEnabled && _ndAudioCtx) {
+        _ndStopAudio();
+    }
+}
+
+function _ndTunerOnDetection(freq) {
+    if (freq <= 0) return;
+    const detectedMidi = _ndFreqToMidi(freq);
+    const base = _ndStandardMidiFor(_ndCurrentArrangement);
+    let bestS = -1, bestDist = Infinity;
+    for (let s = 0; s < base.length; s++) {
+        const openMidi = base[s] + (_ndTuningOffsets[s] || 0);
+        const dist = Math.abs(detectedMidi - openMidi);
+        if (dist < bestDist) { bestS = s; bestDist = dist; }
+    }
+    if (bestS < 0 || bestDist > _ND_TUNER_STRING_TOL) return;
+    const openMidi = base[bestS] + (_ndTuningOffsets[bestS] || 0);
+    const expectedHz = 440 * Math.pow(2, (openMidi - 69) / 12);
+    const cents = 1200 * Math.log2(freq / expectedHz);
+    _ndTunerReadings.set(bestS, {
+        freq, cents, expectedHz, timestamp: performance.now(),
+    });
+}
+
+function _ndTunerUpdateReadings() {
+    // Sweep the DOM rows to reflect current readings vs "silent" (stale).
+    const now = performance.now();
+    const base = _ndStandardMidiFor(_ndCurrentArrangement);
+    for (let s = 0; s < base.length; s++) {
+        const row = document.getElementById(`nd-tuner-row-${s}`);
+        if (!row) continue;
+        const reading = _ndTunerReadings.get(s);
+        const fresh = reading && (now - reading.timestamp) < _ND_TUNER_WINDOW_MS;
+
+        const freqEl = row.querySelector('[data-field=freq]');
+        const centsEl = row.querySelector('[data-field=cents]');
+        const meterFill = row.querySelector('[data-field=meter-fill]');
+        const statusEl = row.querySelector('[data-field=status]');
+
+        if (!fresh) {
+            if (freqEl) freqEl.textContent = '—';
+            if (centsEl) { centsEl.textContent = ''; centsEl.style.color = '#888'; }
+            if (meterFill) meterFill.style.transform = 'translateX(-50%) scaleX(0)';
+            if (statusEl) statusEl.textContent = '';
+            continue;
+        }
+        if (freqEl) freqEl.textContent = `${reading.freq.toFixed(2)} Hz`;
+        if (centsEl) {
+            const sign = reading.cents >= 0 ? '+' : '';
+            centsEl.textContent = `${sign}${Math.round(reading.cents)}¢`;
+            const absC = Math.abs(reading.cents);
+            centsEl.style.color = absC < 5 ? '#00ff88' : absC < 20 ? '#ffcc00' : '#ff6b6b';
+        }
+        if (meterFill) {
+            // Meter range ±50¢. Half-width bar moves from left (flat) to right (sharp).
+            const clamped = Math.max(-50, Math.min(50, reading.cents));
+            const frac = clamped / 50; // -1 to 1
+            meterFill.style.transform = `translateX(${frac * 50}%) scaleX(${Math.max(0.05, Math.abs(frac))})`;
+            meterFill.style.backgroundColor = Math.abs(reading.cents) < 5 ? '#00ff88'
+                : Math.abs(reading.cents) < 20 ? '#ffcc00' : '#ff6b6b';
+        }
+        if (statusEl) statusEl.textContent = Math.abs(reading.cents) < 5 ? '✓' : '';
+    }
+}
+
+function _ndTunerRender() {
+    let modal = document.getElementById('nd-tuner-modal');
+    if (!_ndTunerOpen) { if (modal) modal.remove(); return; }
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'nd-tuner-modal';
+        modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+        document.body.appendChild(modal);
+    }
+
+    const base = _ndStandardMidiFor(_ndCurrentArrangement);
+    const noteNames = _ndCurrentArrangement === 'bass'
+        ? ['E1', 'A1', 'D2', 'G2', '', '']
+        : ['E2', 'A2', 'D3', 'G3', 'B3', 'E4'];
+
+    // Build expected-pitch label for each string including any tuning offsets
+    const rows = base.map((openStd, s) => {
+        const openMidi = openStd + (_ndTuningOffsets[s] || 0);
+        const expectedHz = 440 * Math.pow(2, (openMidi - 69) / 12);
+        const label = noteNames[s] || '';
+        const offsetTag = (_ndTuningOffsets[s] || 0) !== 0 ? ` (${_ndTuningOffsets[s] > 0 ? '+' : ''}${_ndTuningOffsets[s]}st)` : '';
+        return `
+            <div id="nd-tuner-row-${s}" class="grid grid-cols-12 gap-2 items-center py-1.5 border-b border-gray-800 last:border-0 text-xs">
+                <div class="col-span-2 font-mono text-gray-200 font-semibold">${label}${offsetTag}</div>
+                <div class="col-span-2 text-[10px] text-gray-500 font-mono">${expectedHz.toFixed(1)} Hz</div>
+                <div class="col-span-5 relative h-3 bg-dark-800 rounded overflow-hidden">
+                    <div class="absolute top-0 bottom-0 left-1/2 w-[1px] bg-gray-500"></div>
+                    <div data-field="meter-fill" class="absolute top-0 bottom-0 left-1/2 w-1/2 origin-left transition-all duration-75"
+                         style="transform:translateX(-50%) scaleX(0);background-color:#888;"></div>
+                </div>
+                <div class="col-span-2 font-mono text-right" data-field="cents"></div>
+                <div class="col-span-1 text-right" data-field="status"></div>
+                <div class="col-span-12 text-[10px] text-gray-600 font-mono -mt-0.5" data-field="freq">—</div>
+            </div>`;
+    }).join('');
+
+    const arrLabel = _ndCurrentArrangement === 'bass' ? 'Bass (4-string)' : 'Guitar (6-string)';
+    const nonStandard = _ndTuningOffsets.some(o => o !== 0);
+    const tuningNote = nonStandard
+        ? `<p class="text-[11px] text-yellow-500 mb-3 leading-tight">This song expects non-standard tuning (offsets: ${_ndTuningOffsets.slice(0, base.length).join(', ')} semitones). Tune each string to the Hz value above.</p>`
+        : `<p class="text-[11px] text-gray-500 mb-3 leading-tight">Standard tuning.</p>`;
+
+    modal.innerHTML = `
+        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 max-w-lg w-full mx-4 shadow-2xl text-gray-200">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-lg font-bold">Tuner · ${arrLabel}</h3>
+                <button onclick="_ndCloseTuner()" class="text-gray-400 hover:text-white">✕</button>
+            </div>
+            ${tuningNote}
+            <div class="bg-dark-800 rounded-xl px-4 py-2">
+                ${rows}
+            </div>
+            <p class="text-[10px] text-gray-600 mt-3 leading-tight">Play each open string. Green = in tune (&lt;5¢). Yellow = close (&lt;20¢). Red = off. The meter fills left for flat, right for sharp.</p>
+            <div class="flex gap-3 justify-end mt-4">
+                <button onclick="_ndCloseTuner()" class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white">Done</button>
+            </div>
+        </div>`;
+}
+
 // Mark missed notes that have passed the timing window
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
@@ -2781,6 +2972,9 @@ function _ndShowSettings() {
             <button onclick="_ndOpenWizard()"
                 class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs text-white font-semibold"
                 title="Metronome-based wizard that measures mic input lag and audio output lag as two independent quantities. Play along with each beat.">Calibration Wizard</button>
+            <button onclick="_ndOpenTuner()"
+                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"
+                title="Standalone tuner — play each open string, see cents offset per string, verify the instrument matches the song's tuning before scoring.">Tune</button>
             <button onclick="_ndResetScoring()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300"
                 title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
