@@ -2185,7 +2185,13 @@ function _ndBsearch(arr, target) {
 function _ndMatchNotes() {
     // Compensate for audio input latency: the detected pitch corresponds to
     // what the player played ~latencyOffset ago, so shift the comparison window back.
-    const t = highway.getTime() - _ndLatencyOffset;
+    // Also add the core's A/V render offset so we match against the chart time
+    // the user was visually aiming at (the highway's rendered time = getTime() +
+    // avOffset). Without this, a non-zero A/V offset makes every detection miss
+    // by exactly that offset, since getTime() returns the audio-aligned chart
+    // time while the player is playing to the visually-shifted strum bar.
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
     if (_ndDetectedMidi < 0) return;
 
     const notes = highway.getNotes();
@@ -2246,9 +2252,29 @@ function _ndMatchNotes() {
             if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
             _ndUpdateSectionStat('hit');
         }
-        if (levelAnalyser) {
-            try { levelAnalyser.disconnect(); } catch (e) {}
-            levelAnalyser = null;
+    }
+}
+
+// Mark missed notes that have passed the timing window
+function _ndCheckMisses() {
+    if (!_ndEnabled) return;
+    // Mirror _ndMatchNotes's time derivation so hit/miss are measured on the
+    // same clock (visual-target time the player is actually aiming at).
+    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
+    const tolerance = _ndTimingTolerance;
+    const missDeadline = t - tolerance * 2; // notes older than this are missed
+    const notes = highway.getNotes();
+    const chords = highway.getChords();
+
+    const checkNote = (s, f, noteTime) => {
+        if (noteTime > missDeadline) return; // not yet past window
+        const key = _ndNoteKey({ s, f }, noteTime);
+        if (!_ndNoteResults.has(key)) {
+            _ndNoteResults.set(key, 'miss');
+            _ndMisses++;
+            _ndStreak = 0;
+            _ndUpdateSectionStat('miss');
         }
         if (gainNode) {
             try { gainNode.disconnect(); } catch (e) {}
