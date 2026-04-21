@@ -201,29 +201,32 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // hand-maintained constant the diagnostic path keys off of.
 const _ND_VERSION = '1.10.0';
 
-// Audio processing constants
-const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
-// ScriptProcessor buffer size. The YIN analysis buffer is a separate
-// _ND_MIN_YIN_SAMPLES (4096) that accumulates across callbacks, so
-// shrinking the audio-callback granularity here doesn't reduce
-// detection resolution — it only halves the input-side buffering
-// latency (1024/48000 ≈ 21 ms vs 2048/48000 ≈ 43 ms). Matches the
-// headless harness's default --frame-size.
-const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
+// Tuning — standard tuning MIDI base per string, adjusted by arrangement offsets.
+// Guitar: 6 strings, low E2 to high E4. Bass: 4 strings, low E1 to high G2
+// (one octave below guitar low-4 minus the top two). Arrangement type is
+// derived from song_info.arrangement name; see _ndSetArrangement.
+const _ndStandardMidiGuitar = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+const _ndStandardMidiBass = [28, 33, 38, 43];           // E1 A1 D2 G2
+let _ndCurrentArrangement = 'guitar';                   // 'guitar' | 'bass'
+let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
+let _ndCapo = 0;
 
-// Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
-//
-// Bass ascends in perfect fourths end-to-end; guitar is fourths except
-// the major third between G3→B3 (the standard irregularity). Low B on
-// 5-string bass and 7-string guitar both add a perfect fourth below
-// the standard low-E string. 8-string guitar adds a further low F#1
-// below that (a perfect fourth below B1), matching the most common
-// Ibanez/Schecter 8-string standard tuning.
-const _ND_TUNING_BASS_4 = [28, 33, 38, 43];                   // E1 A1 D2 G2
-const _ND_TUNING_BASS_5 = [23, 28, 33, 38, 43];               // B0 E1 A1 D2 G2
-const _ND_TUNING_GUITAR_6 = [40, 45, 50, 55, 59, 64];         // E2 A2 D3 G3 B3 E4
-const _ND_TUNING_GUITAR_7 = [35, 40, 45, 50, 55, 59, 64];     // B1 E2 A2 D3 G3 B3 E4
-const _ND_TUNING_GUITAR_8 = [30, 35, 40, 45, 50, 55, 59, 64]; // F#1 B1 E2 A2 D3 G3 B3 E4
+function _ndArrangementKindFromName(name) {
+    return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
+}
+
+function _ndSetArrangement(name) {
+    _ndCurrentArrangement = _ndArrangementKindFromName(name);
+}
+
+function _ndStandardMidiFor(arrangement) {
+    return arrangement === 'bass' ? _ndStandardMidiBass : _ndStandardMidiGuitar;
+}
+
+// Audio processing — use native sample rate, accumulate samples for YIN
+let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
+const _ndMinYinSamples = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
+const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 
 function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
@@ -2012,18 +2015,182 @@ function createNoteDetector(options = {}) {
             startLevelMeter();
             populateDevices();
 
-            return true;
-        } catch (e) {
-            console.error('Note detect: mic access denied or failed:', e);
-            // Suppress the user-facing alert if the instance is no
-            // longer enabled — the enable/restart was superseded by a
-            // concurrent disable (e.g. song switch while the mic
-            // permission prompt was open). Surfacing an error the
-            // user never asked to see in that case is just noise.
-            // The console.error still goes to devtools for
-            // diagnostics.
-            if (enabled) {
-                alert('Note Detection: Could not access audio input.\n\n' + e.message);
+// ── Input Level Metering ──────────────────────────────────────────────────
+
+let _ndLevelRaf = null;
+
+function _ndStartLevelMeter() {
+    _ndStopLevelMeter();
+    const tick = () => {
+        if (!_ndLevelAnalyser) return;
+        const buf = new Float32Array(_ndLevelAnalyser.fftSize);
+        _ndLevelAnalyser.getFloatTimeDomainData(buf);
+
+        // RMS level
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+        _ndInputLevel = Math.min(1, rms * 5); // scale up for visibility
+
+        // Peak hold with decay
+        if (_ndInputLevel > _ndInputPeak) {
+            _ndInputPeak = _ndInputLevel;
+            _ndPeakDecay = 30; // hold for ~30 frames
+        } else if (_ndPeakDecay > 0) {
+            _ndPeakDecay--;
+        } else {
+            _ndInputPeak *= 0.95;
+        }
+
+        // Update VU meter in settings panel if visible
+        _ndDrawSettingsVU();
+
+        _ndLevelRaf = requestAnimationFrame(tick);
+    };
+    _ndLevelRaf = requestAnimationFrame(tick);
+}
+
+function _ndStopLevelMeter() {
+    if (_ndLevelRaf) {
+        cancelAnimationFrame(_ndLevelRaf);
+        _ndLevelRaf = null;
+    }
+}
+
+function _ndDrawSettingsVU() {
+    const bar = document.getElementById('nd-vu-bar');
+    const peak = document.getElementById('nd-vu-peak');
+    if (!bar) return;
+    const pct = Math.round(_ndInputLevel * 100);
+    bar.style.width = pct + '%';
+    // Color: green < 60%, yellow 60-85%, red > 85%
+    bar.className = pct > 85 ? 'h-full rounded transition-all duration-75 bg-red-500'
+        : pct > 60 ? 'h-full rounded transition-all duration-75 bg-yellow-500'
+        : 'h-full rounded transition-all duration-75 bg-green-500';
+    if (peak) {
+        const peakPct = Math.round(_ndInputPeak * 100);
+        peak.style.left = Math.min(peakPct, 100) + '%';
+    }
+}
+
+// ── Frame Processing ───────────────────────────────────────────────────────
+
+async function _ndProcessFrame(buffer) {
+    let result;
+    const sr = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
+    if (_ndDetectionMethod === 'crepe' && _ndModel) {
+        result = await _ndCrepeDetect(buffer);
+        // Fall back to YIN if CREPE returned nothing useful
+        if (result.freq <= 0 || result.confidence < 0.3) {
+            result = _ndYinDetect(buffer, sr);
+        }
+    } else {
+        result = _ndYinDetect(buffer, sr);
+    }
+
+    if (result.freq <= 0 || result.confidence < 0.3) {
+        _ndDetectedMidi = -1;
+        _ndDetectedConfidence = 0;
+        _ndDetectedString = -1;
+        _ndDetectedFret = -1;
+        return;
+    }
+
+    _ndDetectedMidi = _ndFreqToMidi(result.freq);
+    _ndDetectedConfidence = result.confidence;
+
+    // Find best string/fret match
+    const sf = _ndMidiToStringFret(_ndDetectedMidi);
+    _ndDetectedString = sf.string;
+    _ndDetectedFret = sf.fret;
+
+    // Match against expected notes
+    _ndMatchNotes();
+}
+
+// ── Frequency / MIDI Conversion ────────────────────────────────────────────
+
+function _ndFreqToMidi(freq) {
+    return 12 * Math.log2(freq / 440) + 69;
+}
+
+function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement) {
+    const base = _ndStandardMidiFor(arrangement);
+    return base[string] + _ndTuningOffsets[string] + _ndCapo + fret;
+}
+
+function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
+    // Find the string/fret combo closest to the detected pitch for the given
+    // arrangement. When multiple strings match at equal pitch distance, prefer
+    // the one with the lowest fret (open strings before fretted notes) — this
+    // is the fingering a player is most likely using on an open chart note.
+    const base = _ndStandardMidiFor(arrangement);
+    let bestDist = Infinity;
+    let bestFret = Infinity;
+    let bestString = -1;
+    for (let s = 0; s < base.length; s++) {
+        const openMidi = base[s] + _ndTuningOffsets[s] + _ndCapo;
+        const fret = Math.round(midiNote - openMidi);
+        if (fret < 0 || fret > 24) continue;
+        const dist = Math.abs(midiNote - (openMidi + fret));
+        if (dist < bestDist || (dist === bestDist && fret < bestFret)) {
+            bestDist = dist;
+            bestFret = fret;
+            bestString = s;
+        }
+    }
+    return { string: bestString, fret: bestFret === Infinity ? -1 : bestFret };
+}
+
+// ── Note Matching ──────────────────────────────────────────────────────────
+
+function _ndNoteKey(note, time) {
+    // Unique key for a note event
+    return `${time.toFixed(3)}_${note.s}_${note.f}`;
+}
+
+// Binary search: find index of first element with .t >= target
+function _ndBsearch(arr, target) {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid].t < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+function _ndMatchNotes() {
+    // Compensate for audio input latency: the detected pitch corresponds to
+    // what the player played ~latencyOffset ago, so shift the comparison window back.
+    const t = highway.getTime() - _ndLatencyOffset;
+    if (_ndDetectedMidi < 0) return;
+
+    const notes = highway.getNotes();
+    const chords = highway.getChords();
+    const tolerance = _ndTimingTolerance;
+    const centsTolerance = _ndPitchTolerance;
+
+    const candidateNotes = [];
+
+    // Use binary search to jump to the relevant time region
+    if (notes && notes.length > 0) {
+        const start = _ndBsearch(notes, t - tolerance);
+        for (let i = start; i < notes.length; i++) {
+            const n = notes[i];
+            if (n.t > t + tolerance) break;
+            if (n.mt) continue; // skip muted notes
+            candidateNotes.push({ s: n.s, f: n.f, t: n.t });
+        }
+    }
+    if (chords && chords.length > 0) {
+        const start = _ndBsearch(chords, t - tolerance);
+        for (let i = start; i < chords.length; i++) {
+            const c = chords[i];
+            if (c.t > t + tolerance) break;
+            for (const cn of (c.notes || [])) {
+                if (cn.mt) continue;
+                candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
             }
             // Partial-init cleanup — if we got as far as acquiring the
             // stream or creating any AudioNodes before the throw, we
@@ -2150,18 +2317,196 @@ function createNoteDetector(options = {}) {
 
     // ── Level meter ───────────────────────────────────────────────────
 
-    // Desktop-bridge equivalent of startLevelMeter(). The engine already
-    // computes RMS + peak on the audio thread; here we just poll those
-    // and drive the same DOM bar the Web-Audio path drives. Polled on
-    // setInterval rather than rAF so the IPC round-trip doesn't pin
-    // requestAnimationFrame to the IPC cadence when the renderer
-    // throttles in the background.
-    function startBridgeLevelMeter(desktop) {
-        stopBridgeLevelMeter();
-        // Bail before installing the timer if the engine doesn't expose
-        // getLevels — otherwise we'd run a no-op poll forever, leak the
-        // interval, and never surface the missing capability.
-        if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
+    if (countsEl && total > 0) {
+        countsEl.textContent = `${_ndHits} / ${total}`;
+    }
+
+    if (detectedEl) {
+        if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
+            const names = ['E2','A2','D3','G3','B3','E4'];
+            detectedEl.textContent = `${names[_ndDetectedString] || '?'} fret ${_ndDetectedFret}`;
+        } else {
+            detectedEl.textContent = '';
+        }
+    }
+
+    // Edge flash on hit/miss
+    if (flashEl) {
+        if (_ndHits > _ndLastHitCount) {
+            flashEl.style.borderColor = 'rgba(0, 255, 136, 0.6)';
+            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+        } else if (_ndMisses > _ndLastMissCount) {
+            flashEl.style.borderColor = 'rgba(255, 50, 68, 0.4)';
+            setTimeout(() => { if (flashEl) flashEl.style.borderColor = 'transparent'; }, 80);
+        }
+        _ndLastHitCount = _ndHits;
+        _ndLastMissCount = _ndMisses;
+    }
+}
+
+// 2D highway draw hook — uses project()/fretX() for accurate positioning.
+// Only draws when the 2D highway is active (these APIs exist on the highway object).
+highway.addDrawHook(function(ctx, W, H) {
+    if (!_ndEnabled) return;
+    // Only draw note indicators if highway exposes projection (2D mode)
+    if (!highway.project || !highway.fretX) return;
+
+    const t = highway.getTime();
+    const notes = highway.getNotes();
+    const chords = highway.getChords();
+
+    const drawIndicator = (s, f, noteTime, result) => {
+        const tOff = noteTime - t;
+        const p = highway.project(tOff);
+        if (!p) return;
+        const x = highway.fretX(f, p.scale, W);
+        const y = p.y * H;
+
+        const age = Math.abs(t - noteTime);
+        const fade = Math.max(0, 1 - age / 0.6) * p.scale;
+        if (fade <= 0) return;
+
+        if (result === 'hit') {
+            ctx.save();
+            ctx.globalAlpha = fade * 0.7;
+            ctx.shadowColor = '#00ff88';
+            ctx.shadowBlur = 20 * p.scale;
+            ctx.strokeStyle = '#00ff88';
+            ctx.lineWidth = 3 * p.scale;
+            ctx.beginPath();
+            ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+        } else if (result === 'miss') {
+            ctx.save();
+            ctx.globalAlpha = fade * 0.5;
+            ctx.shadowColor = '#ff3344';
+            ctx.shadowBlur = 12 * p.scale;
+            ctx.strokeStyle = '#ff3344';
+            ctx.lineWidth = 2 * p.scale;
+            const sz = 8 * p.scale;
+            ctx.beginPath();
+            ctx.moveTo(x - sz, y - sz);
+            ctx.lineTo(x + sz, y + sz);
+            ctx.moveTo(x + sz, y - sz);
+            ctx.lineTo(x - sz, y + sz);
+            ctx.stroke();
+            ctx.restore();
+        }
+    };
+
+    // Draw results for recent notes
+    if (notes) {
+        for (const n of notes) {
+            if (n.t < t - 0.5) continue;
+            if (n.t > t + 3) break;
+            if (n.mt) continue;
+            const key = _ndNoteKey(n, n.t);
+            const result = _ndNoteResults.get(key);
+            if (result) drawIndicator(n.s, n.f, n.t, result);
+        }
+    }
+    if (chords) {
+        for (const c of chords) {
+            if (c.t < t - 0.5) continue;
+            if (c.t > t + 3) break;
+            for (const cn of (c.notes || [])) {
+                if (cn.mt) continue;
+                const key = _ndNoteKey(cn, c.t);
+                const result = _ndNoteResults.get(key);
+                if (result) drawIndicator(cn.s, cn.f, c.t, result);
+            }
+        }
+    }
+
+    // Detected note indicator at the now line
+    if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
+        const p = highway.project(0); // now line
+        if (p) {
+            const x = highway.fretX(_ndDetectedFret, p.scale, W);
+            const y = p.y * H;
+            ctx.save();
+            ctx.globalAlpha = Math.min(1, _ndDetectedConfidence);
+            ctx.fillStyle = '#44ddff';
+            ctx.shadowColor = '#44ddff';
+            ctx.shadowBlur = 12;
+            ctx.beginPath();
+            ctx.arc(x, y, 6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 7px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(_ndDetectedFret, x, y);
+            ctx.restore();
+        }
+    }
+});
+
+// ── Toggle Button ──────────────────────────────────────────────────────────
+
+function _ndInjectButton() {
+    const controls = document.getElementById('player-controls');
+    if (!controls || document.getElementById('btn-notedetect')) return;
+
+    const closeBtn = controls.querySelector('button:last-child');
+
+    const btn = document.createElement('button');
+    btn.id = 'btn-notedetect';
+    btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+    btn.textContent = 'Detect';
+    btn.title = 'Toggle real-time note detection & scoring';
+    btn.onclick = _ndToggle;
+    controls.insertBefore(btn, closeBtn);
+
+    // Settings gear button
+    const gear = document.createElement('button');
+    gear.id = 'btn-notedetect-settings';
+    gear.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+    gear.textContent = '\u2699';
+    gear.title = 'Note detection settings';
+    gear.onclick = _ndShowSettings;
+    controls.insertBefore(gear, closeBtn);
+}
+
+function _ndUpdateButton() {
+    const btn = document.getElementById('btn-notedetect');
+    if (!btn) return;
+    if (_ndEnabled) {
+        btn.className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+        btn.textContent = 'Detect \u2713';
+    } else {
+        btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+        btn.textContent = 'Detect';
+    }
+    const gear = document.getElementById('btn-notedetect-settings');
+    if (gear) gear.classList.toggle('hidden', !_ndEnabled);
+}
+
+async function _ndToggle() {
+    _ndEnabled = !_ndEnabled;
+    _ndUpdateButton();
+
+    if (_ndEnabled) {
+        // Read tuning from song info
+        const info = highway.getSongInfo();
+        if (info && info.tuning) {
+            _ndTuningOffsets = info.tuning;
+        }
+        if (info && info.capo !== undefined) {
+            _ndCapo = info.capo;
+        }
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
+        }
+
+        // Reset scoring
+        _ndResetScoring();
+
+        const ok = await _ndStartAudio();
+        if (!ok) {
+            _ndEnabled = false;
+            _ndUpdateButton();
             return;
         }
         // In-flight guard — if an IPC `getLevels()` round-trip takes
@@ -6679,40 +7024,9 @@ function _ndInstallPlaySongHook() {
             if (inst.isEnabled()) inst.disable({ silent: true });
             if (typeof inst._resetScoring === 'function') inst._resetScoring();
         }
-        const ret = await origPlaySong.apply(this, args);
-        // Re-inject the default singleton's Detect button in case the
-        // loader recreated the player-controls row. Tuning/capo/
-        // arrangement are re-read later inside enable() from
-        // hw.getSongInfo(); no need to refresh them eagerly here.
-        if (window.noteDetect) {
-            window.noteDetect.injectButton();
+        if (info && info.arrangement) {
+            _ndSetArrangement(info.arrangement);
         }
-        // Honour the user's standing preference: if they had Detect
-        // turned on, keep it on across song switches. Without this,
-        // every song requires another button press because the loop
-        // above silent-disables the instance. The end-of-song summary
-        // path also silent-disables, so this is the single re-arm
-        // point that covers both "user picked next song" and "song
-        // finished, user picked next" flows. Default singleton only
-        // — splitscreen panels are opt-in surfaces the user mounts
-        // per session, and reclaiming the mic for every panel on
-        // every song change would be surprising. There's no public
-        // isDefault() accessor; the singleton is the one anchored on
-        // window.noteDetect.
-        const def = window.noteDetect;
-        if (def
-            && typeof def.wantsDetect === 'function' && def.wantsDetect()
-            && !def.isEnabled()) {
-            // Fire-and-forget — enable() awaits getUserMedia which we
-            // don't want to block playSong on. If the user denied mic
-            // permission previously the failure surfaces through the
-            // button text the same way it does for a manual click.
-            def.enable().catch((e) => {
-                console.warn('[note_detect] auto-re-enable on playSong failed:',
-                    e && e.message ? e.message : e);
-            });
-        }
-        return ret;
     };
     wrapper._ndWrapped = true;
     window.playSong = wrapper;
