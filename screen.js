@@ -192,7 +192,15 @@ const _ndInstances = _ndShared.instances;
 // so it persists across HMR / double-<script>-load where a
 // module-level flag would be reset.)
 
-const _ND_STORAGE_KEY = 'slopsmith_notedetect';
+// Scoring
+let _ndHits = 0;
+let _ndMisses = 0;
+let _ndPitchMisses = 0;      // detection in timing window but wrong cents
+let _ndTimingMisses = 0;     // chart note passed with NO detection in window
+let _ndStreak = 0;
+let _ndBestStreak = 0;
+let _ndSectionStats = [];    // [{name, hits, misses}]
+let _ndCurrentSection = null;
 
 // Rolling diagnostic stats — each entry is the closest-chart-note-match for a
 // detection event. Used for the HUD readout and calibration.
@@ -208,7 +216,11 @@ let _ndCalibrationSamples = [];
 const _ND_CAL_TARGET = 15;
 
 // Note tracking
-let _ndNoteResults = new Map(); // key -> 'hit'|'miss'
+let _ndNoteResults = new Map(); // key -> 'hit'|'pitch_miss'|'timing_miss'
+// Per-chart-note: best pitch attempt (min |cents|) seen while note was in
+// timing window. If a note gets marked miss, we use this to distinguish
+// "detection fired but wrong pitch" vs "nothing fired at all."
+let _ndNotePitchAttempts = new Map(); // key -> bestCentsErr
 let _ndDetectedMidi = -1;
 let _ndDetectedConfidence = 0;
 let _ndDetectedString = -1;
@@ -2280,10 +2292,17 @@ function _ndMatchNotes() {
     // Check each candidate (all-against-all match, as before)
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
-        if (_ndNoteResults.has(key)) continue; // already judged
 
+        // Record best pitch attempt seen for this note — used by _ndCheckMisses
+        // to split "wrong pitch" from "no detection" when the window expires.
         const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
         const detectedCents = (_ndDetectedMidi - expectedMidi) * 100;
+        const prev = _ndNotePitchAttempts.get(key);
+        if (prev === undefined || Math.abs(detectedCents) < Math.abs(prev)) {
+            _ndNotePitchAttempts.set(key, detectedCents);
+        }
+
+        if (_ndNoteResults.has(key)) continue; // already judged
 
         if (Math.abs(detectedCents) <= centsTolerance) {
             _ndNoteResults.set(key, 'hit');
@@ -2372,8 +2391,12 @@ function _ndCheckMisses() {
         if (noteTime > missDeadline) return; // not yet past window
         const key = _ndNoteKey({ s, f }, noteTime);
         if (!_ndNoteResults.has(key)) {
-            _ndNoteResults.set(key, 'miss');
+            const hadDetection = _ndNotePitchAttempts.has(key);
+            const kind = hadDetection ? 'pitch_miss' : 'timing_miss';
+            _ndNoteResults.set(key, kind);
             _ndMisses++;
+            if (hadDetection) _ndPitchMisses++;
+            else _ndTimingMisses++;
             _ndStreak = 0;
             _ndUpdateSectionStat('miss');
         }
@@ -2528,6 +2551,9 @@ function _ndShowSettings() {
         <div class="flex items-center gap-2 mb-2">
             <button id="nd-calibrate-btn" onclick="_ndStartCalibration()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300">Calibrate</button>
+            <button onclick="_ndResetScoring()"
+                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300"
+                title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
             <div id="nd-calibrate-msg" class="text-[10px] text-gray-400 flex-1 leading-tight"></div>
         </div>
         <div class="text-[10px] text-gray-600 mb-3 leading-tight">
@@ -2682,7 +2708,14 @@ function _ndUpdateHUD() {
     // ── Level meter ───────────────────────────────────────────────────
 
     if (countsEl && total > 0) {
-        countsEl.textContent = `${_ndHits} / ${total}`;
+        // Breakdown helps diagnose why the accuracy number is low. If misses
+        // are mostly "p" (pitch), YIN is misdetecting and no amount of latency
+        // tuning helps. If mostly "t" (no detection in window), the plugin
+        // isn't hearing the played note — check input level / tuning base.
+        countsEl.textContent = `${_ndHits} / ${total}` +
+            (_ndPitchMisses || _ndTimingMisses
+                ? `  (p:${_ndPitchMisses} t:${_ndTimingMisses})`
+                : '');
     }
 
     if (detectedEl) {
@@ -2943,39 +2976,24 @@ async function _ndToggle() {
         }
     }
 
-    function startLevelMeter() {
-        stopLevelMeter();
-        // Cache the analyser read buffer across rAF ticks. At 60 fps
-        // with fftSize=512 this was allocating ~120 kB/s per enabled
-        // instance; reusing a single Float32Array (re-allocating only
-        // if fftSize changes) keeps the meter out of the GC path.
-        let levelBuf = null;
-        let levelBufSize = 0;
-        const tick = () => {
-            if (!levelAnalyser) return;
-            const fftSize = levelAnalyser.fftSize;
-            if (!levelBuf || levelBufSize !== fftSize) {
-                levelBuf = new Float32Array(fftSize);
-                levelBufSize = fftSize;
-            }
-            levelAnalyser.getFloatTimeDomainData(levelBuf);
-            let sum = 0;
-            for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
-            const rms = Math.sqrt(sum / levelBuf.length);
-            inputLevel = Math.min(1, rms * 5);
-            if (inputLevel > inputPeak) {
-                inputPeak = inputLevel;
-                peakDecay = 30;
-            } else if (peakDecay > 0) {
-                peakDecay--;
-            } else {
-                inputPeak *= 0.95;
-            }
-            drawSettingsVU();
-            levelRaf = requestAnimationFrame(tick);
-        };
-        levelRaf = requestAnimationFrame(tick);
-    }
+function _ndResetScoring() {
+    _ndHits = 0;
+    _ndMisses = 0;
+    _ndPitchMisses = 0;
+    _ndTimingMisses = 0;
+    _ndStreak = 0;
+    _ndBestStreak = 0;
+    _ndNoteResults.clear();
+    _ndSectionStats = [];
+    _ndCurrentSection = null;
+    _ndDetectedMidi = -1;
+    _ndDetectedConfidence = 0;
+    _ndDetectedString = -1;
+    _ndDetectedFret = -1;
+    _ndEventLog = [];
+    _ndCalibrationSamples = [];
+    _ndNotePitchAttempts.clear();
+}
 
     function stopLevelMeter() {
         if (levelRaf) {
