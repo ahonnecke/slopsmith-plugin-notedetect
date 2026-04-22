@@ -2518,26 +2518,26 @@ function _ndWizFireBeat(isCountIn, mode) {
 }
 
 function _ndWizFinishRun(mode) {
-    // Pre-filter detections to "fresh" ones: the first detection after a gap
-    // (YIN's confidence dropped below the detection floor) OR a pitch change
-    // of more than a semitone. This suppresses the sustain tail of each
-    // pluck, which used to be incorrectly attributed as the "earliest
-    // detection" inside the NEXT beat's window — producing apparent dt
-    // values around -400 ms that were just the previous pluck's sustain
-    // reaching forward, not user anticipation.
-    const _ND_FRESH_GAP_MS = 100;      // silence gap to mark a new pluck
-    const _ND_FRESH_PITCH = 1;         // semitone change to mark a new pluck
+    // Pre-filter detections to "fresh" ones — the first detection after a
+    // silence gap. Using gap-only (not pitch-change) because YIN's pitch
+    // jitters during the attack transient of each pluck: a single pluck can
+    // briefly report 5-6 different midi values in the first 100 ms before
+    // settling. Counting each jitter as a "fresh pluck" adds spurious events
+    // that pollute the beat-to-pluck assignment.
+    //
+    // Trade-off: if the user plays sustained notes with no gap between
+    // plucks (e.g. long-sustain open-string bass at 75 BPM), gap filtering
+    // misses re-plucks of the same note. Instructions on the running panel
+    // tell the user to play short / palm-muted notes so there's an audible
+    // silence between plucks for the gap filter to catch.
+    const _ND_FRESH_GAP_MS = 120;
     const fresh = [];
     let lastTime = -Infinity;
-    let lastMidi = -999;
     for (const det of _ndWizDetections) {
-        const gap = det.time - lastTime;
-        const pitchChange = Math.abs(det.midi - lastMidi);
-        if (gap > _ND_FRESH_GAP_MS || pitchChange > _ND_FRESH_PITCH) {
+        if (det.time - lastTime > _ND_FRESH_GAP_MS) {
             fresh.push(det);
         }
         lastTime = det.time;
-        lastMidi = det.midi;
     }
 
     // Assignment: for each beat, find the fresh detection within the beat
