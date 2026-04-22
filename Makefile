@@ -17,6 +17,7 @@ export
 SLOPSMITH_DIR  ?= $(abspath ../slopsmith)
 SLOPSMITH_PORT ?= 8000
 PLUGIN_DIR     := $(abspath .)
+FLASHCARD_DIR  ?= $(abspath ../slopsmith-plugin-flashcard)
 OVERLAY        := $(PLUGIN_DIR)/docker-compose.slopsmith.yml
 COMPOSE        := docker compose -f $(SLOPSMITH_DIR)/docker-compose.yml -f $(OVERLAY)
 

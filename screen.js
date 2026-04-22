@@ -158,34 +158,19 @@
 
 // ── Module-level shared state ──────────────────────────────────────────────
 
-// Shared state anchored on `window` so multiple evaluations of this
-// file (HMR, accidental double <script> load) all see the same
-// registry and model-load state. A bare module-scoped Set would let
-// the second evaluation register its detectors into a fresh set
-// while the first evaluation's live playSong wrapper iterates the
-// old set — breaking song-switch disable/reset on any detector
-// created by the second eval.
-//
-// `_ndShared` is initialised once; subsequent evaluations reuse the
-// existing object. All mutable shared state (CREPE model, loading
-// flag, instance registry, playSong-hook retry counter) lives on it
-// so reassignments land on the canonical object, not on a fresh
-// module-scope copy.
-const _ndShared = (window.__ndShared = window.__ndShared || {
-    model: null,          // CREPE/SPICE model (single ~20 MB load)
-    modelLoading: false,
-    instances: new Set(), // live detector APIs — iterated by playSong hook
-    playSongRetries: 0,   // bounded-retry counter for _ndInstallPlaySongHook
-    // Most-recent filename passed to playSong(). hw.getSongInfo() doesn't
-    // expose a `filename` field (per the WS song_info contract), but
-    // playSong's first arg IS the CDLC filename — capture it in the
-    // wrapper so the training-bundle manifest can populate the CDLC
-    // File Name field that getSongInfo can't supply on its own.
-    currentFilename: null,
-});
-// Local aliases — kept for readability of the rest of the file, but
-// they're the same objects as `window.__ndShared.*`.
-const _ndInstances = _ndShared.instances;
+// Settings
+let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
+let _ndPitchTolerance = 50;      // cents
+let _ndInputGain = 1.0;
+let _ndSelectedDeviceId = '';
+let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
+let _ndLatencyOffset = 0.350;    // seconds — compensates for buffer accumulation (~85ms) + stability voting (~250ms)
+let _ndSilenceGate = 0.02;       // reject detections below this input level (scaled RMS)
+let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensates for chart CentOffset / tuning errors
+// NOTE: localStorage may have a stale -1 from a bad calibration run. The
+// Quick Calibrate proved G/D/A all match at 0 offset for Mexico by Cake.
+// If localStorage has a non-zero value, it'll be loaded — use Quick Calibrate
+// or the settings slider to reset.
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -222,6 +207,14 @@ const _ND_PERFECT_PITCH_CENT = 20;
 const _ND_EVENT_WINDOW = 30;
 let _ndEventLog = [];
 
+// Transient rejection — lightweight filter that adds zero latency.
+// If MIDI jumps > threshold from previous detection within the debounce
+// window, skip it (likely attack transient jitter from YIN).
+let _ndLastMatchMidi = -1;
+let _ndLastMatchTime = 0;
+const _ND_TRANSIENT_JUMP = 3;      // semitones — skip if MIDI jumps more than this
+const _ND_TRANSIENT_WINDOW = 0.15; // seconds — only filter within this window of last detection
+
 // Note tracking
 let _ndNoteResults = new Map(); // key -> 'hit'|'pitch_miss'|'timing_miss'
 // Per-chart-note: best pitch attempt (min |cents|) seen while note was in
@@ -234,8 +227,8 @@ let _ndNotePitchAttempts = new Map(); // key -> bestCentsErr
 // before the plugin treats it as a "stable" detection for scoring purposes.
 // Downstream: scoring uses _ndStableMidi; HUD's raw "detected" readout still
 // uses _ndDetectedMidi so users see live YIN output.
-const _ND_STABILITY_WINDOW = 5;      // raw samples considered
-const _ND_STABILITY_REQUIRED = 3;    // N-of-M for "stable"
+const _ND_STABILITY_WINDOW = 3;      // raw samples considered (was 5 — too slow for 400ms note spacing)
+const _ND_STABILITY_REQUIRED = 2;    // N-of-M for "stable" (was 3 — halves convergence time)
 let _ndRawMidiHistory = [];          // last N raw midi values (rounded)
 let _ndStableMidi = -1;              // most recent stable midi, or -1 if unsettled
 let _ndDetectedMidi = -1;
@@ -254,6 +247,70 @@ let _ndTuningOffsets = [0, 0, 0, 0, 0, 0];
 let _ndCapo = 0;
 let _ndUnderBufferWarned = false;
 
+// Frame-level diagnostic log — records EVERY detection frame including
+// rejections, so we can see exactly what YIN reports and when.
+// Toggle with _ndFrameLogEnabled = true in console (off by default to
+// avoid spamming). Ring buffer, max 200 entries.
+let _ndFrameLogEnabled = true;
+let _ndFrameLog = [];
+const _ND_FRAME_LOG_MAX = 2000;
+let _ndOnsetCount = 0; // count onset flushes for diagnostics
+
+// Auto-dump: POST diagnostic data to server automatically so the user never
+// has to click a button while holding a guitar. Fires on loop restart (time
+// jumps backward) and periodically every 30s while playing.
+let _ndLastDumpTime = 0;           // performance.now() of last auto-dump
+let _ndLastSeenScoreTime = -1;     // track score time to detect loop restarts
+const _ND_AUTO_DUMP_INTERVAL = 30; // seconds between periodic dumps
+const _ND_AUTO_DUMP_MIN_EVENTS = 3; // need at least this many events to be worth dumping
+
+function _ndAutoDumpPost() {
+    const dumpData = {
+        timestamp: new Date().toISOString(),
+        autoDump: true,
+        eventLog: _ndEventLog,
+        frameLog: _ndFrameLog,
+        noteResults: [],
+        settings: {
+            latencyOffset: _ndLatencyOffset,
+            timingTolerance: _ndTimingTolerance,
+            pitchTolerance: _ndPitchTolerance,
+            silenceGate: _ndSilenceGate,
+            arrangement: _ndCurrentArrangement,
+            tuning: _ndTuningOffsets,
+            capo: _ndCapo,
+        },
+        scoring: { hits: _ndHits, misses: _ndMisses, pitchMisses: _ndPitchMisses, timingMisses: _ndTimingMisses },
+    };
+    _ndNoteResults.forEach((v, k) => dumpData.noteResults.push({ key: k, ...v }));
+    fetch('/api/plugins/note_detect/dump', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dumpData),
+    }).then(() => console.log('[note_detect] Auto-dump saved'))
+      .catch(e => console.warn('[note_detect] Auto-dump failed:', e));
+    _ndLastDumpTime = performance.now() / 1000;
+}
+
+function _ndCheckAutoDump() {
+    const now = performance.now() / 1000;
+    const scoreT = highway.getTime ? highway.getTime() : -1;
+
+    // Detect loop restart: score time jumped backward by >1s
+    if (_ndLastSeenScoreTime > 0 && scoreT >= 0 && scoreT < _ndLastSeenScoreTime - 1) {
+        if (_ndEventLog.length >= _ND_AUTO_DUMP_MIN_EVENTS) {
+            console.log('[note_detect] Loop restart detected, auto-dumping');
+            _ndAutoDumpPost();
+        }
+    }
+    _ndLastSeenScoreTime = scoreT;
+
+    // Periodic dump every 30s if there's data
+    if (now - _ndLastDumpTime > _ND_AUTO_DUMP_INTERVAL && _ndEventLog.length >= _ND_AUTO_DUMP_MIN_EVENTS) {
+        _ndAutoDumpPost();
+    }
+}
+
 function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
 }
@@ -271,17 +328,53 @@ let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
 const _ndMinYinSamples = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
 const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 
-function _ndArrangementKindFromName(name) {
-    return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
+// Onset detection — flush buffer when a new pluck is detected
+// Without this, the 4096-sample buffer contains ~85ms of audio. On sustained
+// bass notes, when you pluck a new note the buffer is still 90%+ old sustain
+// and YIN reports the PREVIOUS note's pitch.
+let _ndOnsetRmsHistory = [];           // rolling RMS of recent audio chunks
+const _ND_ONSET_HISTORY_LEN = 8;      // ~8 chunks at 2048 samples = ~340ms of history
+const _ND_ONSET_RATIO = 3.0;          // current RMS must be Nx the recent average to trigger
+const _ND_ONSET_MIN_RMS = 0.005;      // ignore onset detection below noise floor
+
+// ── localStorage Persistence ──────────────────────────────────────────────
+
+const _ndStorageKey = 'slopsmith_notedetect';
+
+function _ndSaveSettings() {
+    try {
+        localStorage.setItem(_ndStorageKey, JSON.stringify({
+            deviceId: _ndSelectedDeviceId,
+            channel: _ndSelectedChannel,
+            method: _ndDetectionMethod,
+            timingTolerance: _ndTimingTolerance,
+            pitchTolerance: _ndPitchTolerance,
+            inputGain: _ndInputGain,
+            latencyOffset: _ndLatencyOffset,
+            silenceGate: _ndSilenceGate,
+            pitchOffset: _ndPitchOffset,
+        }));
+    } catch (e) { /* localStorage unavailable */ }
 }
 
-function _ndStandardMidiFor(arrangement, stringCount) {
-    if (arrangement === 'bass') {
-        return stringCount === 5 ? _ND_TUNING_BASS_5 : _ND_TUNING_BASS_4;
-    }
-    if (stringCount === 8) return _ND_TUNING_GUITAR_8;
-    if (stringCount === 7) return _ND_TUNING_GUITAR_7;
-    return _ND_TUNING_GUITAR_6;
+function _ndLoadSettings() {
+    try {
+        const raw = localStorage.getItem(_ndStorageKey);
+        if (!raw) return;
+        const s = JSON.parse(raw);
+        if (s.deviceId !== undefined) _ndSelectedDeviceId = s.deviceId;
+        if (s.channel) _ndSelectedChannel = s.channel;
+        if (s.method) _ndDetectionMethod = s.method;
+        if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
+        if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
+        if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
+        if (s.latencyOffset !== undefined) _ndLatencyOffset = s.latencyOffset;
+        if (s.silenceGate !== undefined) _ndSilenceGate = s.silenceGate;
+        if (s.pitchOffset !== undefined) {
+            // Reject saved offsets > ±1 — they're from the feedback loop bug
+            _ndPitchOffset = Math.abs(s.pitchOffset) <= 1 ? s.pitchOffset : 0;
+        }
+    } catch (e) { /* ignore */ }
 }
 
 // ── Pure mapping helpers ───────────────────────────────────────────────────
@@ -1841,125 +1934,25 @@ function createNoteDetector(options = {}) {
                     // set is fixed for the session.
                     const hasDetectNotes = typeof desktop.audio.detectNotes === 'function';
 
-                    detectInterval = setInterval(async () => {
-                        if (!enabled || processingFrame) return;
-                        processingFrame = true;
-                        const gen = sessionGen;
-                        try {
-                            // Onset-event detection. detectNotes carries a
-                            // per-pitch onsetSeq counter; a higher value than
-                            // we last consumed means that pitch was struck
-                            // anew. Consuming each onset once makes the
-                            // single-note path edge-triggered (fires at the
-                            // attack) instead of matching a pitch for its
-                            // whole ring. The matched judgment is timestamped
-                            // at the current playhead — not back-dated by the
-                            // onset age, which is not a reliable per-onset
-                            // duration. Chords are scored separately via the
-                            // scoreChord IPC, gated on a fresh chord-pitch
-                            // onset in bridgeNewOnsets.
-                            let detection = null;
-                            if (hasDetectNotes) {
-                                try { detection = await desktop.audio.detectNotes(); }
-                                catch (_) { detection = null; }
-                                if (!enabled || gen !== sessionGen) return;
-                            }
+        processor.onaudioprocess = (e) => {
+            if (!_ndEnabled) return;
+            const input = e.inputBuffer.getChannelData(0);
 
-                            if (detection && Array.isArray(detection.notes)) {
-                                bridgeNewOnsets.clear();
-                                for (const n of detection.notes) {
-                                    if (!n || typeof n.midi !== 'number'
-                                        || typeof n.onsetSeq !== 'number') continue;
-                                    const prev = bridgeOnsetSeqSeen.get(n.midi);
-                                    if (prev !== undefined && n.onsetSeq <= prev) continue;
-                                    bridgeOnsetSeqSeen.set(n.midi, n.onsetSeq);
-                                    // The first poll only primes the seq
-                                    // baseline — pre-existing onsets from
-                                    // before enable must not replay as a burst.
-                                    if (bridgeOnsetPrimed
-                                        && typeof n.confidence === 'number'
-                                        && n.confidence >= detectionConfidenceMin) {
-                                        bridgeNewOnsets.set(n.midi, {
-                                            ageMs: Number.isFinite(n.onsetMs) ? n.onsetMs : 0,
-                                            conf: n.confidence,
-                                        });
-                                    }
-                                }
-                                bridgeOnsetPrimed = true;
+            // Onset detection DISABLED — flushing the buffer forces re-accumulation
+            // from scratch (~170ms) which is SLOWER than the natural sliding window
+            // (~85ms). The flush also re-contaminates with the onset chunk itself.
+            // See frame log analysis: onset flush added ~400ms latency vs ~170ms without.
 
-                                // Single-note pick = highest-confidence active
-                                // note (level-triggered). Edge-triggering the
-                                // single-note path on the onset posteriorgram
-                                // alone proved too sparse for fast guitar and
-                                // dropped notes; the onset events above are
-                                // used only to gate chord timing.
-                                let best = null;
-                                for (const n of detection.notes) {
-                                    if (n && typeof n.midi === 'number'
-                                        && (best === null || n.confidence > best.confidence)) {
-                                        best = n;
-                                    }
-                                }
-                                if (best && best.confidence >= detectionConfidenceMin) {
-                                    detectedMidi = best.midi;
-                                    detectedConfidence = best.confidence;
-                                } else {
-                                    detectedMidi = -1;
-                                    detectedConfidence = 0;
-                                    detectedString = -1;
-                                    detectedFret = -1;
-                                }
-                            } else {
-                                bridgeNewOnsets.clear();
-                                const p = await desktop.audio.getPitchDetection();
-                                if (!enabled || gen !== sessionGen) return;
-                                if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
-                                    && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
-                                    detectedMidi = p.midiNote;
-                                    detectedConfidence = p.confidence;
-                                } else {
-                                    detectedMidi = -1;
-                                    detectedConfidence = 0;
-                                    detectedString = -1;
-                                    detectedFret = -1;
-                                }
-                            }
-                            // Stamp the detector identity from the path that
-                            // actually ran this tick (read back by the
-                            // diagnostic export).
-                            _diagDetector = {
-                                desktop_bridge: true,
-                                ml: bridgeMlActive,
-                                path: bridgeMlActive ? 'desktop-ml-basicpitch' : 'desktop-yin',
-                            };
-                            // The chord branch in matchNotes() dispatches the
-                            // audio:scoreChord IPC — no raw audio buffer is
-                            // threaded here, the engine reads its own input
-                            // ring. Pass null; the single-note path is gated
-                            // on detectedMidi >= 0 and skips itself regardless,
-                            // and checkMisses() is independent.
-                            await matchNotes(null);
-                        } catch (e) {
-                            console.warn('[note_detect] bridge poll failed:', e && e.message ? e.message : e);
-                        } finally {
-                            processingFrame = false;
-                        }
-                    }, 50);
-
-                    startBridgeLevelMeter(desktop);
-                    populateDevices();
-                    return true;
-                }
-                // bridge present but engine unavailable — fall through
-                // to the getUserMedia path so the user sees a concrete
-                // error (and can troubleshoot the engine separately)
-                // rather than silent failure.
-            }
-
-            // Acquire the stream — use the supplied one or open
-            // getUserMedia for our own.
-            if (externalStream) {
-                stream = externalStream;
+            // Accumulate samples for low-frequency detection (need 4096 at 48kHz for low E)
+            const prev = _ndAccumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= _ndMinYinSamples) {
+                // Store ready buffer — detection timer will pick it up
+                const start = combined.length - _ndMinYinSamples;
+                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
+                _ndAccumBuffer = new Float32Array(0);
             } else {
                 const constraints = {
                     audio: {
@@ -2055,8 +2048,28 @@ function createNoteDetector(options = {}) {
             gainNode.connect(processor);
             processor.connect(audioCtx.destination);
 
-            startLevelMeter();
-            populateDevices();
+function _ndStopAudio() {
+    _ndStopLevelMeter();
+    if (_ndDetectInterval) { clearInterval(_ndDetectInterval); _ndDetectInterval = null; }
+    _ndPendingBuffer = null;
+    if (_ndWorklet) {
+        _ndWorklet.disconnect();
+        _ndWorklet = null;
+    }
+    _ndLevelAnalyser = null;
+    if (_ndStream) {
+        _ndStream.getTracks().forEach(t => t.stop());
+        _ndStream = null;
+    }
+    if (_ndAudioCtx) {
+        _ndAudioCtx.close();
+        _ndAudioCtx = null;
+    }
+    _ndInputLevel = 0;
+    _ndInputPeak = 0;
+    _ndAccumBuffer = new Float32Array(0);
+    _ndOnsetRmsHistory = [];
+}
 
 // ── Input Level Metering ──────────────────────────────────────────────────
 
@@ -2124,17 +2137,59 @@ async function _ndProcessFrame(buffer) {
     if (_ndDetectionMethod === 'crepe' && _ndModel) {
         result = await _ndCrepeDetect(buffer);
         // Fall back to YIN if CREPE returned nothing useful
-        if (result.freq <= 0 || result.confidence < 0.3) {
+        if (result.freq <= 0 || result.confidence < 0.7) {
             result = _ndYinDetect(buffer, sr);
         }
     } else {
         result = _ndYinDetect(buffer, sr);
     }
 
-    if (result.freq <= 0 || result.confidence < 0.3) {
+    if (result.freq <= 0 || result.confidence < 0.7) {
         if (result.underBuffered && !_ndUnderBufferWarned) {
             console.warn('[note_detect] YIN received an undersized buffer — low-frequency (bass) notes will drop silently. Check the frame accumulation path.');
             _ndUnderBufferWarned = true;
+        }
+        if (_ndFrameLogEnabled) {
+            _ndFrameLog.push({
+                t: performance.now() / 1000,
+                type: 'reject_conf',
+                freq: result.freq.toFixed(1),
+                conf: result.confidence.toFixed(2),
+                level: _ndInputLevel.toFixed(4),
+            });
+            if (_ndFrameLog.length > _ND_FRAME_LOG_MAX) _ndFrameLog.shift();
+        }
+        _ndDetectedMidi = -1;
+        _ndDetectedConfidence = 0;
+        _ndDetectedString = -1;
+        _ndDetectedFret = -1;
+        return;
+    }
+
+    // ── Silence gate ─────────────────────────────────────────────────────
+    // YIN returns high confidence on electrical hum / noise floor.
+    // Reject detections when the raw RMS input level is below the gate.
+    // _ndInputLevel is already scaled (rms * 5), so 0.01 ≈ raw RMS 0.002.
+    // Typical quiet guitar hum: 0.001-0.003. Soft pluck: 0.02+.
+    if (_ndInputLevel < _ndSilenceGate) {
+        if (_ndFrameLogEnabled) {
+            _ndFrameLog.push({
+                t: performance.now() / 1000,
+                type: 'reject_gate',
+                freq: result.freq.toFixed(1),
+                conf: result.confidence.toFixed(2),
+                level: _ndInputLevel.toFixed(4),
+                midi: _ndFreqToMidi(result.freq).toFixed(1),
+            });
+            if (_ndFrameLog.length > _ND_FRAME_LOG_MAX) _ndFrameLog.shift();
+        }
+        // Flush stability history on silence — stale votes from the previous
+        // note would otherwise produce false stable detections when signal
+        // briefly returns. Proven in flashcard plugin testing.
+        if (_ndRawMidiHistory.length > 0) {
+            _ndRawMidiHistory = [];
+            _ndStableMidi = -1;
+            _ndLastMatchMidi = -1;  // allow same note to re-match after silence
         }
         _ndDetectedMidi = -1;
         _ndDetectedConfidence = 0;
@@ -2177,10 +2232,53 @@ async function _ndProcessFrame(buffer) {
         return;
     }
 
-    // Only run chart matching when the detection has stabilized — otherwise
-    // we'd score attack-transient jitter as separate candidates and most
-    // notes would log a pitch_miss that scoring-correctly should be a hit.
-    if (_ndStableMidi < 0) return;
+    // ── Event-driven chart matching ─────────────────────────────────────
+    // Only match when stable pitch CHANGES, not every frame. Continuous
+    // matching caused sustained note N to poison match attempts against
+    // chart note N+1. The flashcard plugin proved event-driven matching
+    // works — same approach here.
+    //
+    // Stability voting is now the gate: we wait for 3-of-5 agreement,
+    // then match once. No transient filter needed (was blocking real
+    // transitions like E→A = 5 semitones).
+    const now = performance.now() / 1000;
+
+    if (_ndStableMidi < 0) {
+        // Not stable yet — don't match. Log for diagnostics.
+        if (_ndFrameLogEnabled) {
+            _ndFrameLog.push({
+                t: now, type: 'unstable',
+                midi: _ndDetectedMidi.toFixed(1),
+                conf: _ndDetectedConfidence.toFixed(2),
+                level: _ndInputLevel.toFixed(3),
+            });
+            if (_ndFrameLog.length > _ND_FRAME_LOG_MAX) _ndFrameLog.shift();
+        }
+        return;
+    }
+
+    // Log every stable frame
+    if (_ndFrameLogEnabled) {
+        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+        const scoreT = highway.getTime() + avOffsetSec - _ndLatencyOffset;
+        _ndFrameLog.push({
+            t: now, type: 'stable',
+            midi: _ndStableMidi,
+            conf: _ndDetectedConfidence.toFixed(2),
+            scoreT: scoreT.toFixed(3),
+            chartT: highway.getTime().toFixed(3),
+            level: _ndInputLevel.toFixed(3),
+        });
+        if (_ndFrameLog.length > _ND_FRAME_LOG_MAX) _ndFrameLog.shift();
+    }
+
+    // Only match on note CHANGE — but expire the lock after 1s so replayed
+    // notes aren't blocked. Without this, F1→(3.7s gap)→F1 is silently
+    // dropped because _ndLastMatchMidi never cleared (silence gate might
+    // not fire if bass sustain stays above the gate threshold).
+    if (_ndStableMidi === _ndLastMatchMidi && (now - _ndLastMatchTime) < 1.0) return;
+    _ndLastMatchMidi = _ndStableMidi;
+    _ndLastMatchTime = now;
 
     _ndMatchNotes();
 }
@@ -2197,26 +2295,25 @@ function _ndMidiFromStringFret(string, fret, arrangement = _ndCurrentArrangement
 }
 
 function _ndMidiToStringFret(midiNote, arrangement = _ndCurrentArrangement) {
-    // Pure geometric fallback: walk strings 0..N and return the first position
-    // that matches the pitch. Used when there is no chart context available
-    // (player noodling between chart notes). When a chart note is in play,
-    // _ndResolveDisplayFingering picks the chart's (s, f) instead — see the
-    // research notes in mapping-bass.test.js.
+    // Pure geometric fallback: find the string/fret combination with the
+    // lowest fret number (prefer open strings and low positions over high
+    // frets on lower strings). When tied on fret, prefer higher string
+    // index (thinner string). This gives musically sensible assignments:
+    // MIDI 43 on bass → s3/f0 (open G), not s0/f15.
     const base = _ndStandardMidiFor(arrangement);
-    let bestDist = Infinity;
     let bestString = -1;
-    let bestFret = -1;
+    let bestFret = 25; // start worse than any valid fret
     for (let s = 0; s < base.length; s++) {
         const openMidi = base[s] + _ndTuningOffsets[s] + _ndCapo;
         const fret = Math.round(midiNote - openMidi);
         if (fret < 0 || fret > 24) continue;
-        const dist = Math.abs(midiNote - (openMidi + fret));
-        if (dist < bestDist) {
-            bestDist = dist;
+        // Prefer lowest fret; on tie prefer highest string index
+        if (fret < bestFret || (fret === bestFret && s > bestString)) {
             bestString = s;
             bestFret = fret;
         }
     }
+    if (bestString < 0) return { string: -1, fret: -1 };
     return { string: bestString, fret: bestFret };
 }
 
@@ -2258,23 +2355,21 @@ function _ndBsearch(arr, target) {
 }
 
 function _ndMatchNotes() {
-    // Compensate for audio input latency: the detected pitch corresponds to
-    // what the player played ~latencyOffset ago, so shift the comparison window back.
-    // Also add the core's A/V render offset so we match against the chart time
-    // the user was visually aiming at (the highway's rendered time = getTime() +
-    // avOffset). Without this, a non-zero A/V offset makes every detection miss
-    // by exactly that offset, since getTime() returns the audio-aligned chart
-    // time while the player is playing to the visually-shifted strum bar.
+    // Event-driven matching: this function is now called only when the stable
+    // pitch changes (not every frame). Use the STABLE midi for scoring — it's
+    // been validated by 3-of-5 agreement and confidence 0.7.
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
     const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
-    // Use the stability-voted MIDI for scoring (set in _ndProcessFrame).
-    // Falls back to the raw value only if stability never ran (e.g. tests).
-    const scoreMidi = (_ndStableMidi >= 0) ? _ndStableMidi : _ndDetectedMidi;
+    const scoreMidi = _ndStableMidi;
     if (scoreMidi < 0) return;
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
-    const tolerance = _ndTimingTolerance;
+    // Wider window for event-driven matching: pitch specificity (50 cents)
+    // provides the selectivity that the tight timing window used to provide.
+    // Stability voting adds ~250ms latency, so the old ±110ms window was
+    // physically impossible. Use ±500ms — enough for the detection pipeline.
+    const tolerance = Math.max(_ndTimingTolerance, 0.5);
     const centsTolerance = _ndPitchTolerance;
 
     const candidateNotes = [];
@@ -2328,10 +2423,15 @@ function _ndMatchNotes() {
         }
     }
     if (closest) {
-        const expectedMidi = _ndMidiFromStringFret(closest.s, closest.f);
+        const expectedMidi = _ndMidiFromStringFret(closest.s, closest.f) + _ndPitchOffset;
         const centsErr = (scoreMidi - expectedMidi) * 100;
         const hit = Math.abs(closestDt) <= tolerance * 1000 && Math.abs(centsErr) <= centsTolerance;
-        _ndEventLog.push({ dtMs: closestDt, centsErr, hit, time: t });
+        _ndEventLog.push({
+            dtMs: closestDt, centsErr, hit, time: t,
+            detectedMidi: scoreMidi,
+            expectedMidi,
+            chartNote: `s${closest.s}/f${closest.f}`,
+        });
         if (_ndEventLog.length > _ND_EVENT_WINDOW) _ndEventLog.shift();
     }
 
@@ -2339,7 +2439,7 @@ function _ndMatchNotes() {
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
 
-        const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
+        const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f) + _ndPitchOffset;
         const rawCents = (scoreMidi - expectedMidi) * 100;
         // Octave-up harmonic tolerance — see the longer note below. Still
         // chart-context-aware: only applied when it explains a match.
@@ -2376,6 +2476,7 @@ function _ndMatchNotes() {
             _ndStreak++;
             if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
             _ndUpdateSectionStat('hit');
+            _ndRecordNowlineJudgment(cn.s, cn.f, _ndNoteResults.get(key));
         }
     }
 }
@@ -3045,7 +3146,8 @@ function _ndCheckMisses() {
     // same clock (visual-target time the player is actually aiming at).
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
     const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
-    const tolerance = _ndTimingTolerance;
+    // Use the same effective tolerance as _ndMatchNotes (wider for event-driven)
+    const tolerance = Math.max(_ndTimingTolerance, 0.5);
     const missDeadline = t - tolerance * 2; // notes older than this are missed
     const notes = highway.getNotes();
     const chords = highway.getChords();
@@ -3067,13 +3169,14 @@ function _ndCheckMisses() {
                 timingError: null,              // no meaningful timing for full miss
                 pitchError: hadDetection ? bestPitchErr : null,
                 detectedMidi: null,
-                expectedMidi: _ndMidiFromStringFret(s, f),
+                expectedMidi: _ndMidiFromStringFret(s, f) + _ndPitchOffset,
             });
             _ndMisses++;
             if (hadDetection) _ndPitchMisses++;
             else _ndTimingMisses++;
             _ndStreak = 0;
             _ndUpdateSectionStat('miss');
+            _ndRecordNowlineJudgment(s, f, _ndNoteResults.get(key));
         }
         if (gainNode) {
             try { gainNode.disconnect(); } catch (e) {}
@@ -3219,6 +3322,11 @@ function _ndShowSettings() {
             <option value="crepe" ${_ndDetectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
         </select>
 
+        <label class="block text-gray-400 text-xs mb-1">Silence Gate: <span id="nd-gate-val">${Math.round(_ndSilenceGate * 100)}</span>%</label>
+        <input type="range" min="0" max="20" value="${Math.round(_ndSilenceGate * 100)}"
+               class="w-full accent-yellow-400 mb-3"
+               oninput="_ndSilenceGate=this.value/100;document.getElementById('nd-gate-val').textContent=this.value;_ndSaveSettings()"
+               title="Reject detections when input level is below this threshold. Raise to suppress noise/hum.">
         <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndLatencyOffset * 1000)}</span>ms</label>
         <input type="range" min="0" max="1000" value="${Math.round(_ndLatencyOffset * 1000)}"
                class="w-full accent-green-400 mb-2"
@@ -3247,6 +3355,14 @@ function _ndShowSettings() {
         <input type="range" min="10" max="100" value="${_ndPitchTolerance}"
                class="w-full accent-green-400 mb-3"
                oninput="_ndPitchTolerance=+this.value;document.getElementById('nd-pitch-val').textContent=this.value;_ndSaveSettings()">
+
+        <label class="block text-gray-400 text-xs mb-1">Pitch Offset: <span id="nd-poffset-val">${_ndPitchOffset >= 0 ? '+' : ''}${_ndPitchOffset}</span> semitones</label>
+        <input type="range" min="-5" max="5" value="${_ndPitchOffset}"
+               class="w-full accent-blue-400 mb-1"
+               oninput="_ndPitchOffset=+this.value;document.getElementById('nd-poffset-val').textContent=(_ndPitchOffset>=0?'+':'')+_ndPitchOffset;_ndSaveSettings()">
+        <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+            Compensates for chart CentOffset or tuning metadata errors. Auto-calibrates from your play data — if detections are systematically off by N semitones, this adjusts automatically. Set to 0 to reset.
+        </div>
 
         <label class="block text-gray-400 text-xs mb-1">Input Gain: <span id="nd-gain-val">${_ndInputGain.toFixed(1)}</span>x</label>
         <input type="range" min="1" max="50" value="${Math.round(_ndInputGain * 10)}"
@@ -3454,127 +3570,368 @@ function _ndUpdateHUD() {
     }
 }
 
+// ── Display tuning ───────────────────────────────────────────────────────
+const _ND_HIT_DISPLAY_SEC  = 4.0;   // green glow persists
+const _ND_MISS_DISPLAY_SEC = 15.0;  // miss markers persist long enough to actually see
+const _ND_MISS_LOOKBACK    = 15.0;  // seconds to look back for missed notes
+const _ND_DIAG_FONT_PX     = 18;    // diagnostic label base font size — must be readable
+
+// ── Now-line judgment queue ──────────────────────────────────────────────
+// Renders at project(0) which is KNOWN to work (the detection dot is there).
+// This is the primary visual feedback — the past-note markers are secondary.
+const _ND_NOWLINE_DISPLAY_SEC = 3.0;  // how long a judgment shows at the now-line
+let _ndNowlineJudgments = [];  // [{string, fret, time, judgment}]
+
+function _ndRecordNowlineJudgment(s, f, judgment) {
+    _ndNowlineJudgments.push({
+        string: s, fret: f,
+        time: performance.now() / 1000,
+        judgment,
+    });
+    // Cap at 20 entries
+    if (_ndNowlineJudgments.length > 20) _ndNowlineJudgments.shift();
+}
+
 // 2D highway draw hook — uses project()/fretX() for accurate positioning.
-// Only draws when the 2D highway is active (these APIs exist on the highway object).
 highway.addDrawHook(function(ctx, W, H) {
     if (!_ndEnabled) return;
-    // Only draw note indicators if highway exposes projection (2D mode)
     if (!highway.project || !highway.fretX) return;
+
+    _ndCheckAutoDump();
 
     const t = highway.getTime();
     const notes = highway.getNotes();
     const chords = highway.getChords();
 
-    const drawIndicator = (s, f, noteTime, result) => {
+    // ── Draw a single judgment ───────────────────────────────────────────
+    const drawJudgment = (s, f, noteTime, judgment) => {
         const tOff = noteTime - t;
-        const p = highway.project(tOff);
+        // For past notes: clamp projection so they sit just below the now-line
+        // instead of flying off-screen. project() rejects tOff < -0.05.
+        const p = highway.project(Math.max(tOff, -0.12));
         if (!p) return;
         const x = highway.fretX(f, p.scale, W);
         const y = p.y * H;
+        const age = t - noteTime; // positive = past
 
-        const age = Math.abs(t - noteTime);
-        const fade = Math.max(0, 1 - age / 0.6) * p.scale;
-        if (fade <= 0) return;
-
-        // Normalize: the judgment can be the new object form, the older plain
-        // strings ('hit' / 'pitch_miss' / 'timing_miss' / 'miss'), or null.
-        const primary = (result && typeof result === 'object') ? result.primary
-                      : (result === 'hit') ? 'HIT'
-                      : (result === 'pitch_miss') ? 'MISSED_WRONG_PITCH'
-                      : (result === 'timing_miss' || result === 'miss') ? 'MISSED_NO_DETECTION'
+        const primary = (judgment && typeof judgment === 'object') ? judgment.primary
+                      : (judgment === 'hit') ? 'HIT'
+                      : (judgment === 'pitch_miss') ? 'MISSED_WRONG_PITCH'
+                      : (judgment === 'timing_miss' || judgment === 'miss') ? 'MISSED_NO_DETECTION'
                       : null;
         if (!primary) return;
 
         if (primary === 'HIT') {
+            // ── HIT: green glow ring + optional timing/pitch labels ──────
+            // Full opacity for most of the duration, fade only in last 1s
+            if (age > _ND_HIT_DISPLAY_SEC) return;
+            const fadeStart = _ND_HIT_DISPLAY_SEC - 1;
+            const fade = age < fadeStart ? 1.0 : Math.max(0, 1 - (age - fadeStart));
+            const sz = Math.max(24, 32 * p.scale);
+
             ctx.save();
-            ctx.globalAlpha = fade * 0.7;
+            ctx.globalAlpha = fade;
+            ctx.globalCompositeOperation = 'lighter';
             ctx.shadowColor = '#00ff88';
-            ctx.shadowBlur = 20 * p.scale;
-            ctx.strokeStyle = '#00ff88';
-            ctx.lineWidth = 3 * p.scale;
+            ctx.shadowBlur = 36 * p.scale;
+            // Filled green disc behind the note
+            ctx.fillStyle = 'rgba(0, 255, 136, 0.3)';
             ctx.beginPath();
-            ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
+            ctx.arc(x, y, sz, 0, Math.PI * 2);
+            ctx.fill();
+            // Thick ring
+            ctx.strokeStyle = '#00ff88';
+            ctx.lineWidth = Math.max(4, 5 * p.scale);
+            ctx.beginPath();
+            ctx.arc(x, y, sz, 0, Math.PI * 2);
             ctx.stroke();
             ctx.restore();
 
-            // Label any compound off-axis tags (EARLY / LATE / SHARP / FLAT).
-            // Kept brief — a 3-char monogram next to the ring.
-            const labels = result && result.labels ? result.labels : [];
-            if (labels.length) {
-                const tag = labels.map(l =>
-                    l === 'EARLY' ? '↑E' : l === 'LATE' ? '↓L' :
-                    l === 'SHARP' ? '♯' : l === 'FLAT' ? '♭' : ''
-                ).filter(Boolean).join(' ');
-                ctx.save();
-                ctx.globalAlpha = fade * 0.85;
-                ctx.fillStyle = '#ffcc00';
-                ctx.font = `bold ${Math.max(9, 11 * p.scale)}px sans-serif`;
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'top';
-                ctx.fillText(tag, x, y + 16 * p.scale);
-                ctx.restore();
+            // Show diagnostic labels on imperfect hits
+            const labels = judgment && judgment.labels ? judgment.labels : [];
+            if (labels.length && fade > 0.2) {
+                _ndDrawDiagLabels(ctx, x, y, p.scale, judgment, fade);
             }
-        } else if (primary === 'MISSED_WRONG_PITCH' || primary === 'MISSED_NO_DETECTION') {
-            // Brighter red for pitch misses (detection happened) vs dimmer for
-            // no-detection misses. Same X glyph for both.
-            const colour = primary === 'MISSED_NO_DETECTION' ? '#aa2233' : '#ff3344';
+        } else {
+            // ── MISS: massive persistent marker + diagnostic labels ──────
+            if (age < 0) return; // don't mark future notes
+            // Full opacity for most of duration, fade only in last 2s
+            const rawFade = Math.max(0, 1 - age / _ND_MISS_DISPLAY_SEC);
+            if (rawFade <= 0) return;
+            const fadeStart = _ND_MISS_DISPLAY_SEC - 2;
+            const fade = age < fadeStart ? 1.0 : Math.max(0, 1 - (age - fadeStart) / 2);
+
+            const isTiming = primary === 'MISSED_NO_DETECTION';
+            const colour = isTiming ? '#ff2244' : '#ff6644';
+            const sz = Math.max(20, 28 * p.scale);
+
             ctx.save();
-            ctx.globalAlpha = fade * 0.5;
+            ctx.globalAlpha = fade;
+
+            // Filled background circle so the X sits on a dark disc
+            ctx.fillStyle = 'rgba(40, 0, 0, 0.7)';
+            ctx.beginPath();
+            ctx.arc(x, y, sz + 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Big bold X — thick lines, heavy glow
             ctx.shadowColor = colour;
-            ctx.shadowBlur = 12 * p.scale;
+            ctx.shadowBlur = 24 * p.scale;
             ctx.strokeStyle = colour;
-            ctx.lineWidth = 2 * p.scale;
-            const sz = 8 * p.scale;
+            ctx.lineWidth = Math.max(4, 6 * p.scale);
+            ctx.lineCap = 'round';
             ctx.beginPath();
             ctx.moveTo(x - sz, y - sz);
             ctx.lineTo(x + sz, y + sz);
             ctx.moveTo(x + sz, y - sz);
             ctx.lineTo(x - sz, y + sz);
             ctx.stroke();
+
+            // Outer ring — always visible, pulsing
+            const pulse = 0.6 + 0.4 * Math.sin(age * 4);
+            ctx.globalAlpha = fade * pulse;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(x, y, sz + 10, 0, Math.PI * 2);
+            ctx.stroke();
+
             ctx.restore();
+
+            // Diagnostic: WHY was it missed?
+            _ndDrawDiagLabels(ctx, x, y, p.scale, judgment, fade);
         }
     };
 
-    // Draw results for recent notes
+    // ── Diagnostic labels drawn above the note ───────────────────────────
+    function _ndDrawDiagLabels(ctx, x, y, scale, judgment, fade) {
+        const fontSize = Math.max(16, _ND_DIAG_FONT_PX * scale) | 0;
+        const lineH = fontSize + 8;
+        let labelY = y - Math.max(24, 34 * scale) - 4;
+        const primary = (typeof judgment === 'object') ? judgment.primary : judgment;
+
+        ctx.save();
+        ctx.globalAlpha = Math.min(fade, 1.0);
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        // Black outline so text is readable against any background
+        ctx.shadowColor = '#000';
+        ctx.shadowBlur = 6;
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#000';
+
+        if (primary === 'MISSED_NO_DETECTION') {
+            ctx.fillStyle = '#ff2244';
+            highway.fillTextUnmirrored('NO INPUT', x, labelY);
+            // Double-draw for outline effect
+            ctx.globalCompositeOperation = 'destination-over';
+            ctx.strokeText('NO INPUT', x, labelY);
+            ctx.globalCompositeOperation = 'source-over';
+            labelY -= lineH;
+        } else if (primary === 'MISSED_WRONG_PITCH') {
+            ctx.fillStyle = '#ff6644';
+            const cErr = judgment.pitchError;
+            const label = (cErr !== null && cErr !== undefined)
+                ? (cErr > 0 ? `+${Math.round(cErr)}\u00a2` : `${Math.round(cErr)}\u00a2`)
+                : 'WRONG PITCH';
+            highway.fillTextUnmirrored(label, x, labelY);
+            labelY -= lineH;
+        }
+
+        // Timing error (for hits and pitch-misses that had timing data)
+        if (judgment.timingError !== null && judgment.timingError !== undefined) {
+            const ms = Math.round(judgment.timingError);
+            if (Math.abs(ms) > _ND_PERFECT_TIMING_MS) {
+                ctx.fillStyle = '#ffaa33';
+                const arrow = ms > 0 ? '\u2193' : '\u2191';
+                const sign = ms > 0 ? '+' : '';
+                highway.fillTextUnmirrored(`${arrow} ${sign}${ms}ms`, x, labelY);
+                labelY -= lineH;
+            }
+        }
+
+        // Pitch error on imperfect hits
+        if (primary === 'HIT' && judgment.pitchError !== null && judgment.pitchError !== undefined) {
+            const cents = Math.round(judgment.pitchError);
+            if (Math.abs(cents) > _ND_PERFECT_PITCH_CENT) {
+                ctx.fillStyle = '#44aaff';
+                const sym = cents > 0 ? '\u266f' : '\u266d';
+                const sign = cents > 0 ? '+' : '';
+                highway.fillTextUnmirrored(`${sym} ${sign}${cents}\u00a2`, x, labelY);
+            }
+        }
+
+        ctx.restore();
+    }
+
+    // ── Iterate chart notes — look back far enough for persistent markers ─
     if (notes) {
-        for (const n of notes) {
-            if (n.t < t - 0.5) continue;
+        const start = _ndBsearch(notes, t - _ND_MISS_LOOKBACK);
+        for (let i = start; i < notes.length; i++) {
+            const n = notes[i];
             if (n.t > t + 3) break;
             if (n.mt) continue;
             const key = _ndNoteKey(n, n.t);
-            const result = _ndNoteResults.get(key);
-            if (result) drawIndicator(n.s, n.f, n.t, result);
+            const judgment = _ndNoteResults.get(key);
+            if (judgment) drawJudgment(n.s, n.f, n.t, judgment);
         }
     }
     if (chords) {
-        for (const c of chords) {
-            if (c.t < t - 0.5) continue;
+        const start = _ndBsearch(chords, t - _ND_MISS_LOOKBACK);
+        for (let i = start; i < chords.length; i++) {
+            const c = chords[i];
             if (c.t > t + 3) break;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 const key = _ndNoteKey(cn, c.t);
-                const result = _ndNoteResults.get(key);
-                if (result) drawIndicator(cn.s, cn.f, c.t, result);
+                const judgment = _ndNoteResults.get(key);
+                if (judgment) drawJudgment(cn.s, cn.f, c.t, judgment);
             }
         }
     }
 
-    // Detected note indicator at the now line
+    // ── Now-line judgment markers ──────────────────────────────────────────
+    // Primary visual feedback. Renders at project(0) which WORKS (the detection
+    // dot proves it). Shows hit/miss at the now-line at the correct fret position.
+    {
+        const p0 = highway.project(0);
+        if (p0) {
+            const nowSec = performance.now() / 1000;
+            for (const j of _ndNowlineJudgments) {
+                const age = nowSec - j.time;
+                if (age > _ND_NOWLINE_DISPLAY_SEC) continue;
+                // Full opacity, fade only in last 0.5s
+                const fade = age < (_ND_NOWLINE_DISPLAY_SEC - 0.5)
+                    ? 1.0 : Math.max(0, 1 - (age - (_ND_NOWLINE_DISPLAY_SEC - 0.5)) / 0.5);
+                if (fade <= 0) continue;
+
+                const x = highway.fretX(j.fret, p0.scale, W);
+                // Offset below the now-line so it doesn't overlap incoming notes.
+                // Each judgment stacks down slightly based on age.
+                const yBase = p0.y * H;
+                const yOff = 30 + age * 25; // drift downward over time
+                const y = yBase + yOff;
+                if (y > H) continue; // off-screen
+
+                const primary = j.judgment?.primary || '';
+                const sz = Math.max(18, 24 * p0.scale);
+                const fontSize = Math.max(14, 18 * p0.scale) | 0;
+
+                ctx.save();
+                ctx.globalAlpha = fade;
+
+                if (primary === 'HIT') {
+                    // Green check mark
+                    ctx.fillStyle = 'rgba(0, 60, 20, 0.7)';
+                    ctx.beginPath();
+                    ctx.arc(x, y, sz, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.strokeStyle = '#00ff88';
+                    ctx.shadowColor = '#00ff88';
+                    ctx.shadowBlur = 16;
+                    ctx.lineWidth = Math.max(4, 5 * p0.scale);
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    // Check mark shape
+                    ctx.moveTo(x - sz * 0.5, y);
+                    ctx.lineTo(x - sz * 0.1, y + sz * 0.4);
+                    ctx.lineTo(x + sz * 0.5, y - sz * 0.4);
+                    ctx.stroke();
+
+                    // Show labels for imperfect hits
+                    const labels = j.judgment?.labels || [];
+                    if (labels.length > 0) {
+                        ctx.shadowBlur = 0;
+                        ctx.font = `bold ${fontSize}px sans-serif`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'top';
+                        ctx.fillStyle = '#ffaa33';
+                        ctx.strokeStyle = '#000';
+                        ctx.lineWidth = 3;
+                        const labelText = labels.join(' ');
+                        ctx.strokeText(labelText, x, y + sz + 4);
+                        ctx.fillText(labelText, x, y + sz + 4);
+                    }
+                } else if (primary === 'MISSED_NO_DETECTION' || primary === 'MISSED_WRONG_PITCH') {
+                    const isTiming = primary === 'MISSED_NO_DETECTION';
+                    const colour = isTiming ? '#ff2244' : '#ff6644';
+
+                    // Dark disc background
+                    ctx.fillStyle = 'rgba(60, 0, 0, 0.8)';
+                    ctx.beginPath();
+                    ctx.arc(x, y, sz, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Big X
+                    ctx.strokeStyle = colour;
+                    ctx.shadowColor = colour;
+                    ctx.shadowBlur = 18;
+                    ctx.lineWidth = Math.max(4, 5 * p0.scale);
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(x - sz * 0.6, y - sz * 0.6);
+                    ctx.lineTo(x + sz * 0.6, y + sz * 0.6);
+                    ctx.moveTo(x + sz * 0.6, y - sz * 0.6);
+                    ctx.lineTo(x - sz * 0.6, y + sz * 0.6);
+                    ctx.stroke();
+
+                    // Label: "NO INPUT" or pitch error
+                    ctx.shadowBlur = 0;
+                    ctx.font = `bold ${fontSize}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'top';
+                    ctx.strokeStyle = '#000';
+                    ctx.lineWidth = 3;
+                    let label = isTiming ? 'MISS' : '';
+                    if (!isTiming && j.judgment?.pitchError != null) {
+                        const c = Math.round(j.judgment.pitchError);
+                        label = `${c > 0 ? '+' : ''}${c}\u00a2`;
+                    }
+                    if (label) {
+                        ctx.fillStyle = colour;
+                        ctx.strokeText(label, x, y + sz + 4);
+                        ctx.fillText(label, x, y + sz + 4);
+                    }
+                }
+
+                ctx.restore();
+            }
+
+            // Prune old entries
+            _ndNowlineJudgments = _ndNowlineJudgments.filter(
+                j => (nowSec - j.time) < _ND_NOWLINE_DISPLAY_SEC
+            );
+        }
+    }
+
+    // ── Detected-note indicator at the now line ──────────────────────────
+    // Larger and brighter so it's actually visible.
     if (_ndDetectedString >= 0 && _ndDetectedConfidence > 0.3) {
-        const p = highway.project(0); // now line
+        const p = highway.project(0);
         if (p) {
             const x = highway.fretX(_ndDetectedFret, p.scale, W);
             const y = p.y * H;
+            const dotR = Math.max(12, 16 * p.scale);
+
             ctx.save();
-            ctx.globalAlpha = Math.min(1, _ndDetectedConfidence);
-            ctx.fillStyle = '#44ddff';
+            ctx.globalAlpha = Math.min(1, _ndDetectedConfidence * 1.3);
             ctx.shadowColor = '#44ddff';
-            ctx.shadowBlur = 12;
+            ctx.shadowBlur = 22;
+            // Outer ring
+            ctx.strokeStyle = '#44ddff';
+            ctx.lineWidth = 3;
             ctx.beginPath();
-            ctx.arc(x, y, 6, 0, Math.PI * 2);
+            ctx.arc(x, y, dotR, 0, Math.PI * 2);
+            ctx.stroke();
+            // Solid center
+            ctx.fillStyle = '#44ddff';
+            ctx.beginPath();
+            ctx.arc(x, y, dotR * 0.45, 0, Math.PI * 2);
             ctx.fill();
+            // Fret number
             ctx.fillStyle = '#000';
-            ctx.font = 'bold 7px sans-serif';
+            ctx.font = `bold ${Math.max(10, 12 * p.scale) | 0}px sans-serif`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(_ndDetectedFret, x, y);
@@ -3607,6 +3964,15 @@ function _ndInjectButton() {
     gear.title = 'Note detection settings';
     gear.onclick = _ndShowSettings;
     controls.insertBefore(gear, closeBtn);
+
+    // Diag button
+    const diag = document.createElement('button');
+    diag.id = 'btn-notedetect-diag';
+    diag.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+    diag.textContent = '\u2261';
+    diag.title = 'Detection diagnostics';
+    diag.onclick = _ndToggleDiag;
+    controls.insertBefore(diag, closeBtn);
 }
 
 function _ndUpdateButton() {
@@ -3621,6 +3987,8 @@ function _ndUpdateButton() {
     }
     const gear = document.getElementById('btn-notedetect-settings');
     if (gear) gear.classList.toggle('hidden', !_ndEnabled);
+    const diag = document.getElementById('btn-notedetect-diag');
+    if (diag) diag.classList.toggle('hidden', !_ndEnabled);
 }
 
 async function _ndToggle() {
@@ -3630,8 +3998,16 @@ async function _ndToggle() {
     if (_ndEnabled) {
         // Read tuning from song info
         const info = highway.getSongInfo();
-        if (info && info.tuning) {
+        console.log('[note_detect] Song info:', JSON.stringify({
+            title: info?.title, arrangement: info?.arrangement,
+            tuning: info?.tuning, tuningType: typeof info?.tuning,
+            capo: info?.capo,
+        }));
+        if (info && Array.isArray(info.tuning)) {
             _ndTuningOffsets = info.tuning;
+        } else if (info && info.tuning) {
+            console.warn('[note_detect] info.tuning is not an array:', info.tuning);
+            // Leave _ndTuningOffsets at default [0,...] — don't set to a string
         }
         if (info && info.capo !== undefined) {
             _ndCapo = info.capo;
@@ -8094,21 +8470,21 @@ function _ndResetScoring() {
     return api;
 }
 
-// ── playSong wrapper (idempotent) ──────────────────────────────────────────
-// On a new song, disable every live instance so scoring doesn't carry over,
-// then let the original playSong load the chart, then re-inject the default
-// singleton's button.
-//
-// The idempotency guard lives on the wrapper function itself
-// (`wrapper._ndWrapped = true`) rather than on a module-level flag.
-// Module scope resets on every evaluation, so HMR or a double
-// <script> load would see a false module flag, wrap the already-
-// wrapped `window.playSong`, and produce a nested wrapper that
-// disables instances twice per song switch. Marking the function
-// itself persists across re-evaluations because `window.playSong`
-// keeps the reference.
-const _ND_PLAY_SONG_MAX_RETRIES = 20;
-function _ndInstallPlaySongHook() {
+// ── Garbage Collection ─────────────────────────────────────────────────────
+// Prune old note results to prevent unbounded memory growth
+
+setInterval(() => {
+    if (!_ndEnabled || _ndNoteResults.size < 500) return;
+    const t = highway.getTime();
+    for (const [key, _] of _ndNoteResults) {
+        const noteTime = parseFloat(key.split('_')[0]);
+        if (noteTime < t - 20) _ndNoteResults.delete(key);
+    }
+}, 5000);
+
+// ── Hook into playSong ─────────────────────────────────────────────────────
+
+(function() {
     const origPlaySong = window.playSong;
     if (typeof origPlaySong !== 'function') {
         // playSong may not exist yet. Common on HMR or unusual load
@@ -8155,27 +8531,528 @@ function _ndInstallPlaySongHook() {
             _ndSetArrangement(info.arrangement);
         }
     };
-    wrapper._ndWrapped = true;
-    window.playSong = wrapper;
+})();
+
+// ── Built-in Diagnostic Panel ─────────────────────────────────────────────
+// Bottom-docked, doesn't obscure the highway. Toggle via ≡ button.
+
+let _ndDiagOpen = false;
+let _ndDiagInterval = null;
+let _ndDiagProfileLog = [];
+let _ndDiagPaused = false;
+
+function _ndToggleDiag() {
+    _ndDiagOpen = !_ndDiagOpen;
+    if (_ndDiagOpen) _ndOpenDiag();
+    else _ndCloseDiag();
 }
 
-// ── Singleton + bootstrap ──────────────────────────────────────────────────
-// Reuse an existing default instance if the file has been evaluated
-// before (HMR, accidental double <script> load). Without this, each
-// evaluation would call `createNoteDetector({isDefault:true})` afresh
-// — and since `_ndShared.instances` is anchored on window, the old
-// default would still be in the registry, producing duplicate Detect
-// buttons and per-instance DOM on every reload. Pair this with the
-// playSong-wrapper idempotency guard already in place; both together
-// keep double-load end-to-end idempotent.
-const _ndExistingDefault = (window.noteDetect && typeof window.noteDetect.injectButton === 'function')
-    ? window.noteDetect
-    : null;
-const _ndDefaultInstance = _ndExistingDefault || createNoteDetector({ isDefault: true });
-window.noteDetect = _ndDefaultInstance;
-window.createNoteDetector = createNoteDetector;
+function _ndCloseDiag() {
+    _ndDiagOpen = false;
+    if (_ndDiagInterval) { clearInterval(_ndDiagInterval); _ndDiagInterval = null; }
+    const el = document.getElementById('nd-diag-panel');
+    if (el) el.remove();
+}
 
-_ndInstallPlaySongHook();
-// Only inject on first evaluation — re-injecting on a subsequent load
-// would duplicate the button, since the old one is still in the DOM.
-if (!_ndExistingDefault) _ndDefaultInstance.injectButton();
+function _ndOpenDiag() {
+    _ndCloseDiag();
+    _ndDiagOpen = true;
+
+    const panel = document.createElement('div');
+    panel.id = 'nd-diag-panel';
+    panel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#0d0d18;border-top:2px solid #336;font:11px/1.5 monospace;color:#ccc;max-height:35vh;overflow-y:auto;padding:6px 12px;';
+    document.body.appendChild(panel);
+
+    _ndDiagProfileLog = [];
+    _ndDiagPaused = false;
+    _ndDiagRender(panel);
+
+    // Auto-refresh at 4fps — skip when paused so text is selectable
+    _ndDiagInterval = setInterval(() => {
+        if (!_ndDiagPaused) _ndDiagRender(panel);
+    }, 250);
+}
+
+function _ndDiagTogglePause() {
+    _ndDiagPaused = !_ndDiagPaused;
+    const btn = document.getElementById('nd-diag-pause-btn');
+    if (btn) {
+        btn.textContent = _ndDiagPaused ? 'PAUSED (resume)' : 'Pause';
+        btn.style.background = _ndDiagPaused ? '#642' : '#333';
+        btn.style.color = _ndDiagPaused ? '#fa4' : '#aaa';
+    }
+}
+
+function _ndDiagDumpToConsole() {
+    console.log('=== NOTE DETECTION DIAGNOSTIC DUMP ===');
+    console.log('Arrangement:', _ndCurrentArrangement);
+    console.log('Tuning offsets:', _ndTuningOffsets.slice(0, _ndStandardMidiFor(_ndCurrentArrangement).length));
+    console.log('Capo:', _ndCapo);
+    console.log('Latency offset:', _ndLatencyOffset * 1000, 'ms');
+    console.log('AV offset:', highway.getAvOffset ? highway.getAvOffset() : 0, 'ms');
+    console.log('Timing tolerance:', _ndTimingTolerance * 1000, 'ms');
+    console.log('Pitch tolerance:', _ndPitchTolerance, 'cents');
+    console.log('Silence gate:', _ndSilenceGate);
+    console.log('Scoring:', _ndHits, 'hits,', _ndMisses, 'misses');
+    console.log('');
+    console.log('--- Event Log (last', _ndEventLog.length, 'match attempts) ---');
+    for (const e of _ndEventLog) {
+        const midiName = (m) => {
+            if (!m || m < 0) return '?';
+            const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+            const r = Math.round(m);
+            return `${names[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
+        };
+        const dt = `${e.dtMs > 0 ? '+' : ''}${Math.round(e.dtMs)}ms`;
+        const cents = `${e.centsErr > 0 ? '+' : ''}${Math.round(e.centsErr)}¢`;
+        const det = e.detectedMidi ? `detected:${midiName(e.detectedMidi)}(MIDI ${e.detectedMidi.toFixed(1)})` : 'detected:?';
+        const exp = e.expectedMidi ? `expected:${midiName(e.expectedMidi)}(MIDI ${e.expectedMidi})` : 'expected:?';
+        console.log(`  ${e.hit ? 'HIT ' : 'MISS'} ${e.chartNote || '?'} dt=${dt} pitch=${cents} ${det} ${exp}`);
+    }
+    console.log('');
+    console.log('--- Note Results (last 20) ---');
+    const entries = [];
+    _ndNoteResults.forEach((v, k) => entries.push({ key: k, ...v }));
+    for (const r of entries.slice(-20)) {
+        const te = r.timingError != null ? `${Math.round(r.timingError)}ms` : '—';
+        const pe = r.pitchError != null ? `${Math.round(r.pitchError)}¢` : '—';
+        console.log(`  ${r.key} → ${r.primary} timing=${te} pitch=${pe} det:${r.detectedMidi} exp:${r.expectedMidi}`);
+    }
+    console.log('=== END DUMP ===');
+    console.log('');
+    if (_ndFrameLog.length > 0) {
+        // Only show stable/unstable/gate frames, skip the noisy LOW_CONF
+        const interesting = _ndFrameLog.filter(f =>
+            f.type === 'stable' || f.type === 'unstable' || f.type === 'reject_gate'
+        );
+        console.log(`--- Frame Log (${interesting.length} interesting of ${_ndFrameLog.length} total) ---`);
+        for (const f of interesting) {
+            if (f.type === 'stable') {
+                console.log(`  [STABLE] midi=${f.midi} conf=${f.conf} scoreT=${f.scoreT} chartT=${f.chartT} level=${f.level}`);
+            } else if (f.type === 'unstable') {
+                console.log(`  [UNSTABLE] midi=${f.midi} conf=${f.conf} level=${f.level}`);
+            } else if (f.type === 'reject_gate') {
+                console.log(`  [GATED] midi=${f.midi} level=${f.level}`);
+            }
+        }
+        console.log('--- End Frame Log ---');
+    }
+    // Also fire the auto-dump POST
+    _ndAutoDumpPost();
+}
+
+// ── Quick Calibrate ────────────────────────────────────────────────────────
+// Time-independent pitch calibration. Does NOT require the song to be playing
+// or notes to be at the strum bar. Compares detected pitch against ALL unique
+// pitches in the chart to find the systematic offset.
+// ── Flashcard Test (Phase 1) ──────────────────────────────────────────────
+// Console-callable: _fcTest('B1') — play the note, see if detection gets it.
+// No timing, no chart. Proves pitch detection works in isolation.
+
+const _FC_NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+function _fcMidiToNoteName(midi) {
+    const r = Math.round(midi);
+    return `${_FC_NOTE_NAMES[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
+}
+
+function _fcNoteNameToMidi(name) {
+    const m = name.match(/^([A-G]#?)(\d+)$/i);
+    if (!m) return -1;
+    const note = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+    const octave = parseInt(m[2]);
+    const idx = _FC_NOTE_NAMES.indexOf(note);
+    if (idx < 0) return -1;
+    return (octave + 1) * 12 + idx;
+}
+
+function _fcTest(targetNoteName, timeoutSec = 10) {
+    const targetMidi = _fcNoteNameToMidi(targetNoteName);
+    if (targetMidi < 0) {
+        console.error(`[fcTest] Invalid note name: "${targetNoteName}". Use format like B1, E2, G#3`);
+        return;
+    }
+    if (!_ndEnabled) {
+        console.error('[fcTest] Note detection is not enabled. Toggle it on first.');
+        return;
+    }
+    console.log(`[fcTest] Target: ${targetNoteName} (MIDI ${targetMidi}). Play the note...`);
+
+    const startTime = performance.now();
+    let lastStable = -1;
+    const tolerance = 50; // cents
+
+    const iv = setInterval(() => {
+        const elapsed = (performance.now() - startTime) / 1000;
+
+        // Wait for stable MIDI that differs from the last reported one
+        if (_ndStableMidi >= 0 && _ndStableMidi !== lastStable) {
+            lastStable = _ndStableMidi;
+            const detectedName = _fcMidiToNoteName(_ndStableMidi);
+            const centsOff = (_ndStableMidi - targetMidi) * 100;
+            const hit = Math.abs(centsOff) <= tolerance;
+
+            if (hit) {
+                console.log(`[fcTest] ✓ CORRECT  Target: ${targetNoteName}  Detected: ${detectedName} (MIDI ${_ndStableMidi})  ${centsOff > 0 ? '+' : ''}${Math.round(centsOff)}¢  ${elapsed.toFixed(1)}s`);
+            } else {
+                console.log(`[fcTest] ✗ WRONG    Target: ${targetNoteName}  Detected: ${detectedName} (MIDI ${_ndStableMidi})  ${centsOff > 0 ? '+' : ''}${Math.round(centsOff)}¢  ${elapsed.toFixed(1)}s`);
+            }
+            clearInterval(iv);
+            return;
+        }
+
+        if (elapsed > timeoutSec) {
+            console.log(`[fcTest] ✗ TIMEOUT  No stable detection in ${timeoutSec}s. Level: ${_ndInputLevel.toFixed(3)}`);
+            clearInterval(iv);
+        }
+    }, 100);
+}
+
+// Batch test: _fcTestAll(['E1','A1','D2','G2']) — plays each in sequence
+function _fcTestAll(notes) {
+    if (!notes || notes.length === 0) {
+        notes = ['E1', 'A1', 'D2', 'G2']; // open bass strings
+    }
+    console.log(`[fcTest] === Batch test: ${notes.join(', ')} ===`);
+    console.log(`[fcTest] Play each note when prompted. 10s timeout per note.`);
+    let i = 0;
+    const results = [];
+    function next() {
+        if (i >= notes.length) {
+            const correct = results.filter(r => r.hit).length;
+            console.log(`[fcTest] === Results: ${correct}/${results.length} correct ===`);
+            for (const r of results) {
+                console.log(`  ${r.hit ? '✓' : '✗'} ${r.target} → ${r.detected || 'timeout'} (${r.cents != null ? (r.cents > 0 ? '+' : '') + Math.round(r.cents) + '¢' : 'n/a'})`);
+            }
+            return;
+        }
+        const target = notes[i];
+        const targetMidi = _fcNoteNameToMidi(target);
+        console.log(`[fcTest] [${i+1}/${notes.length}] Play: ${target}`);
+
+        const startTime = performance.now();
+        let lastStable = _ndStableMidi; // ignore current stable
+        const iv = setInterval(() => {
+            const elapsed = (performance.now() - startTime) / 1000;
+            if (_ndStableMidi >= 0 && _ndStableMidi !== lastStable) {
+                lastStable = _ndStableMidi;
+                const detectedName = _fcMidiToNoteName(_ndStableMidi);
+                const cents = (_ndStableMidi - targetMidi) * 100;
+                const hit = Math.abs(cents) <= 50;
+                results.push({ target, detected: detectedName, cents, hit });
+                console.log(`  ${hit ? '✓' : '✗'} ${detectedName} (${cents > 0 ? '+' : ''}${Math.round(cents)}¢) in ${elapsed.toFixed(1)}s`);
+                clearInterval(iv);
+                i++;
+                setTimeout(next, 500); // brief pause between notes
+                return;
+            }
+            if (elapsed > 10) {
+                results.push({ target, detected: null, cents: null, hit: false });
+                console.log(`  ✗ TIMEOUT`);
+                clearInterval(iv);
+                i++;
+                setTimeout(next, 500);
+            }
+        }, 100);
+    }
+    next();
+}
+
+let _ndQuickCalActive = false;
+let _ndQuickCalSamples = [];
+let _ndQuickCalChartMidis = null; // cached unique expected MIDIs from the chart
+
+function _ndQuickCalibrate() {
+    // Build the set of unique expected MIDIs from the chart
+    const notes = highway.getNotes() || [];
+    const chords = highway.getChords() || [];
+    const midiSet = new Set();
+    for (const n of notes) {
+        if (n.mt) continue;
+        midiSet.add(_ndMidiFromStringFret(n.s, n.f));
+    }
+    for (const c of chords) {
+        for (const cn of (c.notes || [])) {
+            if (cn.mt) continue;
+            midiSet.add(_ndMidiFromStringFret(cn.s, cn.f));
+        }
+    }
+    _ndQuickCalChartMidis = [...midiSet].sort((a, b) => a - b);
+
+    if (_ndQuickCalChartMidis.length === 0) {
+        console.log('[quick-cal] No chart notes found. Load a song first.');
+        return;
+    }
+
+    _ndPitchOffset = 0;
+    _ndResetScoring();
+    _ndQuickCalSamples = [];
+    _ndQuickCalActive = true;
+
+    const midiName = (m) => {
+        const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+        const r = Math.round(m);
+        return `${names[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
+    };
+
+    console.log('=== QUICK PITCH CALIBRATE ===');
+    console.log(`Chart has ${_ndQuickCalChartMidis.length} unique pitches: ${_ndQuickCalChartMidis.map(m => midiName(m)).join(', ')}`);
+    console.log('Play 5 notes (any notes — song does NOT need to be playing). Listening...');
+
+    let lastStableMidi = -1;
+    const check = setInterval(() => {
+        if (!_ndQuickCalActive) { clearInterval(check); return; }
+
+        // Use stable MIDI (not raw, to avoid transient jitter)
+        const midi = _ndStableMidi;
+        if (midi < 0 || midi === lastStableMidi) return;
+        if (_ndInputLevel < _ndSilenceGate) return;
+        lastStableMidi = midi;
+
+        // Reject octave harmonics — if detected MIDI is more than 14 semitones
+        // above the highest chart pitch, YIN probably locked onto a harmonic
+        const maxChart = _ndQuickCalChartMidis[_ndQuickCalChartMidis.length - 1];
+        if (midi > maxChart + 14) {
+            console.log(`[quick-cal] skip: ${midiName(midi)}(${midi}) — likely harmonic (chart max is ${midiName(maxChart)})`);
+            return;
+        }
+
+        // Find the closest chart MIDI to this detection.
+        // Check at offset 0, +1, +2, +3 to detect systematic shifts.
+        // Only accept if the closest match is within 0.5 semitones of a
+        // whole-number offset — otherwise the note isn't in the chart.
+        let bestChart = null, bestOffset = null, bestDist = Infinity;
+        for (const tryOffset of [0, 1, 2, -1, -2, 3, -3]) {
+            const adjusted = midi - tryOffset;
+            for (const cm of _ndQuickCalChartMidis) {
+                const d = Math.abs(adjusted - cm);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestChart = cm;
+                    bestOffset = tryOffset;
+                }
+            }
+        }
+
+        // Reject if closest match is more than 0.5 semitones away
+        // (the played note isn't near any chart pitch at any reasonable offset)
+        if (bestDist > 0.5) {
+            console.log(`[quick-cal] skip: played ${midiName(midi)}(${midi}) — not near any chart pitch (closest ${midiName(bestChart)}(${bestChart}), dist ${bestDist.toFixed(1)})`);
+            return;
+        }
+
+        const offset = midi - bestChart;
+        _ndQuickCalSamples.push({ detected: midi, closest: bestChart, offset: Math.round(offset) });
+
+        console.log(`[quick-cal] ${_ndQuickCalSamples.length}/5: played ${midiName(midi)}(${midi}) → chart ${midiName(bestChart)}(${bestChart}) → offset ${offset > 0 ? '+' : ''}${Math.round(offset)} semitones`);
+
+        if (_ndQuickCalSamples.length >= 5) {
+            clearInterval(check);
+            _ndQuickCalActive = false;
+
+            // Compute mode of rounded offsets
+            const offsets = _ndQuickCalSamples.map(s => Math.round(s.offset));
+            const votes = new Map();
+            for (const o of offsets) votes.set(o, (votes.get(o) || 0) + 1);
+            let bestOffset = 0, bestCount = 0;
+            for (const [o, c] of votes) {
+                if (c > bestCount) { bestOffset = o; bestCount = c; }
+            }
+
+            const agreement = bestCount / offsets.length;
+            console.log('');
+            console.log('=== RESULTS ===');
+            console.log(`Offsets: [${offsets.map(o => (o > 0 ? '+' : '') + o).join(', ')}]`);
+            console.log(`Mode: ${bestOffset > 0 ? '+' : ''}${bestOffset} semitones (${(agreement * 100).toFixed(0)}% agreement)`);
+
+            if (bestOffset !== 0 && agreement >= 0.6) {
+                _ndPitchOffset = bestOffset;
+                _ndSaveSettings();
+                _ndResetScoring();
+                console.log(`APPLIED: pitch offset = ${bestOffset > 0 ? '+' : ''}${bestOffset} semitones`);
+                console.log('Play normally — hits should register now.');
+            } else if (bestOffset === 0) {
+                console.log('No offset needed — chart pitch matches detection.');
+                console.log('If still getting misses, the issue is timing, not pitch.');
+            } else {
+                console.log(`Low agreement — not auto-applying. Set manually in settings if desired.`);
+            }
+            console.log('=== END QUICK CALIBRATE ===');
+        }
+    }, 100);
+
+    // Timeout after 30 seconds
+    setTimeout(() => {
+        if (_ndQuickCalActive) {
+            clearInterval(check);
+            _ndQuickCalActive = false;
+            console.log(`[quick-cal] Timed out with ${_ndQuickCalSamples.length}/5 samples.`);
+            if (_ndQuickCalSamples.length > 0) {
+                console.log('Partial results:', _ndQuickCalSamples.map(s =>
+                    `played ${s.detected} closest ${s.closest} offset ${s.offset > 0 ? '+' : ''}${s.offset}`
+                ).join(', '));
+            } else {
+                console.log('No detections at all. Check: is detection enabled? Is input level above the silence gate?');
+            }
+        }
+    }, 30000);
+}
+
+function _ndDiagRender(panel) {
+    const t = highway.getTime();
+    const notes = highway.getNotes() || [];
+    const chords = highway.getChords() || [];
+    const info = highway.getSongInfo ? highway.getSongInfo() : {};
+    const total = _ndHits + _ndMisses;
+    const acc = total > 0 ? Math.round((_ndHits / total) * 100) : 0;
+    const P = (c, t) => `<span style="color:${c}">${t}</span>`;
+
+    // Count result types
+    let rHits = 0, rPitchMiss = 0, rTimingMiss = 0;
+    const recentResults = [];
+    _ndNoteResults.forEach((v, k) => {
+        if (typeof v === 'object') {
+            if (v.primary === 'HIT') rHits++;
+            else if (v.primary === 'MISSED_WRONG_PITCH') rPitchMiss++;
+            else if (v.primary === 'MISSED_NO_DETECTION') rTimingMiss++;
+        }
+        recentResults.push({ key: k, judgment: v });
+    });
+
+    // Last 8 event log entries — show expected vs detected MIDI for debugging
+    const midiName = (m) => {
+        if (m < 0 || !isFinite(m)) return '?';
+        const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+        const r = Math.round(m);
+        return `${names[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
+    };
+    const lastEvents = _ndEventLog.slice(-8).map(e => {
+        const dt = `${e.dtMs > 0 ? '+' : ''}${Math.round(e.dtMs)}ms`;
+        const cents = `${e.centsErr > 0 ? '+' : ''}${Math.round(e.centsErr)}\u00a2`;
+        const det = e.detectedMidi ? `det:${midiName(e.detectedMidi)}(${e.detectedMidi.toFixed(0)})` : '';
+        const exp = e.expectedMidi ? `exp:${midiName(e.expectedMidi)}(${e.expectedMidi})` : '';
+        const note = e.chartNote || '';
+        return e.hit
+            ? P('#0f8', `HIT  ${note} ${dt} ${cents} ${det} ${exp}`)
+            : P('#f44', `MISS ${note} ${dt} ${cents} ${det} ${exp}`);
+    }).join('<br>');
+
+    // Nearby chart notes with their judgment status
+    const nearby = [];
+    for (const n of notes) {
+        if (n.mt) continue;
+        if (n.t < t - 4 || n.t > t + 4) continue;
+        const key = _ndNoteKey(n, n.t);
+        const j = _ndNoteResults.get(key);
+        const dt = ((n.t - t) * 1000).toFixed(0);
+        let status = P('#555', 'PENDING');
+        if (j) {
+            const p = typeof j === 'object' ? j.primary : j;
+            if (p === 'HIT') status = P('#0f8', 'HIT');
+            else if (p === 'MISSED_WRONG_PITCH') status = P('#f64', 'PITCH\u2717');
+            else if (p === 'MISSED_NO_DETECTION') status = P('#f24', 'NO DET');
+            else status = P('#fc0', String(p));
+        }
+        nearby.push(`s${n.s}/f${n.f} ${dt}ms ${status}`);
+        if (nearby.length >= 12) break;
+    }
+
+    // Detection state
+    const detMidi = _ndDetectedMidi > 0 ? _ndDetectedMidi.toFixed(1) : '—';
+    const detConf = _ndDetectedConfidence.toFixed(2);
+    const detStr = _ndDetectedString >= 0 ? `s${_ndDetectedString}/f${_ndDetectedFret}` : '—';
+    const level = _ndInputLevel.toFixed(3);
+    const gateOk = _ndInputLevel >= _ndSilenceGate;
+
+    const avOff = (highway.getAvOffset ? highway.getAvOffset() : 0);
+    const matchT = t + avOff / 1000 - _ndLatencyOffset;
+
+    panel.innerHTML = `
+<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:start">
+  <div style="min-width:180px">
+    <b>Detection</b><br>
+    MIDI: ${detMidi}  conf: ${detConf}  ${detStr}<br>
+    Level: ${gateOk ? P('#0f8', level) : P('#f44', level + ' &lt; gate')}  Gate: ${(_ndSilenceGate * 100).toFixed(0)}%<br>
+    Method: ${_ndDetectionMethod}  Stable: ${_ndStableMidi >= 0 ? _ndStableMidi : '—'}
+  </div>
+  <div style="min-width:180px">
+    <b>Scoring</b><br>
+    ${acc}% (${_ndHits}/${total})  streak: ${_ndStreak}  best: ${_ndBestStreak}<br>
+    ${P('#0f8', `hit:${rHits}`)}  ${P('#f64', `pitch\u2717:${rPitchMiss}`)}  ${P('#f24', `no-det:${rTimingMiss}`)}<br>
+    early:${_ndEarly} late:${_ndLate} sharp:${_ndSharp} flat:${_ndFlat}
+  </div>
+  <div style="min-width:200px">
+    <b>Timing</b><br>
+    chart: ${t.toFixed(2)}s  match: ${matchT.toFixed(2)}s  \u0394=${((matchT - t) * 1000).toFixed(0)}ms<br>
+    AV: ${avOff.toFixed(0)}ms  latency: ${(_ndLatencyOffset * 1000).toFixed(0)}ms<br>
+    tol: ${(_ndTimingTolerance * 1000).toFixed(0)}ms / ${_ndPitchTolerance}\u00a2<br>
+    pitch offset: ${_ndPitchOffset >= 0 ? '+' : ''}${_ndPitchOffset} semitones
+  </div>
+  <div style="min-width:120px">
+    <b>Actions</b><br>
+    <button onclick="_ndQuickCalibrate()" style="cursor:pointer;background:#436;color:#c8f;border:2px solid #658;padding:4px 12px;border-radius:3px;font:12px monospace;margin:1px;font-weight:bold">Quick Calibrate</button><br>
+    <button id="nd-diag-pause-btn" onclick="_ndDiagTogglePause()" style="cursor:pointer;background:#553;color:#fc4;border:1px solid #774;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px;font-weight:bold">Pause</button>
+    <button onclick="_ndDiagDumpToConsole()" style="cursor:pointer;background:#335;color:#8cf;border:1px solid #558;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px">Dump</button><br>
+    <button onclick="_ndDiagInjectMisses()" style="cursor:pointer;background:#422;color:#f88;border:1px solid #644;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px">Force misses</button>
+    <button onclick="_ndDiagInjectHits()" style="cursor:pointer;background:#242;color:#8f8;border:1px solid #464;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px">Force hits</button><br>
+    <button onclick="_ndResetScoring()" style="cursor:pointer;background:#333;color:#aaa;border:1px solid #555;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px">Reset</button>
+    <button onclick="_ndCloseDiag()" style="cursor:pointer;background:#222;color:#666;border:1px solid #444;padding:2px 8px;border-radius:3px;font:11px monospace;margin:1px">Close</button>
+  </div>
+</div>
+<div style="margin-top:4px;border-top:1px solid #222;padding-top:4px">
+  <b>Match log</b> (detected → expected):<br>
+  ${lastEvents || P('#555', '(no attempts)')}<br>
+  <b>Nearby notes:</b> ${nearby.join('  ') || P('#555', '(none in \u00b14s)')}<br>
+  <b>Arrangement:</b> ${_ndCurrentArrangement}  <b>Tuning:</b> [${_ndTuningOffsets.slice(0, _ndStandardMidiFor(_ndCurrentArrangement).length).join(',')}]  <b>Capo:</b> ${_ndCapo}
+</div>`;
+}
+
+function _ndDiagInjectMisses() {
+    const t = highway.getTime();
+    const notes = highway.getNotes() || [];
+    let count = 0;
+    // Search backwards from current time — 15s lookback for sparse charts
+    for (let i = notes.length - 1; i >= 0; i--) {
+        const n = notes[i];
+        if (n.mt) continue;
+        if (n.t > t - 0.1) continue;   // skip future / just-now notes
+        if (n.t < t - 15) break;       // 15s lookback
+        const key = _ndNoteKey(n, n.t);
+        _ndNoteResults.set(key, {
+            primary: count % 2 === 0 ? 'MISSED_NO_DETECTION' : 'MISSED_WRONG_PITCH',
+            labels: [],
+            timingError: count % 2 === 0 ? null : 120,
+            pitchError: count % 2 === 0 ? null : 35,
+            detectedMidi: null,
+            expectedMidi: _ndMidiFromStringFret(n.s, n.f),
+        });
+        count++;
+        if (count >= 10) break;
+    }
+    console.log(`[nd-diag] Injected ${count} fake misses across ${notes.length} total notes. t=${t.toFixed(1)}s`);
+}
+
+function _ndDiagInjectHits() {
+    const t = highway.getTime();
+    const notes = highway.getNotes() || [];
+    let count = 0;
+    for (let i = notes.length - 1; i >= 0; i--) {
+        const n = notes[i];
+        if (n.mt) continue;
+        if (n.t > t - 0.1) continue;
+        if (n.t < t - 15) break;      // 15s lookback
+        const key = _ndNoteKey(n, n.t);
+        const expectedMidi = _ndMidiFromStringFret(n.s, n.f);
+        _ndNoteResults.set(key, {
+            primary: 'HIT',
+            labels: count % 3 === 0 ? ['LATE'] : [],
+            timingError: count % 3 === 0 ? 85 : 10,
+            pitchError: count % 2 === 0 ? 15 : -8,
+            detectedMidi: expectedMidi,
+            expectedMidi,
+        });
+        count++;
+        if (count >= 10) break;
+    }
+    console.log(`[nd-diag] Injected ${count} fake hits across ${notes.length} total notes. t=${t.toFixed(1)}s`);
+}

@@ -25,5 +25,6 @@ services:
       - "${SLOPSMITH_PORT:-8000}:8000"
     volumes:
       - ${PLUGIN_DIR:?set PLUGIN_DIR to this plugin repo root}:/opt/user-plugins/note_detect:ro
+      - ${FLASHCARD_DIR:-/home/ahonnecke/src/slopsmith-plugin-flashcard}:/opt/user-plugins/note_flashcard:ro
     environment:
       - SLOPSMITH_PLUGINS_DIR=/opt/user-plugins
