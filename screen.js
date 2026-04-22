@@ -2380,6 +2380,8 @@ let _ndWizVisualRun = null;       // {perBeat, medianDt, droppedOutliers, droppe
 let _ndWizAudioRun = null;
 let _ndWizTimers = [];
 let _ndWizAudioCtx = null;
+let _ndWizBallRaf = null;
+let _ndWizBallOrigin = 0;        // performance.now() at which ball == center for first beat
 
 // Back-compat accessors so callers that still read the old variables work.
 Object.defineProperty(globalThis, '_ndWizVisualOffsetMs', { get: () => _ndWizVisualRun ? _ndWizVisualRun.medianDt : null, configurable: true });
@@ -2394,6 +2396,7 @@ function _ndOpenWizard() {
 
 function _ndCloseWizard() {
     _ndWizCancelTimers();
+    _ndWizStopBall();
     _ndWizStep = 'closed';
     const m = document.getElementById('nd-wizard-modal');
     if (m) m.remove();
@@ -2402,6 +2405,42 @@ function _ndCloseWizard() {
 function _ndWizCancelTimers() {
     for (const t of _ndWizTimers) clearTimeout(t);
     _ndWizTimers = [];
+}
+
+// Bouncing-ball metronome animation. Ball crosses the centre line on EVERY
+// beat and reaches the edges at the halfway point between beats, so the
+// trajectory gives the user anticipation — they can see the ball approaching
+// centre and play exactly when it arrives, rather than trying to react to a
+// point-in-time cue (flash/click) they can't anticipate.
+function _ndWizStartBall() {
+    _ndWizStopBall();
+    const intervalMs = 60000 / _ND_METRO_BPM;
+    const tick = () => {
+        if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') {
+            _ndWizBallRaf = null;
+            return;
+        }
+        const ball = document.getElementById('nd-wiz-ball');
+        if (ball && _ndWizBallOrigin > 0) {
+            // phase = fractional beats since the first-beat anchor. The ball
+            // is at centre whenever phase is an integer (i.e. on each beat)
+            // and at the ±edge at half-integers (halfway between beats).
+            const phase = (performance.now() - _ndWizBallOrigin) / intervalMs;
+            const x = 0.5 + 0.5 * Math.sin(phase * Math.PI);
+            // 100% width range minus ball size; use a calc so the ball's
+            // centre (not edge) tracks x exactly.
+            ball.style.left = `calc(${(x * 100).toFixed(2)}% - 10px)`;
+        }
+        _ndWizBallRaf = requestAnimationFrame(tick);
+    };
+    _ndWizBallRaf = requestAnimationFrame(tick);
+}
+
+function _ndWizStopBall() {
+    if (_ndWizBallRaf) {
+        cancelAnimationFrame(_ndWizBallRaf);
+        _ndWizBallRaf = null;
+    }
 }
 
 function _ndWizStartRun(mode) {
@@ -2413,6 +2452,8 @@ function _ndWizStartRun(mode) {
     const intervalMs = 60000 / _ND_METRO_BPM;
     const startDelay = 1200;
     const origin = performance.now() + startDelay;
+    // Ball reaches centre on every beat; the first beat anchors it.
+    _ndWizBallOrigin = origin;
 
     for (let i = 0; i < _ND_METRO_BEATS_TOTAL; i++) {
         const when = origin + i * intervalMs;
@@ -2424,24 +2465,24 @@ function _ndWizStartRun(mode) {
     _ndWizTimers.push(setTimeout(() => _ndWizFinishRun(mode), finishDelay));
 
     _ndWizRender();
+    _ndWizStartBall();
 }
 
 function _ndWizFireBeat(isCountIn, mode) {
     const now = performance.now();
 
-    // Visual pulse (both modes get the flash so the user always has a visual
-    // reference; audio run also emits a click). Extended ~180 ms so the eye
-    // can register it even at 75 BPM.
-    const el = document.getElementById('nd-wiz-metro-flash');
-    if (el) {
-        const color = isCountIn ? '#666' : '#00ff88';
-        el.style.backgroundColor = color;
-        el.style.boxShadow = isCountIn ? 'none' : '0 0 32px #00ff88';
+    // Flash the centre line briefly when a beat fires. Confirms alignment
+    // between "ball at centre" and the actual beat time without turning
+    // the metronome back into a point-in-time-only cue.
+    const line = document.getElementById('nd-wiz-metro-flash');
+    if (line) {
+        const color = isCountIn ? '#888' : '#00ff88';
+        line.style.backgroundColor = color;
+        line.style.boxShadow = isCountIn ? 'none' : '0 0 18px 4px #00ff88';
         setTimeout(() => {
-            // Guard against the run being cancelled mid-fade
-            if (document.getElementById('nd-wiz-metro-flash') === el) {
-                el.style.backgroundColor = '#1a1a1a';
-                el.style.boxShadow = 'none';
+            if (document.getElementById('nd-wiz-metro-flash') === line) {
+                line.style.backgroundColor = '#6b7280';
+                line.style.boxShadow = 'none';
             }
         }, 180);
     }
@@ -2647,13 +2688,21 @@ function _ndWizRender() {
     } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
         const mode = _ndWizStep.slice('running-'.length);
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-4">${mode === 'visual' ? 'Play on each GREEN pulse. (No audio click.)' : 'Play on each click. The box also flashes green.'}</p>
-            <div id="nd-wiz-metro-flash" class="rounded-xl h-32 mb-3 transition-all duration-150 border-2 border-gray-800" style="background-color:#1a1a1a;"></div>
+            <p class="text-sm text-gray-300 mb-4">${mode === 'visual'
+                ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. No audio click — just the ball.'
+                : 'Watch the ball AND listen for the click. Play each time the ball crosses the <strong>centre line</strong>.'}</p>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight">The ball swings side to side. It's at centre on every beat and at the edges halfway between — use the trajectory to anticipate.</p>
+            <div class="relative h-12 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
+                <!-- Fixed centre line the ball crosses on each beat -->
+                <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[3px] bg-gray-500 transition-all duration-150"></div>
+                <!-- The ball; absolute-positioned, its `left` is driven by the rAF loop -->
+                <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-green-400" style="left:calc(50% - 10px); box-shadow:0 0 14px 3px rgba(0,255,136,0.5);"></div>
+            </div>
             <div class="text-center text-lg font-mono text-gray-300 mb-3">
                 <span id="nd-wiz-counter">${beatsDone} / ${beatsExpected}</span>
             </div>
             <div class="flex gap-3 justify-end">
-                <button onclick="_ndWizCancelTimers();_ndWizStep='intro';_ndWizRender()"
+                <button onclick="_ndWizCancelTimers();_ndWizStopBall();_ndWizStep='intro';_ndWizRender()"
                     class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel run</button>
             </div>
         `);
