@@ -202,6 +202,18 @@ let _ndBestStreak = 0;
 let _ndSectionStats = [];    // [{name, hits, misses}]
 let _ndCurrentSection = null;
 
+// Compound judgment counters (docs/NOTE_FAILURE_SPEC.md). A HIT can still
+// have timing/pitch labels if the detection was within tolerance but not
+// perfectly aligned. These counters tally label occurrences, not unique
+// notes — one hit with "LATE + FLAT" increments both.
+let _ndEarly = 0, _ndLate = 0, _ndSharp = 0, _ndFlat = 0;
+
+// Sub-tolerance "perfect" thresholds: beyond these we attach a label even
+// if the note still counts as a hit within the user's tolerance sliders.
+// Values from the spec.
+const _ND_PERFECT_TIMING_MS  = 50;
+const _ND_PERFECT_PITCH_CENT = 20;
+
 // Rolling diagnostic stats — each entry is the closest-chart-note-match for a
 // detection event. Used for the HUD readout.
 //   dtMs:   plugin_now - chart_note_time (ms). Positive = detection late.
@@ -2327,28 +2339,39 @@ function _ndMatchNotes() {
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
 
-        // Record best pitch attempt seen for this note — used by _ndCheckMisses
-        // to split "wrong pitch" from "no detection" when the window expires.
         const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
         const rawCents = (scoreMidi - expectedMidi) * 100;
-        // Octave-up harmonic tolerance: bass pickups often attenuate the
-        // fundamental so YIN locks on the 2nd harmonic, reporting the note an
-        // octave high. When the raw detection doesn't match but halving it
-        // does (i.e. the halved MIDI equals expected), credit the chart note.
-        // Chart-context-aware: only applies when the halving *explains* a
-        // match, so we don't silently conflate different octaves in passages
-        // where the player genuinely plays the octave up.
+        // Octave-up harmonic tolerance — see the longer note below. Still
+        // chart-context-aware: only applied when it explains a match.
         const octCents = (scoreMidi - 12 - expectedMidi) * 100;
-        const detectedCents = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
+        const pitchError = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
+        const timingError = (t - cn.t) * 1000; // ms; positive = detection late vs chart
+
         const prev = _ndNotePitchAttempts.get(key);
-        if (prev === undefined || Math.abs(detectedCents) < Math.abs(prev)) {
-            _ndNotePitchAttempts.set(key, detectedCents);
+        if (prev === undefined || Math.abs(pitchError) < Math.abs(prev)) {
+            _ndNotePitchAttempts.set(key, pitchError);
         }
 
         if (_ndNoteResults.has(key)) continue; // already judged
 
-        if (Math.abs(detectedCents) <= centsTolerance) {
-            _ndNoteResults.set(key, 'hit');
+        if (Math.abs(pitchError) <= centsTolerance) {
+            // Passed pitch. Timing is already within ±tolerance (we pulled it
+            // from candidateNotes). This is a HIT — but also compute off-axis
+            // labels so the user gets feedback on *how* they hit it.
+            const labels = [];
+            if (timingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
+            else if (timingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
+            if (pitchError > _ND_PERFECT_PITCH_CENT)       { labels.push('SHARP'); _ndSharp++; }
+            else if (pitchError < -_ND_PERFECT_PITCH_CENT) { labels.push('FLAT');  _ndFlat++; }
+
+            _ndNoteResults.set(key, {
+                primary: 'HIT',
+                labels,
+                timingError,
+                pitchError,
+                detectedMidi: scoreMidi,
+                expectedMidi,
+            });
             _ndHits++;
             _ndStreak++;
             if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
@@ -3031,9 +3054,21 @@ function _ndCheckMisses() {
         if (noteTime > missDeadline) return; // not yet past window
         const key = _ndNoteKey({ s, f }, noteTime);
         if (!_ndNoteResults.has(key)) {
-            const hadDetection = _ndNotePitchAttempts.has(key);
-            const kind = hadDetection ? 'pitch_miss' : 'timing_miss';
-            _ndNoteResults.set(key, kind);
+            // Distinguish "pitch miss" (detection fired in window but pitch
+            // outside tolerance) from "timing miss" (no detection at all).
+            // The pitch-attempts map was populated in _ndMatchNotes for any
+            // detection that landed in the window — its presence tells us
+            // which category this note falls into.
+            const bestPitchErr = _ndNotePitchAttempts.get(key);
+            const hadDetection = bestPitchErr !== undefined;
+            _ndNoteResults.set(key, {
+                primary: hadDetection ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION',
+                labels: [],
+                timingError: null,              // no meaningful timing for full miss
+                pitchError: hadDetection ? bestPitchErr : null,
+                detectedMidi: null,
+                expectedMidi: _ndMidiFromStringFret(s, f),
+            });
             _ndMisses++;
             if (hadDetection) _ndPitchMisses++;
             else _ndTimingMisses++;
@@ -3361,14 +3396,17 @@ function _ndUpdateHUD() {
     // ── Level meter ───────────────────────────────────────────────────
 
     if (countsEl && total > 0) {
-        // Breakdown helps diagnose why the accuracy number is low. If misses
-        // are mostly "p" (pitch), YIN is misdetecting and no amount of latency
-        // tuning helps. If mostly "t" (no detection in window), the plugin
-        // isn't hearing the played note — check input level / tuning base.
-        countsEl.textContent = `${_ndHits} / ${total}` +
-            (_ndPitchMisses || _ndTimingMisses
-                ? `  (p:${_ndPitchMisses} t:${_ndTimingMisses})`
-                : '');
+        // Breakdown line 1: hits vs the two miss categories (pitch / timing).
+        // Breakdown line 2: among the hits, how many were off-axis on each
+        //   side (early/late, sharp/flat). Lets the user see "most of my hits
+        //   are late and sharp — I need to work on dragging and tuning up."
+        const offAxis = (_ndEarly + _ndLate + _ndSharp + _ndFlat) > 0
+            ? `  ↑${_ndEarly} ↓${_ndLate} ♯${_ndSharp} ♭${_ndFlat}`
+            : '';
+        countsEl.innerHTML =
+            `${_ndHits} / ${total}` +
+            (_ndPitchMisses || _ndTimingMisses ? `  (p:${_ndPitchMisses} t:${_ndTimingMisses})` : '') +
+            (offAxis ? `<br><span class="text-[9px] text-gray-500">${offAxis}</span>` : '');
     }
 
     if (detectedEl) {
@@ -3438,7 +3476,16 @@ highway.addDrawHook(function(ctx, W, H) {
         const fade = Math.max(0, 1 - age / 0.6) * p.scale;
         if (fade <= 0) return;
 
-        if (result === 'hit') {
+        // Normalize: the judgment can be the new object form, the older plain
+        // strings ('hit' / 'pitch_miss' / 'timing_miss' / 'miss'), or null.
+        const primary = (result && typeof result === 'object') ? result.primary
+                      : (result === 'hit') ? 'HIT'
+                      : (result === 'pitch_miss') ? 'MISSED_WRONG_PITCH'
+                      : (result === 'timing_miss' || result === 'miss') ? 'MISSED_NO_DETECTION'
+                      : null;
+        if (!primary) return;
+
+        if (primary === 'HIT') {
             ctx.save();
             ctx.globalAlpha = fade * 0.7;
             ctx.shadowColor = '#00ff88';
@@ -3449,10 +3496,28 @@ highway.addDrawHook(function(ctx, W, H) {
             ctx.arc(x, y, 14 * p.scale, 0, Math.PI * 2);
             ctx.stroke();
             ctx.restore();
-        } else if (result === 'miss' || result === 'pitch_miss' || result === 'timing_miss') {
-            // pitch_miss: slightly brighter red (detection happened, pitch off)
-            // timing_miss: dimmer red (nothing fired at all)
-            const colour = result === 'timing_miss' ? '#aa2233' : '#ff3344';
+
+            // Label any compound off-axis tags (EARLY / LATE / SHARP / FLAT).
+            // Kept brief — a 3-char monogram next to the ring.
+            const labels = result && result.labels ? result.labels : [];
+            if (labels.length) {
+                const tag = labels.map(l =>
+                    l === 'EARLY' ? '↑E' : l === 'LATE' ? '↓L' :
+                    l === 'SHARP' ? '♯' : l === 'FLAT' ? '♭' : ''
+                ).filter(Boolean).join(' ');
+                ctx.save();
+                ctx.globalAlpha = fade * 0.85;
+                ctx.fillStyle = '#ffcc00';
+                ctx.font = `bold ${Math.max(9, 11 * p.scale)}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillText(tag, x, y + 16 * p.scale);
+                ctx.restore();
+            }
+        } else if (primary === 'MISSED_WRONG_PITCH' || primary === 'MISSED_NO_DETECTION') {
+            // Brighter red for pitch misses (detection happened) vs dimmer for
+            // no-detection misses. Same X glyph for both.
+            const colour = primary === 'MISSED_NO_DETECTION' ? '#aa2233' : '#ff3344';
             ctx.save();
             ctx.globalAlpha = fade * 0.5;
             ctx.shadowColor = colour;
@@ -3639,6 +3704,7 @@ function _ndResetScoring() {
     _ndMisses = 0;
     _ndPitchMisses = 0;
     _ndTimingMisses = 0;
+    _ndEarly = _ndLate = _ndSharp = _ndFlat = 0;
     _ndStreak = 0;
     _ndBestStreak = 0;
     _ndNoteResults.clear();
