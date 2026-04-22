@@ -216,6 +216,16 @@ let _ndNoteResults = new Map(); // key -> 'hit'|'pitch_miss'|'timing_miss'
 // timing window. If a note gets marked miss, we use this to distinguish
 // "detection fired but wrong pitch" vs "nothing fired at all."
 let _ndNotePitchAttempts = new Map(); // key -> bestCentsErr
+
+// Stability voting — suppresses YIN's attack-transient pitch jitter by
+// requiring N of the last M raw detections to agree on a rounded MIDI value
+// before the plugin treats it as a "stable" detection for scoring purposes.
+// Downstream: scoring uses _ndStableMidi; HUD's raw "detected" readout still
+// uses _ndDetectedMidi so users see live YIN output.
+const _ND_STABILITY_WINDOW = 5;      // raw samples considered
+const _ND_STABILITY_REQUIRED = 3;    // N-of-M for "stable"
+let _ndRawMidiHistory = [];          // last N raw midi values (rounded)
+let _ndStableMidi = -1;              // most recent stable midi, or -1 if unsettled
 let _ndDetectedMidi = -1;
 let _ndDetectedConfidence = 0;
 let _ndDetectedString = -1;
@@ -2124,24 +2134,42 @@ async function _ndProcessFrame(buffer) {
     _ndDetectedMidi = _ndFreqToMidi(result.freq);
     _ndDetectedConfidence = result.confidence;
 
+    // Stability voting: roll the latest rounded-MIDI into a short history
+    // and derive a "stable" value only when N of M recent raw detections
+    // agree. This suppresses YIN's attack-transient jitter (e.g. bouncing
+    // E1→D1→E2→E1 during the first 100 ms of a pluck) without slowing
+    // down the raw HUD readout, which still uses _ndDetectedMidi.
+    const roundedMidi = Math.round(_ndDetectedMidi);
+    _ndRawMidiHistory.push(roundedMidi);
+    if (_ndRawMidiHistory.length > _ND_STABILITY_WINDOW) _ndRawMidiHistory.shift();
+    const voteCounts = new Map();
+    for (const m of _ndRawMidiHistory) voteCounts.set(m, (voteCounts.get(m) || 0) + 1);
+    let winnerMidi = -1, winnerCount = 0;
+    for (const [m, c] of voteCounts) {
+        if (c > winnerCount) { winnerMidi = m; winnerCount = c; }
+    }
+    _ndStableMidi = (winnerCount >= _ND_STABILITY_REQUIRED) ? winnerMidi : -1;
+
     // If the Calibration Wizard is armed on the mic step, this detection is
     // the response to the on-screen flash — record the sample and unarm.
-    // Routed before scoring so the wizard capture isn't affected by chart
-    // matching logic.
+    // Wizard uses the RAW detection timestamp so its latency measurement
+    // doesn't include stability-voting delay.
     if (typeof _ndWizOnDetection === 'function') _ndWizOnDetection();
 
     // If the tuner modal is open, route the detection through the tuner's
-    // string-assignment logic instead of chart matching. Tuner doesn't care
-    // about chart context — it only cares which open string this pitch is
-    // closest to, and by how many cents.
+    // string-assignment logic instead of chart matching. Tuner also uses
+    // raw pitch since it shows live tuning and already has its own 1.5s
+    // display-stale window.
     if (_ndTunerOpen) {
         if (typeof _ndTunerOnDetection === 'function') _ndTunerOnDetection(result.freq);
         return;
     }
 
-    // _ndMatchNotes walks the chart candidates and assigns
-    // _ndDetectedString/_ndDetectedFret via _ndResolveDisplayFingering
-    // (chart-aware, with geometric fallback).
+    // Only run chart matching when the detection has stabilized — otherwise
+    // we'd score attack-transient jitter as separate candidates and most
+    // notes would log a pitch_miss that scoring-correctly should be a hit.
+    if (_ndStableMidi < 0) return;
+
     _ndMatchNotes();
 }
 
@@ -2227,7 +2255,10 @@ function _ndMatchNotes() {
     // time while the player is playing to the visually-shifted strum bar.
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
     const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
-    if (_ndDetectedMidi < 0) return;
+    // Use the stability-voted MIDI for scoring (set in _ndProcessFrame).
+    // Falls back to the raw value only if stability never ran (e.g. tests).
+    const scoreMidi = (_ndStableMidi >= 0) ? _ndStableMidi : _ndDetectedMidi;
+    if (scoreMidi < 0) return;
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
@@ -2268,7 +2299,7 @@ function _ndMatchNotes() {
     // Resolve HUD/overlay fingering — prefer the chart's (s, f) when the
     // player is hitting a candidate pitch, otherwise fall back to the
     // geometric first-match on the arrangement's tuning.
-    const disp = _ndResolveDisplayFingering(_ndDetectedMidi, candidateNotes, _ndCurrentArrangement, centsTolerance);
+    const disp = _ndResolveDisplayFingering(scoreMidi, candidateNotes, _ndCurrentArrangement, centsTolerance);
     _ndDetectedString = disp.string;
     _ndDetectedFret = disp.fret;
 
@@ -2286,7 +2317,7 @@ function _ndMatchNotes() {
     }
     if (closest) {
         const expectedMidi = _ndMidiFromStringFret(closest.s, closest.f);
-        const centsErr = (_ndDetectedMidi - expectedMidi) * 100;
+        const centsErr = (scoreMidi - expectedMidi) * 100;
         const hit = Math.abs(closestDt) <= tolerance * 1000 && Math.abs(centsErr) <= centsTolerance;
         _ndEventLog.push({ dtMs: closestDt, centsErr, hit, time: t });
         if (_ndEventLog.length > _ND_EVENT_WINDOW) _ndEventLog.shift();
@@ -2299,7 +2330,7 @@ function _ndMatchNotes() {
         // Record best pitch attempt seen for this note — used by _ndCheckMisses
         // to split "wrong pitch" from "no detection" when the window expires.
         const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f);
-        const rawCents = (_ndDetectedMidi - expectedMidi) * 100;
+        const rawCents = (scoreMidi - expectedMidi) * 100;
         // Octave-up harmonic tolerance: bass pickups often attenuate the
         // fundamental so YIN locks on the 2nd harmonic, reporting the note an
         // octave high. When the raw detection doesn't match but halving it
@@ -2307,7 +2338,7 @@ function _ndMatchNotes() {
         // Chart-context-aware: only applies when the halving *explains* a
         // match, so we don't silently conflate different octaves in passages
         // where the player genuinely plays the octave up.
-        const octCents = (_ndDetectedMidi - 12 - expectedMidi) * 100;
+        const octCents = (scoreMidi - 12 - expectedMidi) * 100;
         const detectedCents = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
         const prev = _ndNotePitchAttempts.get(key);
         if (prev === undefined || Math.abs(detectedCents) < Math.abs(prev)) {
@@ -3619,6 +3650,8 @@ function _ndResetScoring() {
     _ndDetectedFret = -1;
     _ndEventLog = [];
     _ndNotePitchAttempts.clear();
+    _ndRawMidiHistory = [];
+    _ndStableMidi = -1;
 }
 
     function stopLevelMeter() {
