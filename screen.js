@@ -2475,20 +2475,40 @@ function _ndWizFireBeat(isCountIn, mode) {
 }
 
 function _ndWizFinishRun(mode) {
-    // Assignment: for each beat, find the EARLIEST detection within the beat
-    // window (±_ND_METRO_BEAT_WINDOW_MS). "Earliest" is deliberate — YIN
-    // typically fires multiple detections across an attack-sustain note, and
-    // the first is closest to the actual pluck. Closest-by-absolute-dt (what
-    // we did before) picks whichever detection happens to be nearest in time
-    // to the beat, which can wrap a sustain detection from the PREVIOUS pluck
-    // onto the current beat when the user anticipates.
+    // Pre-filter detections to "fresh" ones: the first detection after a gap
+    // (YIN's confidence dropped below the detection floor) OR a pitch change
+    // of more than a semitone. This suppresses the sustain tail of each
+    // pluck, which used to be incorrectly attributed as the "earliest
+    // detection" inside the NEXT beat's window — producing apparent dt
+    // values around -400 ms that were just the previous pluck's sustain
+    // reaching forward, not user anticipation.
+    const _ND_FRESH_GAP_MS = 100;      // silence gap to mark a new pluck
+    const _ND_FRESH_PITCH = 1;         // semitone change to mark a new pluck
+    const fresh = [];
+    let lastTime = -Infinity;
+    let lastMidi = -999;
+    for (const det of _ndWizDetections) {
+        const gap = det.time - lastTime;
+        const pitchChange = Math.abs(det.midi - lastMidi);
+        if (gap > _ND_FRESH_GAP_MS || pitchChange > _ND_FRESH_PITCH) {
+            fresh.push(det);
+        }
+        lastTime = det.time;
+        lastMidi = det.midi;
+    }
+
+    // Assignment: for each beat, find the fresh detection within the beat
+    // window closest in time. "Closest-by-abs-dt" is correct now because
+    // sustain detections are already filtered out — each remaining detection
+    // is an attack event, so the one closest to the beat is "this beat's
+    // pluck."
     const perBeat = _ndWizBeats.map(beatT => {
         let picked = null;
         let pickedDt = null;
-        for (const det of _ndWizDetections) {
+        for (const det of fresh) {
             const dt = det.time - beatT;
             if (Math.abs(dt) > _ND_METRO_BEAT_WINDOW_MS) continue;
-            if (picked === null || det.time < picked.time) {
+            if (picked === null || Math.abs(dt) < Math.abs(pickedDt)) {
                 picked = det;
                 pickedDt = dt;
             }
