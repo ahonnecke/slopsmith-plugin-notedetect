@@ -2369,21 +2369,26 @@ function _ndStats() {
 //                       hear)
 
 const _ND_METRO_BPM = 75;
-const _ND_METRO_BEATS_TOTAL = 10;
+const _ND_METRO_BEATS_TOTAL = 18;
 const _ND_METRO_COUNTIN = 2;
+const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of a beat
 
 let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-visual' | 'running-audio' | 'review'
 let _ndWizBeats = [];             // wall times (performance.now) of measured beats
-let _ndWizDetections = [];        // wall times of detection events during a run
-let _ndWizVisualOffsetMs = null;  // median dt from the visual run
-let _ndWizAudioOffsetMs = null;   // median dt from the audio run
+let _ndWizDetections = [];        // [{time, midi}] of detection events during a run
+let _ndWizVisualRun = null;       // {perBeat, medianDt, droppedOutliers, dropped}
+let _ndWizAudioRun = null;
 let _ndWizTimers = [];
 let _ndWizAudioCtx = null;
 
+// Back-compat accessors so callers that still read the old variables work.
+Object.defineProperty(globalThis, '_ndWizVisualOffsetMs', { get: () => _ndWizVisualRun ? _ndWizVisualRun.medianDt : null, configurable: true });
+Object.defineProperty(globalThis, '_ndWizAudioOffsetMs',  { get: () => _ndWizAudioRun  ? _ndWizAudioRun.medianDt  : null, configurable: true });
+
 function _ndOpenWizard() {
     _ndWizStep = 'intro';
-    _ndWizVisualOffsetMs = null;
-    _ndWizAudioOffsetMs = null;
+    _ndWizVisualRun = null;
+    _ndWizAudioRun = null;
     _ndWizRender();
 }
 
@@ -2470,32 +2475,67 @@ function _ndWizFireBeat(isCountIn, mode) {
 }
 
 function _ndWizFinishRun(mode) {
-    // For each measured beat, find the single closest detection event (by
-    // absolute time distance) and record its offset. Beats with no detection
-    // within ±400 ms are dropped as "no play" — user may have missed a beat.
-    const dts = [];
-    for (const beatT of _ndWizBeats) {
-        let best = Infinity;
-        for (const detT of _ndWizDetections) {
-            const dt = detT - beatT;
-            if (Math.abs(dt) < Math.abs(best)) best = dt;
+    // Assignment: for each beat, find the EARLIEST detection within the beat
+    // window (±_ND_METRO_BEAT_WINDOW_MS). "Earliest" is deliberate — YIN
+    // typically fires multiple detections across an attack-sustain note, and
+    // the first is closest to the actual pluck. Closest-by-absolute-dt (what
+    // we did before) picks whichever detection happens to be nearest in time
+    // to the beat, which can wrap a sustain detection from the PREVIOUS pluck
+    // onto the current beat when the user anticipates.
+    const perBeat = _ndWizBeats.map(beatT => {
+        let picked = null;
+        let pickedDt = null;
+        for (const det of _ndWizDetections) {
+            const dt = det.time - beatT;
+            if (Math.abs(dt) > _ND_METRO_BEAT_WINDOW_MS) continue;
+            if (picked === null || det.time < picked.time) {
+                picked = det;
+                pickedDt = dt;
+            }
         }
-        if (Math.abs(best) < 400) dts.push(best);
+        return { beatT, dt: pickedDt, detection: picked };
+    });
+
+    // Outlier rejection: drop values more than 2σ from the mean. With a
+    // musician who occasionally misses a beat or plays one wildly off, a
+    // single bad sample pulls the naïve median around. σ-trimming is a
+    // decent compromise — we keep reporting the raw per-beat numbers so the
+    // user can see which were dropped.
+    const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
+    let droppedOutliers = 0;
+    let used = dts;
+    if (dts.length >= 4) {
+        const mean = dts.reduce((s, x) => s + x, 0) / dts.length;
+        const variance = dts.reduce((s, x) => s + (x - mean) * (x - mean), 0) / dts.length;
+        const std = Math.sqrt(variance);
+        used = dts.filter(x => Math.abs(x - mean) <= 2 * std);
+        droppedOutliers = dts.length - used.length;
     }
-    const sorted = dts.slice().sort((a, b) => a - b);
+    const sorted = used.slice().sort((a, b) => a - b);
     const medianDt = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 
-    if (mode === 'visual') _ndWizVisualOffsetMs = medianDt;
-    else if (mode === 'audio') _ndWizAudioOffsetMs = medianDt;
+    const runResult = {
+        perBeat, medianDt, droppedOutliers,
+        droppedNoDetection: perBeat.length - dts.length,
+        usedCount: used.length,
+    };
+    if (mode === 'visual') _ndWizVisualRun = runResult;
+    else if (mode === 'audio') _ndWizAudioRun = runResult;
 
     _ndWizStep = 'intro';
     _ndWizRender();
 }
 
-// Hook called from _ndProcessFrame on every detection event.
+// Hook called from _ndProcessFrame on every detection event. Captures the
+// detected MIDI value alongside the timestamp so the review screen can show
+// per-beat pitch info (helpful for diagnosing why a beat was skipped — YIN
+// locked on a harmonic, fingered a different note, etc.).
 function _ndWizOnDetection() {
     if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
-        _ndWizDetections.push(performance.now());
+        _ndWizDetections.push({
+            time: performance.now(),
+            midi: _ndDetectedMidi,
+        });
     }
 }
 
@@ -2598,48 +2638,81 @@ function _ndWizRender() {
             </div>
         `);
     } else if (_ndWizStep === 'review') {
-        const v = _ndWizVisualOffsetMs;
-        const a = _ndWizAudioOffsetMs;
-        // A/V Sync Offset semantics: positive shifts visuals FORWARD (to catch
-        // up with audio that's ahead of them). We're ahead of audio when
-        // visual-render is slower than audio-output — which manifests as
-        // dt_visual > dt_audio in the runs (you play LATER on visual because
-        // the flash is late; you play EARLIER on audio because the click
-        // arrives first). So A/V = dt_v − dt_a.  Previously computed it as
-        // (a − v), which was the opposite sign and pushed the highway the
-        // wrong way on systems where visual render dominates.
+        const vRun = _ndWizVisualRun;
+        const aRun = _ndWizAudioRun;
+        const v = vRun ? vRun.medianDt : null;
+        const a = aRun ? aRun.medianDt : null;
         const avRaw = (a !== null && v !== null) ? Math.round(v - a) : 0;
-        // No clamp on A/V: slopsmith core's slider spans -1000..+1000 so
-        // systems where audio is laggier than visual get handled correctly
-        // too (negative avOffset delays the highway).
         const avApplied = Math.max(-1000, Math.min(1000, avRaw));
-        // Plugin Audio Latency Offset = total audio round-trip from the audio
-        // run. Physically positive; clamp negatives to 0 (heavy anticipation
-        // drops dt_audio below zero — not a real negative latency).
         const latRaw = a !== null ? Math.round(a) : 0;
         const latApplied = Math.max(0, latRaw);
 
         const warnings = [];
-        if (v !== null && v < -40) warnings.push(`Visual run median is ${Math.round(v)} ms. You're probably anticipating the beat — the detection landed before the flash. Try to play with each pulse, not ahead of it.`);
-        if (a !== null && a < -40) warnings.push(`Audio run median is ${Math.round(a)} ms. Same anticipation pattern.`);
-        if (latRaw < 0) warnings.push(`Plugin Audio Latency measured negative (${latRaw} ms). Clamped to <strong>${latApplied}</strong>; physical latency can't be negative.`);
+        if (v !== null && v < -40) warnings.push(`Visual run median is ${Math.round(v)} ms — detection landed before the flash on most beats. You're likely anticipating the beat rather than playing on it.`);
+        if (a !== null && a < -40) warnings.push(`Audio run median is ${Math.round(a)} ms — same pattern.`);
+        if (latRaw < 0) warnings.push(`Plugin Audio Latency clamped from ${latRaw} to <strong>${latApplied}</strong> (physical latency can't be negative).`);
         if (avRaw !== avApplied) warnings.push(`A/V Sync Offset clamped from ${avRaw} to <strong>${avApplied}</strong> (out of ±1000 ms range).`);
 
+        const noteName = (m) => {
+            if (m < 0 || !isFinite(m)) return '—';
+            const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+            const r = Math.round(m);
+            return `${names[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
+        };
+
+        const perBeatTable = (run, label) => {
+            if (!run) return '';
+            const rows = run.perBeat.map((b, i) => {
+                const dtTxt = b.dt === null ? '<span class="text-gray-600">no detection</span>'
+                    : `<span class="text-gray-200 font-mono">${b.dt >= 0 ? '+' : ''}${Math.round(b.dt)} ms</span>`;
+                const note = b.detection ? noteName(b.detection.midi) : '—';
+                // Flag outliers: used set = |dt − mean| ≤ 2σ of raw (same check
+                // we did in finishRun); regenerate quickly so we can mark them.
+                const dts = run.perBeat.filter(x => x.dt !== null).map(x => x.dt);
+                let outlier = false;
+                if (b.dt !== null && dts.length >= 4) {
+                    const mean = dts.reduce((s, x) => s + x, 0) / dts.length;
+                    const std = Math.sqrt(dts.reduce((s, x) => s + (x - mean) * (x - mean), 0) / dts.length);
+                    outlier = Math.abs(b.dt - mean) > 2 * std;
+                }
+                return `
+                    <tr class="${outlier ? 'text-yellow-400' : ''}">
+                        <td class="py-0.5 pr-2 text-gray-500">${i + 1}</td>
+                        <td class="py-0.5 pr-2">${dtTxt}</td>
+                        <td class="py-0.5 pr-2 font-mono text-gray-500">${note}</td>
+                        <td class="py-0.5 text-[10px] text-yellow-500">${outlier ? 'outlier' : ''}</td>
+                    </tr>`;
+            }).join('');
+            return `
+                <details class="mb-3 bg-dark-800 rounded-xl p-3 text-xs">
+                    <summary class="cursor-pointer text-gray-300 font-semibold">${label} · per-beat data (${run.usedCount} of ${run.perBeat.length} used)</summary>
+                    <table class="mt-2 w-full text-xs">
+                        <thead class="text-gray-500 text-left">
+                            <tr><th class="pr-2">#</th><th class="pr-2">dt</th><th class="pr-2">detected</th><th></th></tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                    <p class="text-[10px] text-gray-600 mt-2 leading-tight">
+                        ${run.droppedNoDetection} beats had no detection within ±${_ND_METRO_BEAT_WINDOW_MS} ms · ${run.droppedOutliers} dropped as outliers · median of remaining used as the run's value.
+                    </p>
+                </details>`;
+        };
+
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-400 mb-3">Measured:</p>
-            <div class="bg-dark-800 rounded-xl p-3 mb-4 space-y-2 text-sm">
-                <div class="flex justify-between"><span class="text-gray-400">Visual run (detection − flash)</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
-                <div class="flex justify-between"><span class="text-gray-400">Audio run (detection − click)</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
+            <div class="bg-dark-800 rounded-xl p-3 mb-3 space-y-2 text-sm">
+                <div class="flex justify-between"><span class="text-gray-400">Visual run (dt_v, n=${vRun ? vRun.usedCount : 0})</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
+                <div class="flex justify-between"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0})</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
                 <hr class="border-gray-700">
                 <div class="flex justify-between"><span class="text-gray-300">A/V Sync Offset (= V − A)</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
                 <div class="flex justify-between"><span class="text-gray-300">Plugin Audio Latency</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
             </div>
+            ${perBeatTable(vRun, 'Visual')}
+            ${perBeatTable(aRun, 'Audio')}
             ${warnings.length ? `
                 <div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-[11px] text-yellow-200 leading-tight space-y-1">
                     ${warnings.map(w => `<div>${w}</div>`).join('')}
-                    <div class="mt-1 text-yellow-300/80">Re-running with less anticipation helps. Or close this and hand-tune with <code>[</code> / <code>]</code> on the player.</div>
                 </div>` : ''}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">Positive A/V means visuals need to shift forward (audio is ahead of them); negative means the opposite. Positive plugin latency is just round-trip mic + audio delay. Fine-tune on the player with <code>[</code> / <code>]</code> once applied.</p>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight">Yellow rows = outliers (&gt;2σ from mean). They're dropped from the median. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if the number still feels off.</p>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
                 <button onclick="_ndWizStep='intro'; _ndWizRender()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Re-run</button>
