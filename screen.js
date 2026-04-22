@@ -2516,14 +2516,15 @@ async function _ndWizApplyMetro() {
         if (lbl) lbl.textContent = applied;
     }
 
-    // Slopsmith core A/V sync offset = audio-out lag alone = total − mic.
-    // Also clamped to non-negative. Audio output lag is physically >= 0; if
-    // the measurement came back negative (user anticipated the beat, visual
-    // render delay larger than expected, etc.) we don't propagate nonsense
-    // into the highway setting.
+    // Slopsmith core A/V sync offset = (visual run − audio run). The
+    // direction: if dt_visual > dt_audio, your visual feedback is arriving
+    // later than your audio feedback (high visual render lag), so visuals
+    // need to shift FORWARD to match — that's a positive avOffset in core.
+    // If dt_audio > dt_visual, the opposite: shift visuals backward
+    // (negative avOffset). Core supports the full ±1000 ms range.
     if (totalMs !== null && micMs !== null) {
-        const raw = totalMs - micMs;
-        const avMs = Math.max(0, Math.min(1000, raw));
+        const raw = micMs - totalMs;
+        const avMs = Math.max(-1000, Math.min(1000, raw));
         try {
             await fetch('/api/settings', {
                 method: 'POST',
@@ -2599,36 +2600,46 @@ function _ndWizRender() {
     } else if (_ndWizStep === 'review') {
         const v = _ndWizVisualOffsetMs;
         const a = _ndWizAudioOffsetMs;
-        const avRaw = (a !== null && v !== null) ? Math.round(a - v) : 0;
-        const avApplied = Math.max(0, avRaw);   // clamp: audio output lag can't be negative
+        // A/V Sync Offset semantics: positive shifts visuals FORWARD (to catch
+        // up with audio that's ahead of them). We're ahead of audio when
+        // visual-render is slower than audio-output — which manifests as
+        // dt_visual > dt_audio in the runs (you play LATER on visual because
+        // the flash is late; you play EARLIER on audio because the click
+        // arrives first). So A/V = dt_v − dt_a.  Previously computed it as
+        // (a − v), which was the opposite sign and pushed the highway the
+        // wrong way on systems where visual render dominates.
+        const avRaw = (a !== null && v !== null) ? Math.round(v - a) : 0;
+        // No clamp on A/V: slopsmith core's slider spans -1000..+1000 so
+        // systems where audio is laggier than visual get handled correctly
+        // too (negative avOffset delays the highway).
+        const avApplied = Math.max(-1000, Math.min(1000, avRaw));
+        // Plugin Audio Latency Offset = total audio round-trip from the audio
+        // run. Physically positive; clamp negatives to 0 (heavy anticipation
+        // drops dt_audio below zero — not a real negative latency).
         const latRaw = a !== null ? Math.round(a) : 0;
-        const latApplied = Math.max(0, latRaw); // clamp: total round-trip can't be negative
+        const latApplied = Math.max(0, latRaw);
 
-        // Sanity checks — if the raw numbers are physically implausible (e.g.
-        // the user anticipated the beat enough to pull detections before
-        // the stimulus), warn rather than silently clobber the user's
-        // hand-tuned settings with nonsense.
         const warnings = [];
-        if (v !== null && v < -20) warnings.push(`Visual run is ${Math.round(v)} ms. Negative means detections landed before the flash — you're probably anticipating the beat. Try playing exactly on the green pulse, not slightly before it.`);
-        if (a !== null && a < -20) warnings.push(`Audio run is ${Math.round(a)} ms. Same issue as above, plus: audio output lag is by definition non-negative, so the computed -${Math.abs(avRaw)} ms for "audio output lag" is a bias artifact.`);
-        if (avRaw < 0) warnings.push(`Applying would clamp A/V Sync Offset from ${avRaw} to <strong>${avApplied}</strong> ms.`);
-        if (latRaw < 0) warnings.push(`Applying would clamp plugin Audio Latency from ${latRaw} to <strong>${latApplied}</strong> ms.`);
+        if (v !== null && v < -40) warnings.push(`Visual run median is ${Math.round(v)} ms. You're probably anticipating the beat — the detection landed before the flash. Try to play with each pulse, not ahead of it.`);
+        if (a !== null && a < -40) warnings.push(`Audio run median is ${Math.round(a)} ms. Same anticipation pattern.`);
+        if (latRaw < 0) warnings.push(`Plugin Audio Latency measured negative (${latRaw} ms). Clamped to <strong>${latApplied}</strong>; physical latency can't be negative.`);
+        if (avRaw !== avApplied) warnings.push(`A/V Sync Offset clamped from ${avRaw} to <strong>${avApplied}</strong> (out of ±1000 ms range).`);
 
         modal.innerHTML = wrap(`
             <p class="text-sm text-gray-400 mb-3">Measured:</p>
             <div class="bg-dark-800 rounded-xl p-3 mb-4 space-y-2 text-sm">
-                <div class="flex justify-between"><span class="text-gray-400">Visual run (mic input lag)</span><span class="text-gray-200 font-mono">${v !== null ? Math.round(v) + ' ms' : '—'}</span></div>
-                <div class="flex justify-between"><span class="text-gray-400">Audio run (total round-trip)</span><span class="text-gray-200 font-mono">${a !== null ? Math.round(a) + ' ms' : '—'}</span></div>
+                <div class="flex justify-between"><span class="text-gray-400">Visual run (detection − flash)</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
+                <div class="flex justify-between"><span class="text-gray-400">Audio run (detection − click)</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
                 <hr class="border-gray-700">
-                <div class="flex justify-between"><span class="text-gray-300">Audio output lag (= A − V)</span><span class="text-gray-200 font-mono font-semibold">${avRaw} ms</span></div>
+                <div class="flex justify-between"><span class="text-gray-300">A/V Sync Offset (= V − A)</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
+                <div class="flex justify-between"><span class="text-gray-300">Plugin Audio Latency</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
             </div>
             ${warnings.length ? `
                 <div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-[11px] text-yellow-200 leading-tight space-y-1">
-                    <strong>Values look off.</strong>
                     ${warnings.map(w => `<div>${w}</div>`).join('')}
-                    <div class="mt-1 text-yellow-300/80">Better to re-run with a metronome you're not tempted to anticipate, or just hand-tune with <code>[</code> / <code>]</code> on the player. If you hit Apply anyway, the highway will jump to whatever the clamp produces.</div>
+                    <div class="mt-1 text-yellow-300/80">Re-running with less anticipation helps. Or close this and hand-tune with <code>[</code> / <code>]</code> on the player.</div>
                 </div>` : ''}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">Applying will set the plugin's Audio Latency Offset to <strong>${latApplied} ms</strong>${latRaw !== latApplied ? ` (clamped from ${latRaw})` : ''} and slopsmith's A/V Sync Offset to <strong>${avApplied} ms</strong>${avRaw !== avApplied ? ` (clamped from ${avRaw})` : ''}. Fine-tune afterwards with the <code>[</code> / <code>]</code> keys on the player.</p>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight">Positive A/V means visuals need to shift forward (audio is ahead of them); negative means the opposite. Positive plugin latency is just round-trip mic + audio delay. Fine-tune on the player with <code>[</code> / <code>]</code> once applied.</p>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
                 <button onclick="_ndWizStep='intro'; _ndWizRender()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Re-run</button>
