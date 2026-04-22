@@ -2465,7 +2465,9 @@ function _ndWizStartRun(mode) {
     _ndWizTimers.push(setTimeout(() => _ndWizFinishRun(mode), finishDelay));
 
     _ndWizRender();
-    _ndWizStartBall();
+    // Only animate the ball for the visual run. Audio run is deliberately
+    // visual-free so the user can only lock onto the audible click.
+    if (mode === 'visual') _ndWizStartBall();
 }
 
 function _ndWizFireBeat(isCountIn, mode) {
@@ -2687,17 +2689,26 @@ function _ndWizRender() {
         `);
     } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
         const mode = _ndWizStep.slice('running-'.length);
+        // Deliberately: the visual cue (ball) appears only on the visual run.
+        // The audio run shows a static "ears only" area and nothing moving,
+        // so the user locks onto the audible click as their only cue. If we
+        // also showed the ball on audio mode, the user could hit the pluck
+        // at whichever cue arrived first, and we'd measure a blend of visual
+        // and audio latency instead of audio alone.
+        const runArea = mode === 'visual'
+            ? `<div class="relative h-12 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
+                   <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[3px] bg-gray-500 transition-all duration-150"></div>
+                   <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-green-400" style="left:calc(50% - 10px); box-shadow:0 0 14px 3px rgba(0,255,136,0.5);"></div>
+               </div>`
+            : `<div class="flex items-center justify-center h-20 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-400 text-sm">
+                   <span>🎧 Ears only</span>
+               </div>`;
+        const instr = mode === 'visual'
+            ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. The ball swings side to side — centre is the beat, edges are halfway between. Use the trajectory to anticipate.'
+            : 'Close your eyes or look away. Play each time you hear a <strong>click</strong>. No visual — we deliberately hide the ball here so you can only lock onto the audio cue.';
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-4">${mode === 'visual'
-                ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. No audio click — just the ball.'
-                : 'Watch the ball AND listen for the click. Play each time the ball crosses the <strong>centre line</strong>.'}</p>
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">The ball swings side to side. It's at centre on every beat and at the edges halfway between — use the trajectory to anticipate.</p>
-            <div class="relative h-12 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
-                <!-- Fixed centre line the ball crosses on each beat -->
-                <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[3px] bg-gray-500 transition-all duration-150"></div>
-                <!-- The ball; absolute-positioned, its `left` is driven by the rAF loop -->
-                <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-green-400" style="left:calc(50% - 10px); box-shadow:0 0 14px 3px rgba(0,255,136,0.5);"></div>
-            </div>
+            <p class="text-sm text-gray-300 mb-3">${instr}</p>
+            ${runArea}
             <div class="text-center text-lg font-mono text-gray-300 mb-3">
                 <span id="nd-wiz-counter">${beatsDone} / ${beatsExpected}</span>
             </div>
