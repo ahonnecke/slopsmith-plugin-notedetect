@@ -183,16 +183,17 @@ async function main() {
 
             console.log(`   Running WAV replay test...`);
             result = await page.evaluate(async (name, wavChartStart) => {
-                // Mock highway.getTime() so WAV playback aligns to chart.
-                // WAV t=0 corresponds to chart time wavChartStart.
-                // _ndTestWavPlaybackStart is set inside _ndInjectTestWav right
-                // when source.start() fires, so fetch/decode overhead is excluded.
+                // Mock highway.getTime() so WAV playback aligns to chart on
+                // the AudioContext's hardware clock. _ndInjectTestWav schedules
+                // source.start(t0) at _ndAudioCtx.currentTime + lookahead and
+                // stores t0 as window._ndTestWavPlaybackStartAudio.
                 const realGetTime = highway.getTime.bind(highway);
                 const realGetAvOffset = highway.getAvOffset ? highway.getAvOffset.bind(highway) : () => 0;
-                window._ndTestWavPlaybackStart = 0;
+                window._ndTestWavPlaybackStartAudio = undefined;
                 highway.getTime = () => {
-                    if (window._ndTestWavPlaybackStart === 0) return realGetTime();
-                    const elapsed = (performance.now() - window._ndTestWavPlaybackStart) / 1000;
+                    const anchor = window._ndTestWavPlaybackStartAudio;
+                    if (anchor === undefined) return realGetTime();
+                    const elapsed = _ndAudioCtx.currentTime - anchor;
                     return wavChartStart + elapsed;
                 };
                 highway.getAvOffset = () => 0;

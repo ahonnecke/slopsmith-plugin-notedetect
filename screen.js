@@ -218,6 +218,10 @@ const _ND_PERFECT_PITCH_CENT = 20;
 //   hit:    whether it was within both tolerances (pass for scoring).
 const _ND_EVENT_WINDOW = 30;
 let _ndEventLog = [];
+// Diagnostic capture — when window._ndCaptureAllEvents is truthy, every match
+// attempt is pushed to window._ndAllEvents without the ring-buffer cap. Used
+// by test/replay-baseline.js for offline residual analysis across full songs.
+// Off by default so production keeps its bounded memory.
 
 // Transient rejection — lightweight filter that adds zero latency.
 // If MIDI jumps > threshold from previous detection within the debounce
@@ -278,16 +282,40 @@ let _ndRecordMaxSamples = 0;
 let _ndRecordTotalSamples = 0;
 let _ndRecordSampleRate = 48000;
 
-let _ndRecordChartStartTime = 0; // chart time when recording started
+let _ndRecordChartStartTime = 0; // chart time of the first captured sample (set inside SP callback, not at _ndRecordStart call)
+let _ndRecordAnchored = false;   // true once the SP callback has captured the real first-sample chart time
+let _ndRecordArmedChartTime = 0; // chart time at the moment of arming — used to detect play-has-started (chart advancing)
+let _ndRecordFilename = 'auto-recording.wav'; // filename used by the auto-save when max samples reached
 
-function _ndRecordStart(maxSeconds = 60) {
+function _ndRecordStart(maxSeconds = 60, filename) {
     _ndRecordChunks = [];
     _ndRecordTotalSamples = 0;
     _ndRecordSampleRate = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     _ndRecordMaxSamples = maxSeconds * _ndRecordSampleRate;
-    _ndRecordChartStartTime = highway.getTime ? highway.getTime() : 0;
+    // Do NOT capture chart start time here — highway.getTime() returns the
+    // paused chart position if the song hasn't been played yet, which does
+    // not correspond to WAV t=0 once playback starts. Instead, anchor inside
+    // the ScriptProcessor callback on the first sample captured AFTER the
+    // chart clock begins advancing.
+    _ndRecordAnchored = false;
+    _ndRecordChartStartTime = 0;
+    _ndRecordArmedChartTime = highway.getTime ? highway.getTime() : 0;
+    _ndRecordFilename = filename || 'auto-recording.wav';
     _ndRecording = true;
-    console.log(`[note_detect] Recording started (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz, chart time ${_ndRecordChartStartTime.toFixed(3)}s)`);
+    console.log(`[note_detect] Recording armed (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz, chart ${_ndRecordArmedChartTime.toFixed(3)}s — waiting for playback to advance)`);
+}
+
+// Returns a snapshot of the recording state for UI polling.
+function _ndRecordStatus() {
+    return {
+        active: _ndRecording,
+        anchored: _ndRecordAnchored,
+        armedChartTime: _ndRecordArmedChartTime,
+        anchorChartTime: _ndRecordChartStartTime,
+        capturedSec: _ndRecordTotalSamples / (_ndRecordSampleRate || 48000),
+        maxSec: _ndRecordMaxSamples / (_ndRecordSampleRate || 48000),
+        filename: _ndRecordFilename,
+    };
 }
 
 function _ndRecordStop() {
@@ -357,6 +385,44 @@ async function _ndRecordSave(filename = 'recording.wav') {
         a.href = url; a.download = filename; a.click();
         URL.revokeObjectURL(url);
     }
+}
+
+// UI-driven aligned recording. Arms recording AND starts playback atomically
+// so there is no "human interval" between the two. The SP callback captures
+// the anchor on the first sample where the chart has advanced past the armed
+// value, which happens within one SP buffer (~42 ms) of audio.play().
+async function _ndRecordAlignedStart(seconds = 60) {
+    if (_ndRecording) {
+        console.log('[note_detect] Recording already active; stop first');
+        return null;
+    }
+    const info = highway.getSongInfo && highway.getSongInfo();
+    const songSlug = info?.filename
+        ? info.filename.replace(/\.\w+$/, '').replace(/[^a-z0-9-]/gi, '_').toLowerCase()
+        : 'take';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `${songSlug}-${stamp}.wav`;
+    _ndRecordStart(seconds, filename);
+
+    // Start playback if the song audio is paused. If it's already playing,
+    // leave it alone. If there's no audio element, the user can start it
+    // manually and the anchor will be captured whenever playback advances.
+    const audio = document.getElementById('audio');
+    if (audio) {
+        if (audio.paused) {
+            try {
+                await audio.play();
+                console.log(`[note_detect] Playback started from chart ${(highway.getTime ? highway.getTime() : 0).toFixed(3)}s`);
+            } catch (e) {
+                console.warn('[note_detect] audio.play() rejected:', e?.message || e);
+            }
+        } else {
+            console.log('[note_detect] Audio already playing — recording armed without triggering play');
+        }
+    } else {
+        console.log('[note_detect] No <audio id="audio"> found; press play manually to begin');
+    }
+    return filename;
 }
 
 // Auto-dump: POST diagnostic data to server automatically so the user never
@@ -2049,13 +2115,29 @@ function createNoteDetector(options = {}) {
             if (!_ndEnabled) return;
             const input = e.inputBuffer.getChannelData(0);
 
-            // Record raw audio if recording is active
+            // Record raw audio if recording is active. Chart-time anchor is
+            // captured here — NOT at _ndRecordStart() — so WAV t=0 corresponds
+            // to a sample taken while the chart clock was advancing.
             if (_ndRecording && _ndRecordTotalSamples < _ndRecordMaxSamples) {
-                _ndRecordChunks.push(new Float32Array(input));
-                _ndRecordTotalSamples += input.length;
-                if (_ndRecordTotalSamples >= _ndRecordMaxSamples) {
-                    console.log('[note_detect] Recording max duration reached, auto-stopping');
-                    _ndRecordSave('auto-recording.wav');
+                if (!_ndRecordAnchored) {
+                    const chartNow = highway.getTime ? highway.getTime() : 0;
+                    // Wait for the chart clock to advance past where it was
+                    // when we armed. 1ms epsilon tolerates float noise.
+                    if (chartNow > _ndRecordArmedChartTime + 0.001) {
+                        _ndRecordChartStartTime = chartNow;
+                        _ndRecordAnchored = true;
+                        console.log(`[note_detect] Recording anchor set: WAV t=0 = chart ${chartNow.toFixed(3)}s`);
+                        _ndRecordChunks.push(new Float32Array(input));
+                        _ndRecordTotalSamples += input.length;
+                    }
+                    // else: chart paused; skip this sample batch until play starts.
+                } else {
+                    _ndRecordChunks.push(new Float32Array(input));
+                    _ndRecordTotalSamples += input.length;
+                    if (_ndRecordTotalSamples >= _ndRecordMaxSamples) {
+                        console.log('[note_detect] Recording max duration reached, auto-stopping');
+                        _ndRecordSave(_ndRecordFilename);
+                    }
                 }
             }
 
@@ -2581,13 +2663,19 @@ function _ndMatchNotes() {
         const hit = closestDt >= -earlyWindowSec * 1000
                  && closestDt <= lateWindowSec * 1000
                  && Math.abs(centsErr) <= centsTolerance;
-        _ndEventLog.push({
+        const evt = {
             dtMs: closestDt, centsErr, hit, time: t,
             detectedMidi: scoreMidi,
             expectedMidi,
             chartNote: `s${closest.s}/f${closest.f}`,
-        });
+            chartT: closest.t,
+        };
+        _ndEventLog.push(evt);
         if (_ndEventLog.length > _ND_EVENT_WINDOW) _ndEventLog.shift();
+        if (window._ndCaptureAllEvents) {
+            if (!window._ndAllEvents) window._ndAllEvents = [];
+            window._ndAllEvents.push(evt);
+        }
     }
 
     // Check each candidate (all-against-all match, as before)
@@ -3530,10 +3618,68 @@ function _ndShowSettings() {
         <div class="text-[10px] text-gray-600 mt-1 leading-tight">
             Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
         </div>
+
+        <div class="border-t border-gray-700 mt-3 pt-3">
+            <label class="block text-gray-400 text-xs mb-1">Diagnostic Recording</label>
+            <div class="flex items-center gap-2 mb-1">
+                <select id="nd-record-secs" class="bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200">
+                    <option value="15">15s</option>
+                    <option value="30">30s</option>
+                    <option value="60" selected>60s</option>
+                    <option value="120">120s</option>
+                </select>
+                <button id="nd-record-btn" onclick="_ndOnRecordClick()"
+                    class="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs text-red-200 font-semibold">
+                    ● Record
+                </button>
+            </div>
+            <div id="nd-record-status" class="text-[10px] text-gray-600 leading-tight">
+                Click once — the song starts playing and recording arms atomically. WAV t=0 anchors to the first sample captured after the chart advances, so the fixture is free of the "armed-then-play" interval bug.
+            </div>
+        </div>
     `;
 
     document.body.appendChild(panel);
     _ndPopulateDevices();
+}
+
+// Click handler for the Record button in the settings panel. Arms recording
+// and starts playback atomically (see _ndRecordAlignedStart), then polls the
+// recording status so the user sees progress without opening the console.
+async function _ndOnRecordClick() {
+    const btn = document.getElementById('nd-record-btn');
+    const status = document.getElementById('nd-record-status');
+    if (!btn || !status) return;
+    if (_ndRecording) {
+        _ndRecordSave(_ndRecordFilename);
+        return;
+    }
+    const secs = parseInt(document.getElementById('nd-record-secs')?.value || '60', 10);
+    btn.disabled = true;
+    const filename = await _ndRecordAlignedStart(secs);
+    btn.disabled = false;
+    if (!filename) return;
+    btn.textContent = '■ Stop';
+    btn.className = 'px-3 py-1 bg-yellow-900 hover:bg-yellow-800 rounded text-xs text-yellow-200 font-semibold';
+    const t0 = performance.now();
+    const tick = () => {
+        const s = _ndRecordStatus();
+        if (!s.active) {
+            status.textContent = `Saved ${filename} (anchor chart ${s.anchorChartTime.toFixed(3)}s, ${s.capturedSec.toFixed(1)}s captured).`;
+            btn.textContent = '● Record';
+            btn.className = 'px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs text-red-200 font-semibold';
+            return;
+        }
+        if (!s.anchored) {
+            const waited = ((performance.now() - t0) / 1000).toFixed(1);
+            status.textContent = `Armed (chart ${s.armedChartTime.toFixed(3)}s). Waiting ${waited}s for chart to advance — if this persists, playback didn't start.`;
+        } else {
+            const remaining = Math.max(0, s.maxSec - s.capturedSec);
+            status.textContent = `Recording — anchor chart ${s.anchorChartTime.toFixed(3)}s, ${s.capturedSec.toFixed(1)}/${s.maxSec.toFixed(0)}s (${remaining.toFixed(1)}s left).`;
+        }
+        setTimeout(tick, 200);
+    };
+    tick();
 }
 
 function _ndOnDeviceChange(deviceId) {
@@ -9520,13 +9666,18 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
     const source = _ndAudioCtx.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(_ndTestGainNode);
-    source.start();
-    // Mark playback start for highway time mock alignment
-    window._ndTestWavPlaybackStart = performance.now();
+    // Schedule on the audio clock with a small lookahead so the graph has
+    // time to flush. The anchor is the scheduled audio-clock time, not
+    // performance.now() — the two drift independently. See
+    // docs/WAV_ALIGNMENT_ISSUE.md items #2 and #3.
+    const wavPlaybackLookaheadSec = 0.05;
+    const wavPlaybackStartAudio = _ndAudioCtx.currentTime + wavPlaybackLookaheadSec;
+    source.start(wavPlaybackStartAudio);
+    window._ndTestWavPlaybackStartAudio = wavPlaybackStartAudio;
     _ndTestOscillators.push(source);
 
-    // Wait for playback + pipeline drain
-    await new Promise(r => setTimeout(r, (dur + 1.5) * 1000));
+    // Wait for lookahead + playback + pipeline drain
+    await new Promise(r => setTimeout(r, (wavPlaybackLookaheadSec + dur + 1.5) * 1000));
 
     // Force miss checking — the draw hook (which normally calls _ndCheckMisses)
     // may not be running in headless mode. The miss checker only scans 1s behind
