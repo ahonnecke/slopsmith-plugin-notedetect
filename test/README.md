@@ -1,36 +1,49 @@
-# Detection-core test harness
+# Note Detection Tests
 
-Node `vm`-based tests for the pure pitch-detection and string/fret-mapping
-logic in `screen.js`. Loads the shipped plugin script with DOM/browser stubs
-and exercises its function declarations against synthetic signals.
+## Programmatic audio test (Puppeteer)
 
-## Run
+Injects synthetic sine waves into the detection pipeline via OscillatorNode and verifies chart matching. Exercises the full pipeline: YIN → stability voting → event-driven matching → chart scoring.
 
+Requires slopsmith running at `localhost:8088`.
+
+```bash
+# Install dependencies (first time)
+npm install
+
+# Quick test (30 notes, ~45s)
+node test/perfect-play.test.js
+
+# Full song (all notes, ~3min)
+node test/perfect-play.test.js --max-notes 127
+
+# Specific song/arrangement
+node test/perfect-play.test.js --song "Mexico" --arrangement 3
+
+# Show browser window for debugging
+node test/perfect-play.test.js --headed
 ```
+
+Pass criteria: 90%+ hit rate. Current result: 125/125 (100%) on Mexico bass.
+
+## Detection-core unit tests (Node vm)
+
+Pure pitch-detection and string/fret-mapping logic tests. Loads `screen.js` into a Node vm with DOM stubs. No browser needed.
+
+```bash
 npm test
 ```
 
-Requires Node 18+ (uses the built-in `node:test` runner; no dependencies).
+### What the unit tests cover
 
-## What these prove
-
-The plugin today is a 6-string-guitar detector. The tests document concrete
-behavior gaps that matter for bass practice:
-
-| Gap | Test file |
+| Test file | What it proves |
 |---|---|
-| Bass MIDI < 40 returns `{string:-1, fret:-1}` and the hit is silently dropped | `mapping-bass.test.js` |
-| `_ndMidiToStringFret` picks the guitar interpretation for bass G2 (MIDI 43), hiding the open-G-string fingering | `mapping-bass.test.js` |
-| YIN silently returns `-1` for frequencies below ~80 Hz when handed a 2048-sample buffer (one raw ScriptProcessor frame, no accumulation) | `yin-buffer-sizing.test.js` |
-| YIN returns no detection when the fundamental is suppressed (common on small-speaker / compressed bass signals) and some noise is present | `yin-noise-tolerance.test.js` |
+| `mapping-bass.test.js` | Bass MIDI mapping and string/fret resolution |
+| `yin-buffer-sizing.test.js` | YIN needs 4096+ samples for frequencies below ~80 Hz |
+| `yin-noise-tolerance.test.js` | YIN behavior with suppressed fundamentals and noise |
+| `display-fingering.test.js` | Chart-context-aware fingering resolution |
 
-Passing tests at the top of each file are intentional regression guards:
-we want to catch if a future edit breaks the baselines that currently work.
+## Architecture
 
-## Why a `vm`-based loader
+The unit tests use a `vm`-based loader (`_loader.js`) that runs the real `screen.js` against DOM/Navigator stubs. This ensures tests exercise the shipping code, not a copy that could drift.
 
-`screen.js` is a single browser script (no module exports). Copying the YIN
-or mapping functions into a test module would drift. The loader
-(`test/_loader.js`) runs the real script against DOM/Navigator stubs, lets
-the top-level function declarations attach to the sandbox, and extracts
-them. Tests exercise the shipping code.
+The Puppeteer test (`perfect-play.test.js`) runs against the actual slopsmith app in headless Chrome with real Web Audio API processing.
