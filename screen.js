@@ -164,7 +164,12 @@ let _ndPitchTolerance = 50;      // cents
 let _ndInputGain = 1.0;
 let _ndSelectedDeviceId = '';
 let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
-let _ndLatencyOffset = 0.350;    // seconds — compensates for buffer accumulation (~85ms) + stability voting (~250ms)
+// Detection pipeline latency (audio input buffer + YIN window + stability voting).
+// Rocksmith-equivalent: "Audio Lag Correction" / input offset. See
+// docs/ROCKSMITH_TIMING_MODEL.md. Distinct from avOffsetMs (chart-vs-audio display
+// offset): subtract this from chart time when translating a detection *event* back
+// to "when the string was actually struck."
+let _ndDetectionLatencySec = 0.350;
 let _ndSilenceGate = 0.02;       // reject detections below this input level (scaled RMS)
 let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensates for chart CentOffset / tuning errors
 // NOTE: localStorage may have a stale -1 from a bad calibration run. The
@@ -272,7 +277,7 @@ function _ndAutoDumpPost() {
         frameLog: _ndFrameLog,
         noteResults: [],
         settings: {
-            latencyOffset: _ndLatencyOffset,
+            latencyOffset: _ndDetectionLatencySec,
             timingTolerance: _ndTimingTolerance,
             pitchTolerance: _ndPitchTolerance,
             silenceGate: _ndSilenceGate,
@@ -350,7 +355,7 @@ function _ndSaveSettings() {
             timingTolerance: _ndTimingTolerance,
             pitchTolerance: _ndPitchTolerance,
             inputGain: _ndInputGain,
-            latencyOffset: _ndLatencyOffset,
+            latencyOffset: _ndDetectionLatencySec,
             silenceGate: _ndSilenceGate,
             pitchOffset: _ndPitchOffset,
         }));
@@ -368,7 +373,7 @@ function _ndLoadSettings() {
         if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
         if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
-        if (s.latencyOffset !== undefined) _ndLatencyOffset = s.latencyOffset;
+        if (s.latencyOffset !== undefined) _ndDetectionLatencySec = s.latencyOffset;
         if (s.silenceGate !== undefined) _ndSilenceGate = s.silenceGate;
         if (s.pitchOffset !== undefined) {
             // Reject saved offsets > ±1 — they're from the feedback loop bug
@@ -2260,7 +2265,7 @@ async function _ndProcessFrame(buffer) {
     // Log every stable frame
     if (_ndFrameLogEnabled) {
         const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-        const scoreT = highway.getTime() + avOffsetSec - _ndLatencyOffset;
+        const scoreT = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
         _ndFrameLog.push({
             t: now, type: 'stable',
             midi: _ndStableMidi,
@@ -2359,36 +2364,38 @@ function _ndMatchNotes() {
     // pitch changes (not every frame). Use the STABLE midi for scoring — it's
     // been validated by 3-of-5 agreement and confidence 0.7.
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
+    const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
     const scoreMidi = _ndStableMidi;
     if (scoreMidi < 0) return;
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
-    // Wider window for event-driven matching: pitch specificity (50 cents)
-    // provides the selectivity that the tight timing window used to provide.
-    // Stability voting adds ~250ms latency, so the old ±110ms window was
-    // physically impossible. Use ±500ms — enough for the detection pipeline.
-    const tolerance = Math.max(_ndTimingTolerance, 0.5);
+    // Asymmetric hit window. _ndDetectionLatencySec already compensates the
+    // bulk of pipeline bias; remaining jitter leans late, so the late bound
+    // is 2× the early bound. _ndTimingTolerance is the user-tunable "early"
+    // window. See docs/ROCKSMITH_TIMING_MODEL.md.
+    const earlyWindowSec = _ndTimingTolerance;
+    const lateWindowSec = _ndTimingTolerance * 2;
     const centsTolerance = _ndPitchTolerance;
 
     const candidateNotes = [];
 
-    // Use binary search to jump to the relevant time region
+    // Candidate notes sit within [t - lateWindow, t + earlyWindow] around the
+    // detection-adjusted chart time `t`.
     if (notes && notes.length > 0) {
-        const start = _ndBsearch(notes, t - tolerance);
+        const start = _ndBsearch(notes, t - lateWindowSec);
         for (let i = start; i < notes.length; i++) {
             const n = notes[i];
-            if (n.t > t + tolerance) break;
+            if (n.t > t + earlyWindowSec) break;
             if (n.mt) continue; // skip muted notes
             candidateNotes.push({ s: n.s, f: n.f, t: n.t });
         }
     }
     if (chords && chords.length > 0) {
-        const start = _ndBsearch(chords, t - tolerance);
+        const start = _ndBsearch(chords, t - lateWindowSec);
         for (let i = start; i < chords.length; i++) {
             const c = chords[i];
-            if (c.t > t + tolerance) break;
+            if (c.t > t + earlyWindowSec) break;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
@@ -2425,7 +2432,9 @@ function _ndMatchNotes() {
     if (closest) {
         const expectedMidi = _ndMidiFromStringFret(closest.s, closest.f) + _ndPitchOffset;
         const centsErr = (scoreMidi - expectedMidi) * 100;
-        const hit = Math.abs(closestDt) <= tolerance * 1000 && Math.abs(centsErr) <= centsTolerance;
+        const hit = closestDt >= -earlyWindowSec * 1000
+                 && closestDt <= lateWindowSec * 1000
+                 && Math.abs(centsErr) <= centsTolerance;
         _ndEventLog.push({
             dtMs: closestDt, centsErr, hit, time: t,
             detectedMidi: scoreMidi,
@@ -2518,7 +2527,7 @@ function _ndStats() {
 // each beat (that's the difference from a flash-then-react design).
 //
 // Applies to:
-//   _ndLatencyOffset  ← audio_run (total round-trip; correct for scoring)
+//   _ndDetectionLatencySec  ← audio_run (total round-trip; correct for scoring)
 //   core av_offset_ms ← audio_run − visual_run (audio output lag; correct
 //                       for shifting the highway so visuals match what you
 //                       hear)
@@ -2766,7 +2775,7 @@ async function _ndWizApplyMetro() {
     // leave the highway worse than before the wizard.
     if (totalMs !== null) {
         const applied = Math.max(0, totalMs);
-        _ndLatencyOffset = Math.min(1, applied / 1000);
+        _ndDetectionLatencySec = Math.min(1, applied / 1000);
         _ndSaveSettings();
         const sl = document.querySelector('#nd-settings-panel input[type=range]');
         const lbl = document.getElementById('nd-latency-val');
@@ -3145,10 +3154,13 @@ function _ndCheckMisses() {
     // Mirror _ndMatchNotes's time derivation so hit/miss are measured on the
     // same clock (visual-target time the player is actually aiming at).
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-    const t = highway.getTime() + avOffsetSec - _ndLatencyOffset;
-    // Use the same effective tolerance as _ndMatchNotes (wider for event-driven)
-    const tolerance = Math.max(_ndTimingTolerance, 0.5);
-    const missDeadline = t - tolerance * 2; // notes older than this are missed
+    const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+    // A note is missed once it has passed the late bound of the hit window.
+    // Matches _ndMatchNotes's asymmetric window; see docs/ROCKSMITH_TIMING_MODEL.md.
+    // Extra grace period prevents racing a detection that arrives right at the edge.
+    const lateWindowSec = _ndTimingTolerance * 2;
+    const missGraceSec = 0.050;
+    const missDeadline = t - lateWindowSec - missGraceSec;
     const notes = highway.getNotes();
     const chords = highway.getChords();
 
@@ -3327,10 +3339,10 @@ function _ndShowSettings() {
                class="w-full accent-yellow-400 mb-3"
                oninput="_ndSilenceGate=this.value/100;document.getElementById('nd-gate-val').textContent=this.value;_ndSaveSettings()"
                title="Reject detections when input level is below this threshold. Raise to suppress noise/hum.">
-        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndLatencyOffset * 1000)}</span>ms</label>
-        <input type="range" min="0" max="1000" value="${Math.round(_ndLatencyOffset * 1000)}"
+        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndDetectionLatencySec * 1000)}</span>ms</label>
+        <input type="range" min="0" max="1000" value="${Math.round(_ndDetectionLatencySec * 1000)}"
                class="w-full accent-green-400 mb-2"
-               oninput="_ndLatencyOffset=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
+               oninput="_ndDetectionLatencySec=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
             <button onclick="_ndOpenWizard()"
                 class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs text-white font-semibold"
@@ -8588,7 +8600,7 @@ function _ndDiagDumpToConsole() {
     console.log('Arrangement:', _ndCurrentArrangement);
     console.log('Tuning offsets:', _ndTuningOffsets.slice(0, _ndStandardMidiFor(_ndCurrentArrangement).length));
     console.log('Capo:', _ndCapo);
-    console.log('Latency offset:', _ndLatencyOffset * 1000, 'ms');
+    console.log('Latency offset:', _ndDetectionLatencySec * 1000, 'ms');
     console.log('AV offset:', highway.getAvOffset ? highway.getAvOffset() : 0, 'ms');
     console.log('Timing tolerance:', _ndTimingTolerance * 1000, 'ms');
     console.log('Pitch tolerance:', _ndPitchTolerance, 'cents');
@@ -8965,7 +8977,7 @@ function _ndDiagRender(panel) {
     const gateOk = _ndInputLevel >= _ndSilenceGate;
 
     const avOff = (highway.getAvOffset ? highway.getAvOffset() : 0);
-    const matchT = t + avOff / 1000 - _ndLatencyOffset;
+    const matchT = t + avOff / 1000 - _ndDetectionLatencySec;
 
     panel.innerHTML = `
 <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:start">
@@ -8984,7 +8996,7 @@ function _ndDiagRender(panel) {
   <div style="min-width:200px">
     <b>Timing</b><br>
     chart: ${t.toFixed(2)}s  match: ${matchT.toFixed(2)}s  \u0394=${((matchT - t) * 1000).toFixed(0)}ms<br>
-    AV: ${avOff.toFixed(0)}ms  latency: ${(_ndLatencyOffset * 1000).toFixed(0)}ms<br>
+    AV: ${avOff.toFixed(0)}ms  latency: ${(_ndDetectionLatencySec * 1000).toFixed(0)}ms<br>
     tol: ${(_ndTimingTolerance * 1000).toFixed(0)}ms / ${_ndPitchTolerance}\u00a2<br>
     pitch offset: ${_ndPitchOffset >= 0 ? '+' : ''}${_ndPitchOffset} semitones
   </div>
@@ -9189,7 +9201,7 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
         hitRate: _ndHits + _ndMisses > 0 ? (_ndHits / (_ndHits + _ndMisses) * 100).toFixed(1) : '0.0',
         noteResults: results,
         settings: {
-            latencyOffset: _ndLatencyOffset,
+            latencyOffset: _ndDetectionLatencySec,
             timingTolerance: _ndTimingTolerance,
             pitchTolerance: _ndPitchTolerance,
             silenceGate: _ndSilenceGate,
@@ -9302,15 +9314,17 @@ async function _ndTestPerfectPlay(options = {}) {
 
     highway.getTime = () => {
         if (testStartPerf === 0) return realGetTime();
-        // Map performance.now() to chart time, accounting for latency offset
+        // Map wall-clock elapsed time to chart time. The pipeline's natural
+        // detection delay (~400ms) is the latency that _ndDetectionLatencySec
+        // compensates in scoreT. Don't add it here — that would double-count.
         const elapsed = (performance.now() - testStartPerf) / 1000;
-        return baseChartTime + elapsed + _ndLatencyOffset;
+        return baseChartTime + elapsed;
     };
     // Zero out AV offset during test — we're injecting directly, no audio output lag
     highway.getAvOffset = () => 0;
 
     console.log(`[nd-test] Starting perfect-play test: ${sequence.length} notes, base chart time ${baseChartTime.toFixed(3)}s`);
-    console.log(`[nd-test] Latency offset: ${(_ndLatencyOffset * 1000).toFixed(0)}ms`);
+    console.log(`[nd-test] Latency offset: ${(_ndDetectionLatencySec * 1000).toFixed(0)}ms`);
 
     testStartPerf = performance.now();
 

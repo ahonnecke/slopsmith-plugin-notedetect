@@ -116,7 +116,7 @@ async function main() {
             _ndEnabled = true;
             // Reset any poisoned settings
             _ndPitchOffset = 0;
-            _ndLatencyOffset = 0.350;
+            _ndDetectionLatencySec = 0.350;
             // Set arrangement from song info (normally done in _ndToggle)
             const info = highway.getSongInfo();
             if (info && info.arrangement) _ndSetArrangement(info.arrangement);
