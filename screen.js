@@ -9486,8 +9486,23 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
     await new Promise(r => setTimeout(r, (dur + 1.5) * 1000));
 
     // Force miss checking — the draw hook (which normally calls _ndCheckMisses)
-    // may not be running in headless mode
-    if (typeof _ndCheckMisses === 'function') _ndCheckMisses();
+    // may not be running in headless mode. The miss checker only scans 1s behind
+    // the deadline per call (designed for per-frame use), so sweep through the
+    // entire chart by advancing the mock time and calling repeatedly.
+    if (typeof _ndCheckMisses === 'function') {
+        const notes = highway.getNotes() || [];
+        if (notes.length > 0) {
+            const lastNoteTime = notes[notes.length - 1].t;
+            // Temporarily advance highway time past all notes
+            const savedGetTime = highway.getTime;
+            const sweepEnd = lastNoteTime + 2; // 2s past last note
+            for (let sweepT = 0; sweepT <= sweepEnd; sweepT += 0.5) {
+                highway.getTime = () => sweepT + _ndDetectionLatencySec;
+                _ndCheckMisses();
+            }
+            highway.getTime = savedGetTime;
+        }
+    }
 
     const results = [];
     _ndNoteResults.forEach((v, k) => results.push({ key: k, ...v }));
