@@ -68,6 +68,62 @@ WAV ?= test/fixtures/mexico-bass-take1.wav
 test-wav: ## Run WAV replay test on a fixture (WAV=<path> to override)
 	node test/perfect-play.test.js --song Mexico --arrangement 3 --max-notes 200 --wav $(WAV)
 
+# ── Harness layers ──────────────────────────────────────────────────────────
+# Each target below is a discrete validation with quantitative output. They
+# compose: `make test-pipeline` runs everything that doesn't need slopsmith
+# running; `make test-all` additionally exercises the browser-pipeline paths.
+
+.PHONY: test-ground-truth
+test-ground-truth: ## Offline YIN per-pitch correctness against known-note WAVs (4 plucks, per-frame MIDI)
+	node --test test/ground-truth.test.js
+
+.PHONY: test-synth
+test-synth: ## Synthesize a bass WAV from the chart and measure offline YIN hit rate against expected MIDIs
+	node test/synthesize-bass.js
+	node test/yin-offline.js test/fixtures/ground-truth/mexico-bass-synth.wav
+
+.PHONY: test-pipeline
+test-pipeline: ## Node-only validation bundle: pitch-relevant unit tests + ground-truth + offline synth analysis (no browser)
+	@echo "=== Pitch-detection unit + ground-truth tests ==="
+	node --test test/ground-truth.test.js test/yin-buffer-sizing.test.js test/yin-noise-tolerance.test.js
+	@echo
+	@echo "=== Offline YIN vs synthesized Mexico (pipeline capability ceiling) ==="
+	$(MAKE) --no-print-directory test-synth
+	@echo
+	@echo "Note: test/mapping-bass.test.js and test/display-fingering.test.js"
+	@echo "      have 7 pre-existing failures (unrelated to pitch detection)."
+	@echo "      Run 'make test' to see them."
+
+.PHONY: test-timing-latency
+test-timing-latency: check-slopsmith ## Timing-latency harness: p95 scoring error vs onset-manifest attacks (browser)
+	node test/timing-latency.test.js
+
+.PHONY: test-replay
+test-replay: check-slopsmith ## Replay-baseline on real-bass takes (browser; exposes player-accuracy floor)
+	node test/replay-baseline.js
+
+.PHONY: test-synth-replay
+test-synth-replay: check-slopsmith ## Replay-baseline on the synthesized WAV (browser; measures end-to-end pipeline)
+	node test/synthesize-bass.js
+	node test/replay-baseline.js --fixture-dir test/fixtures/ground-truth --fixture-glob 'mexico-bass-synth.wav'
+
+.PHONY: test-detector-bakeoff
+test-detector-bakeoff: check-slopsmith ## YIN vs CREPE side-by-side on the open-strings ground-truth WAV (browser)
+	node test/detector-bakeoff.js
+
+.PHONY: test-all
+test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency
+	$(MAKE) --no-print-directory test-pipeline
+	@echo
+	@echo "=== Browser: timing-latency ==="
+	$(MAKE) --no-print-directory test-timing-latency
+	@echo
+	@echo "=== Browser: replay on real takes ==="
+	$(MAKE) --no-print-directory test-replay
+	@echo
+	@echo "=== Browser: replay on synth ==="
+	$(MAKE) --no-print-directory test-synth-replay
+
 .PHONY: diagnostic
 diagnostic: ## Copy test/diagnostic-inject.js to clipboard; paste into Slopsmith browser console
 	@command -v xclip >/dev/null 2>&1 || { echo "error: xclip not found (install xclip)"; exit 1; }

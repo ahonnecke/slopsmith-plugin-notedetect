@@ -20,7 +20,7 @@ const path = require('path');
 const puppeteer = require('puppeteer');
 
 const SLOPSMITH_URL = process.env.SLOPSMITH_URL || 'http://localhost:8088';
-const FIXTURES_DIR = path.join(__dirname, 'fixtures');
+const DEFAULT_FIXTURES_DIR = path.join(__dirname, 'fixtures');
 const TIMEOUT_MS = 120_000;
 
 const args = process.argv.slice(2);
@@ -32,6 +32,7 @@ function getArg(name, defaultVal) {
 const SONG_QUERY = getArg('song', 'Mexico');
 const ARRANGEMENT = getArg('arrangement', null);
 const FIXTURE_GLOB = getArg('fixture-glob', 'mexico-bass-take*.wav');
+const FIXTURES_DIR = getArg('fixture-dir', DEFAULT_FIXTURES_DIR);
 const HEADLESS = !args.includes('--headed');
 
 function discoverFixtures() {
