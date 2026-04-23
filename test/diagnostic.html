@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Note Detection — Layer Diagnostics</title>
+<style>
+  body { background: #111; color: #eee; font: 14px/1.6 monospace; padding: 20px; max-width: 900px; }
+  h1 { font-size: 18px; border-bottom: 1px solid #444; padding-bottom: 8px; }
+  h2 { font-size: 15px; color: #88f; margin-top: 24px; }
+  .pass { color: #0f8; } .fail { color: #f44; } .warn { color: #fc0; } .info { color: #8cf; }
+  pre { background: #1a1a2a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+  button { background: #336; color: #eee; border: 1px solid #558; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 4px; font: 13px monospace; }
+  button:hover { background: #448; }
+  #log { background: #0a0a14; padding: 12px; border-radius: 6px; max-height: 400px; overflow-y: auto; font-size: 12px; }
+  .log-line { border-bottom: 1px solid #1a1a2a; padding: 2px 0; }
+</style>
+</head>
+<body>
+
+<h1>Note Detection — Layer-by-Layer Diagnostic</h1>
+<p>Open this in a tab while Slopsmith + notedetect plugin is running on the same origin.
+Each test isolates one layer of the detection → matching → rendering pipeline.</p>
+
+<h2>Test 1: Is the plugin loaded?</h2>
+<p>Checks if the notedetect plugin's globals are present in the page.</p>
+<button onclick="test1()">Run</button>
+<pre id="t1"></pre>
+
+<h2>Test 2: Is detection active?</h2>
+<p>Checks _ndEnabled, audio context state, detected MIDI value.</p>
+<button onclick="test2()">Run</button>
+<pre id="t2"></pre>
+
+<h2>Test 3: Are detections arriving?</h2>
+<p>Polls _ndDetectedMidi for 5 seconds. Play a note on your guitar.</p>
+<button onclick="test3()">Run (play a note!)</button>
+<pre id="t3"></pre>
+
+<h2>Test 4: Are chart notes available?</h2>
+<p>Checks highway.getNotes() and highway.getChords().</p>
+<button onclick="test4()">Run</button>
+<pre id="t4"></pre>
+
+<h2>Test 5: What's in _ndNoteResults?</h2>
+<p>Dumps the current judgment map — shows what matching has produced.</p>
+<button onclick="test5()">Run</button>
+<pre id="t5"></pre>
+
+<h2>Test 6: Is _ndCheckMisses running?</h2>
+<p>Checks if the miss-check interval is active and producing miss entries.</p>
+<button onclick="test6()">Run</button>
+<pre id="t6"></pre>
+
+<h2>Test 7: Force a miss and check rendering</h2>
+<p>Injects a fake MISSED_NO_DETECTION into _ndNoteResults for the first chart note
+near the current time. If the draw hook works, you should see a red X on the highway.</p>
+<button onclick="test7()">Run</button>
+<pre id="t7"></pre>
+
+<h2>Test 8: Timing alignment check</h2>
+<p>Shows the clock values used by matching vs the highway. Drift here = mismatched hits.</p>
+<button onclick="test8()">Run</button>
+<pre id="t8"></pre>
+
+<h2>Live Event Log</h2>
+<p>Streams _ndEventLog entries as they arrive. Play notes to see matching attempts.</p>
+<button onclick="startLog()">Start</button>
+<button onclick="stopLog()">Stop</button>
+<div id="log"></div>
+
+<script>
+// All tests access the main page's globals via window.opener or same-origin frames.
+// This page must be opened from within Slopsmith (same origin).
+
+function el(id) { return document.getElementById(id); }
+function line(cls, text) { return `<span class="${cls}">${text}</span>`; }
+
+function test1() {
+    const out = [];
+    const checks = [
+        ['_ndEnabled', typeof _ndEnabled],
+        ['_ndNoteResults', typeof _ndNoteResults],
+        ['_ndCheckMisses', typeof _ndCheckMisses],
+        ['_ndMatchNotes', typeof _ndMatchNotes],
+        ['_ndDetectedMidi', typeof _ndDetectedMidi],
+        ['highway', typeof highway],
+        ['highway.getNotes', typeof highway?.getNotes],
+        ['highway.addDrawHook', typeof highway?.addDrawHook],
+        ['highway.project', typeof highway?.project],
+        ['highway.fretX', typeof highway?.fretX],
+        ['highway.fillTextUnmirrored', typeof highway?.fillTextUnmirrored],
+    ];
+    for (const [name, type] of checks) {
+        const ok = type !== 'undefined';
+        out.push(line(ok ? 'pass' : 'fail', `${ok ? 'OK' : 'MISSING'}  ${name} (${type})`));
+    }
+    el('t1').innerHTML = out.join('\n');
+}
+
+function test2() {
+    const out = [];
+    try {
+        out.push(line(_ndEnabled ? 'pass' : 'fail', `_ndEnabled = ${_ndEnabled}`));
+        out.push(line(_ndAudioCtx ? 'pass' : 'fail', `_ndAudioCtx = ${_ndAudioCtx?.state || 'null'}`));
+        out.push(line('info', `Detection method: ${_ndDetectionMethod}`));
+        out.push(line('info', `Timing tolerance: ${_ndTimingTolerance * 1000}ms`));
+        out.push(line('info', `Pitch tolerance: ${_ndPitchTolerance} cents`));
+        out.push(line('info', `Latency offset: ${_ndDetectionLatencySec * 1000}ms`));
+        out.push(line('info', `Input gain: ${_ndInputGain}`));
+        out.push(line('info', `Input level: ${_ndInputLevel.toFixed(4)}`));
+        out.push(line('info', `Arrangement: ${_ndCurrentArrangement}`));
+        out.push(line('info', `Tuning offsets: [${_ndTuningOffsets.join(', ')}]`));
+        out.push(line('info', `Capo: ${_ndCapo}`));
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t2').innerHTML = out.join('\n');
+}
+
+async function test3() {
+    const out = [];
+    out.push(line('info', 'Polling _ndDetectedMidi for 5 seconds... PLAY A NOTE'));
+    el('t3').innerHTML = out.join('\n');
+
+    const seen = [];
+    const start = Date.now();
+    await new Promise(resolve => {
+        const iv = setInterval(() => {
+            const midi = _ndDetectedMidi;
+            const conf = _ndDetectedConfidence;
+            const str = _ndDetectedString;
+            const fret = _ndDetectedFret;
+            const level = _ndInputLevel;
+            if (midi > 0) {
+                seen.push({ t: Date.now() - start, midi, conf: conf.toFixed(2), str, fret, level: level.toFixed(4) });
+            }
+            if (Date.now() - start > 5000) {
+                clearInterval(iv);
+                resolve();
+            }
+        }, 50);
+    });
+
+    if (seen.length === 0) {
+        out.push(line('fail', 'NO DETECTIONS in 5 seconds.'));
+        out.push(line('warn', 'Check: is detection enabled? Is input level > 0? Is the device selected?'));
+    } else {
+        out.push(line('pass', `${seen.length} detections in 5 seconds.`));
+        out.push(line('info', 'First 10:'));
+        for (const d of seen.slice(0, 10)) {
+            out.push(line('info', `  ${d.t}ms  midi=${d.midi}  conf=${d.conf}  s${d.str}/f${d.fret}  level=${d.level}`));
+        }
+        const midis = [...new Set(seen.map(d => d.midi))];
+        out.push(line('info', `Unique MIDI values: [${midis.map(m => m.toFixed(1)).join(', ')}]`));
+    }
+    el('t3').innerHTML = out.join('\n');
+}
+
+function test4() {
+    const out = [];
+    try {
+        const notes = highway.getNotes();
+        const chords = highway.getChords();
+        const t = highway.getTime();
+        const info = highway.getSongInfo ? highway.getSongInfo() : {};
+
+        out.push(line(notes?.length > 0 ? 'pass' : 'fail', `Notes: ${notes?.length || 0}`));
+        out.push(line(chords?.length > 0 ? 'pass' : 'warn', `Chords: ${chords?.length || 0}`));
+        out.push(line(t > 0 ? 'pass' : 'warn', `Current time: ${t.toFixed(3)}s`));
+        out.push(line('info', `Song: ${info.title || '?'} — ${info.artist || '?'}`));
+        out.push(line('info', `Tuning: ${JSON.stringify(info.tuning || '?')}`));
+
+        if (notes?.length > 0) {
+            // Show notes near current time
+            const nearby = notes.filter(n => Math.abs(n.t - t) < 3).slice(0, 8);
+            out.push(line('info', `\nNotes near current time (±3s):`));
+            for (const n of nearby) {
+                const offset = ((n.t - t) * 1000).toFixed(0);
+                out.push(line('info', `  t=${n.t.toFixed(3)}  s${n.s}/f${n.f}  offset=${offset}ms  key=${_ndNoteKey(n, n.t)}`));
+            }
+        }
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t4').innerHTML = out.join('\n');
+}
+
+function test5() {
+    const out = [];
+    try {
+        const size = _ndNoteResults.size;
+        out.push(line(size > 0 ? 'pass' : 'warn', `_ndNoteResults has ${size} entries`));
+        out.push(line('info', `Hits: ${_ndHits}  Misses: ${_ndMisses}  (pitch: ${_ndPitchMisses}  timing: ${_ndTimingMisses})`));
+        out.push(line('info', `Streak: ${_ndStreak}  Best: ${_ndBestStreak}`));
+
+        // Count by type
+        let hits = 0, pitchMiss = 0, timingMiss = 0, oldFormat = 0, unknown = 0;
+        const recent = [];
+        _ndNoteResults.forEach((v, k) => {
+            if (typeof v === 'object') {
+                if (v.primary === 'HIT') hits++;
+                else if (v.primary === 'MISSED_WRONG_PITCH') pitchMiss++;
+                else if (v.primary === 'MISSED_NO_DETECTION') timingMiss++;
+                else unknown++;
+                recent.push({ key: k, ...v });
+            } else {
+                oldFormat++;
+                recent.push({ key: k, legacy: v });
+            }
+        });
+
+        out.push(line('info', `\nBy type: HIT=${hits}  MISSED_WRONG_PITCH=${pitchMiss}  MISSED_NO_DETECTION=${timingMiss}  old_format=${oldFormat}  unknown=${unknown}`));
+
+        // Show last 15 entries
+        const last15 = recent.slice(-15);
+        if (last15.length > 0) {
+            out.push(line('info', `\nLast ${last15.length} judgments:`));
+            for (const r of last15) {
+                if (r.legacy) {
+                    out.push(line('warn', `  ${r.key} → "${r.legacy}" (OLD STRING FORMAT — draw hook may not render)`));
+                } else {
+                    const tErr = r.timingError !== null ? `${r.timingError > 0 ? '+' : ''}${Math.round(r.timingError)}ms` : '—';
+                    const pErr = r.pitchError !== null ? `${r.pitchError > 0 ? '+' : ''}${Math.round(r.pitchError)}¢` : '—';
+                    const labels = r.labels?.join(',') || '';
+                    const cls = r.primary === 'HIT' ? 'pass' : 'fail';
+                    out.push(line(cls, `  ${r.key} → ${r.primary}  timing=${tErr}  pitch=${pErr}  ${labels}`));
+                }
+            }
+        }
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t5').innerHTML = out.join('\n');
+}
+
+function test6() {
+    const out = [];
+    try {
+        // Check if the miss-check interval variable exists
+        // _ndCheckMisses is called from a setInterval — look for evidence it's running
+        const before = _ndMisses;
+        const beforeSize = _ndNoteResults.size;
+        out.push(line('info', `Current misses: ${before}`));
+        out.push(line('info', `NoteResults size: ${beforeSize}`));
+
+        // Check the timing used by _ndCheckMisses
+        const avOff = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+        const chartT = highway.getTime();
+        const scoreT = chartT + avOff - _ndDetectionLatencySec;
+        const tolerance = _ndTimingTolerance;
+        const missDeadline = scoreT - tolerance * 2;
+
+        out.push(line('info', `\nTiming breakdown:`));
+        out.push(line('info', `  highway.getTime()  = ${chartT.toFixed(3)}s`));
+        out.push(line('info', `  avOffset           = ${(avOff * 1000).toFixed(0)}ms`));
+        out.push(line('info', `  latencyOffset      = ${(_ndDetectionLatencySec * 1000).toFixed(0)}ms`));
+        out.push(line('info', `  → scoring time     = ${scoreT.toFixed(3)}s`));
+        out.push(line('info', `  → miss deadline    = ${missDeadline.toFixed(3)}s  (notes before this are eligible for miss)`));
+        out.push(line('info', `  timing tolerance   = ${(tolerance * 1000).toFixed(0)}ms`));
+
+        // Check how many notes are past the miss deadline but not yet judged
+        const notes = highway.getNotes();
+        if (notes) {
+            let unjudged = 0;
+            let total = 0;
+            const start = _ndBsearch(notes, missDeadline - 2);
+            for (let i = start; i < notes.length; i++) {
+                const n = notes[i];
+                if (n.t > missDeadline) break;
+                if (n.mt) continue;
+                total++;
+                const key = _ndNoteKey(n, n.t);
+                if (!_ndNoteResults.has(key)) unjudged++;
+            }
+            const judgedOk = unjudged === 0;
+            out.push(line(judgedOk ? 'pass' : 'fail',
+                `\nNotes past miss deadline (last 2s): ${total} total, ${unjudged} UNJUDGED`));
+            if (unjudged > 0) {
+                out.push(line('fail', '^^^ These notes should have been marked as misses by _ndCheckMisses'));
+                out.push(line('fail', '    This means the miss-check interval is not running or is broken'));
+            }
+        }
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t6').innerHTML = out.join('\n');
+}
+
+function test7() {
+    const out = [];
+    try {
+        const notes = highway.getNotes();
+        const t = highway.getTime();
+        if (!notes || notes.length === 0) {
+            out.push(line('fail', 'No chart notes loaded. Load a song first.'));
+            el('t7').innerHTML = out.join('\n');
+            return;
+        }
+
+        // Find a note just before current time (recently passed)
+        let target = null;
+        for (const n of notes) {
+            if (n.mt) continue;
+            if (n.t < t && n.t > t - 2) { target = n; }
+            if (n.t > t) break;
+        }
+        if (!target) {
+            out.push(line('warn', 'No recent past notes found. Play a bit further into the song.'));
+            el('t7').innerHTML = out.join('\n');
+            return;
+        }
+
+        const key = _ndNoteKey(target, target.t);
+        const fakeJudgment = {
+            primary: 'MISSED_NO_DETECTION',
+            labels: [],
+            timingError: null,
+            pitchError: null,
+            detectedMidi: null,
+            expectedMidi: 0,
+        };
+
+        _ndNoteResults.set(key, fakeJudgment);
+        out.push(line('pass', `Injected MISSED_NO_DETECTION for note at t=${target.t.toFixed(3)} s${target.s}/f${target.f}`));
+        out.push(line('info', `Key: ${key}`));
+        out.push(line('info', 'Look at the highway — you should see a RED X with "NO INPUT" label.'));
+        out.push(line('info', 'If you see nothing, the draw hook is broken.'));
+        out.push(line('info', `(Marker will fade after ${typeof _ND_MISS_DISPLAY_SEC !== 'undefined' ? _ND_MISS_DISPLAY_SEC : '???'}s)`));
+
+        // Also inject a pitch miss on the next note for comparison
+        let target2 = null;
+        for (const n of notes) {
+            if (n.mt) continue;
+            if (n.t > target.t && n.t < t) { target2 = n; break; }
+        }
+        if (target2) {
+            const key2 = _ndNoteKey(target2, target2.t);
+            _ndNoteResults.set(key2, {
+                primary: 'MISSED_WRONG_PITCH',
+                labels: [],
+                timingError: null,
+                pitchError: 35,
+                detectedMidi: 50,
+                expectedMidi: 48,
+            });
+            out.push(line('pass', `Also injected MISSED_WRONG_PITCH (+35¢) for note at t=${target2.t.toFixed(3)} s${target2.s}/f${target2.f}`));
+            out.push(line('info', 'This one should show an ORANGE X with "+35¢" label.'));
+        }
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t7').innerHTML = out.join('\n');
+}
+
+function test8() {
+    const out = [];
+    try {
+        const chartT = highway.getTime();
+        const avOff = (highway.getAvOffset ? highway.getAvOffset() : 0);
+        const avOffSec = avOff / 1000;
+        const matchT = chartT + avOffSec - _ndDetectionLatencySec;
+
+        out.push(line('info', `highway.getTime()     = ${chartT.toFixed(4)}s  (chart/audio clock)`));
+        out.push(line('info', `highway.getAvOffset() = ${avOff.toFixed(1)}ms  (A/V render compensation)`));
+        out.push(line('info', `_ndDetectionLatencySec      = ${(_ndDetectionLatencySec * 1000).toFixed(1)}ms  (input latency compensation)`));
+        out.push(line('info', `→ matching time       = ${matchT.toFixed(4)}s  (what _ndMatchNotes uses)`));
+        out.push(line('info', `→ delta from chart    = ${((matchT - chartT) * 1000).toFixed(1)}ms`));
+
+        if (Math.abs(matchT - chartT) > 200) {
+            out.push(line('fail', '\nWARNING: matching time is >200ms from chart time.'));
+            out.push(line('fail', 'This means detections may never land in the tolerance window.'));
+            out.push(line('warn', 'Check: is _ndDetectionLatencySec too high? Is avOffset miscalibrated?'));
+        } else {
+            out.push(line('pass', '\nTiming alignment looks reasonable.'));
+        }
+
+        // Show what the event log says about recent attempts
+        if (_ndEventLog.length > 0) {
+            const last5 = _ndEventLog.slice(-5);
+            out.push(line('info', `\nLast ${last5.length} match attempts from _ndEventLog:`));
+            for (const e of last5) {
+                const cls = e.hit ? 'pass' : 'fail';
+                out.push(line(cls, `  dt=${e.dtMs > 0 ? '+' : ''}${Math.round(e.dtMs)}ms  cents=${e.centsErr > 0 ? '+' : ''}${Math.round(e.centsErr)}¢  ${e.hit ? 'HIT' : 'MISS'}`));
+            }
+        } else {
+            out.push(line('warn', '\n_ndEventLog is empty — no match attempts have been made.'));
+            out.push(line('warn', 'This means _ndMatchNotes is not finding candidates, or no detections are arriving.'));
+        }
+    } catch (e) {
+        out.push(line('fail', `Error: ${e.message}`));
+    }
+    el('t8').innerHTML = out.join('\n');
+}
+
+// ── Live event log ───────────────────────────────────────────────────────
+let _logInterval = null;
+let _logLastLen = 0;
+
+function startLog() {
+    _logLastLen = typeof _ndEventLog !== 'undefined' ? _ndEventLog.length : 0;
+    el('log').innerHTML = '<span class="info">Listening... play notes to see match attempts.</span>\n';
+
+    _logInterval = setInterval(() => {
+        if (typeof _ndEventLog === 'undefined') return;
+        while (_logLastLen < _ndEventLog.length) {
+            const e = _ndEventLog[_logLastLen];
+            const cls = e.hit ? 'pass' : 'fail';
+            const dt = `${e.dtMs > 0 ? '+' : ''}${Math.round(e.dtMs)}ms`;
+            const cents = `${e.centsErr > 0 ? '+' : ''}${Math.round(e.centsErr)}¢`;
+            const div = document.createElement('div');
+            div.className = 'log-line';
+            div.innerHTML = `<span class="${cls}">${e.hit ? 'HIT ' : 'MISS'}</span>  dt=${dt}  cents=${cents}  t=${e.time.toFixed(3)}`;
+            el('log').appendChild(div);
+            el('log').scrollTop = el('log').scrollHeight;
+            _logLastLen++;
+        }
+    }, 100);
+}
+
+function stopLog() {
+    if (_logInterval) { clearInterval(_logInterval); _logInterval = null; }
+}
+</script>
+
+</body>
+</html>

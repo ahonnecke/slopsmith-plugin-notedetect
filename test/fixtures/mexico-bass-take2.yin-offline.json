@@ -1,0 +1,417 @@
+{
+  "wav": "test/fixtures/mexico-bass-take2.wav",
+  "sampleRate": 48000,
+  "chartStartTime": 25,
+  "params": {
+    "YIN_BUF": 4096,
+    "HOP_MS": 50,
+    "STABILITY": 3,
+    "CENTS_TOL": 50
+  },
+  "summary": {
+    "hits": 2,
+    "pitchMiss": 24,
+    "noCandidate": 12,
+    "totalChart": 38,
+    "rawDet": 799,
+    "stableDet": 38
+  },
+  "stableDetections": [
+    {
+      "wavT": 0.15,
+      "midi": 29
+    },
+    {
+      "wavT": 7.15,
+      "midi": 36
+    },
+    {
+      "wavT": 8.35,
+      "midi": 35
+    },
+    {
+      "wavT": 9.55,
+      "midi": 33
+    },
+    {
+      "wavT": 10.9,
+      "midi": 31
+    },
+    {
+      "wavT": 11.9,
+      "midi": 29
+    },
+    {
+      "wavT": 13.75,
+      "midi": 41
+    },
+    {
+      "wavT": 16,
+      "midi": 31
+    },
+    {
+      "wavT": 16.9,
+      "midi": 36
+    },
+    {
+      "wavT": 18.05,
+      "midi": 38
+    },
+    {
+      "wavT": 19.25,
+      "midi": 40
+    },
+    {
+      "wavT": 20.55,
+      "midi": 43
+    },
+    {
+      "wavT": 21.75,
+      "midi": 48
+    },
+    {
+      "wavT": 22.25,
+      "midi": 36
+    },
+    {
+      "wavT": 22.5,
+      "midi": 29
+    },
+    {
+      "wavT": 26.35,
+      "midi": 40
+    },
+    {
+      "wavT": 26.6,
+      "midi": 36
+    },
+    {
+      "wavT": 28.95,
+      "midi": 31
+    },
+    {
+      "wavT": 31.55,
+      "midi": 36
+    },
+    {
+      "wavT": 35.5,
+      "midi": 38
+    },
+    {
+      "wavT": 35.9,
+      "midi": 40
+    },
+    {
+      "wavT": 36.45,
+      "midi": 41
+    },
+    {
+      "wavT": 38.55,
+      "midi": 28
+    },
+    {
+      "wavT": 38.8,
+      "midi": 43
+    },
+    {
+      "wavT": 41.1,
+      "midi": 36
+    },
+    {
+      "wavT": 42.35,
+      "midi": 35
+    },
+    {
+      "wavT": 43.7,
+      "midi": 33
+    },
+    {
+      "wavT": 44.8,
+      "midi": 31
+    },
+    {
+      "wavT": 46,
+      "midi": 38
+    },
+    {
+      "wavT": 47.25,
+      "midi": 33
+    },
+    {
+      "wavT": 48.45,
+      "midi": 38
+    },
+    {
+      "wavT": 49.65,
+      "midi": 33
+    },
+    {
+      "wavT": 50.9,
+      "midi": 31
+    },
+    {
+      "wavT": 53.3,
+      "midi": 36
+    },
+    {
+      "wavT": 54.6,
+      "midi": 35
+    },
+    {
+      "wavT": 55.75,
+      "midi": 33
+    },
+    {
+      "wavT": 56.9,
+      "midi": 31
+    },
+    {
+      "wavT": 58.1,
+      "midi": 29
+    }
+  ],
+  "details": [
+    {
+      "chartT": 29.87,
+      "expMidi": 36,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 30.99,
+      "expMidi": 35,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 32.17,
+      "expMidi": 33,
+      "detMidi": 36,
+      "cents": 300,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 33.37,
+      "expMidi": 31,
+      "detMidi": 35,
+      "cents": 400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 34.71,
+      "expMidi": 29,
+      "detMidi": 33,
+      "cents": 400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 38.43,
+      "expMidi": 29,
+      "detMidi": 41,
+      "cents": 1200,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 38.83,
+      "expMidi": 31,
+      "detMidi": 41,
+      "cents": 1000,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 39.23,
+      "expMidi": 35,
+      "detMidi": 41,
+      "cents": 600,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 39.615,
+      "expMidi": 36,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 40.77,
+      "expMidi": 38,
+      "detMidi": 31,
+      "cents": -700,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 41.95,
+      "expMidi": 40,
+      "detMidi": 36,
+      "cents": -400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 43.2,
+      "expMidi": 43,
+      "detMidi": 38,
+      "cents": -500,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 44.42,
+      "expMidi": 48,
+      "detMidi": 40,
+      "cents": -800,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 49.34,
+      "expMidi": 36,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 51.78,
+      "expMidi": 31,
+      "detMidi": 36,
+      "cents": 500,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 54.22,
+      "expMidi": 36,
+      "detMidi": 31,
+      "cents": -500,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 57.87,
+      "expMidi": 36,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 58.265,
+      "expMidi": 38,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 58.68,
+      "expMidi": 40,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 59.06,
+      "expMidi": 41,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 61.52,
+      "expMidi": 43,
+      "detMidi": 41,
+      "cents": -200,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 63.82,
+      "expMidi": 36,
+      "detMidi": 43,
+      "cents": 700,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 65.02,
+      "expMidi": 35,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 66.32,
+      "expMidi": 33,
+      "detMidi": 36,
+      "cents": 300,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 67.43,
+      "expMidi": 31,
+      "detMidi": 35,
+      "cents": 400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 68.72,
+      "expMidi": 38,
+      "detMidi": 33,
+      "cents": -500,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 70.01,
+      "expMidi": 33,
+      "detMidi": 31,
+      "cents": -200,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 71.19,
+      "expMidi": 38,
+      "detMidi": 38,
+      "dtMs": -189.99999999999773,
+      "status": "HIT"
+    },
+    {
+      "chartT": 72.39,
+      "expMidi": 33,
+      "detMidi": 33,
+      "dtMs": -140.00000000000057,
+      "status": "HIT"
+    },
+    {
+      "chartT": 73.61,
+      "expMidi": 31,
+      "detMidi": 38,
+      "cents": 700,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 76.03,
+      "expMidi": 36,
+      "detMidi": 31,
+      "cents": -500,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 77.23,
+      "expMidi": 35,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 78.5,
+      "expMidi": 33,
+      "detMidi": 36,
+      "cents": 300,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 79.7,
+      "expMidi": 31,
+      "detMidi": 35,
+      "cents": 400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 80.85,
+      "expMidi": 29,
+      "detMidi": 33,
+      "cents": 400,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 83.366,
+      "expMidi": 31,
+      "detMidi": 29,
+      "cents": -200,
+      "status": "PITCH_MISS"
+    },
+    {
+      "chartT": 84.6,
+      "expMidi": 29,
+      "status": "NO_CANDIDATE"
+    },
+    {
+      "chartT": 85,
+      "expMidi": 31,
+      "status": "NO_CANDIDATE"
+    }
+  ]
+}
