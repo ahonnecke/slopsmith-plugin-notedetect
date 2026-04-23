@@ -217,7 +217,11 @@ substitutions in the overlay.
 
 ```bash
 make help              # list targets
-make test              # run the node:test suite (no deps)
+make orient            # recent commits + working tree + docs/ (session start)
+make test              # run the full node:test suite (no deps)
+make test FILE=<name>  # scope to test/<name>.test.js (with or without .test.js)
+make test-wav          # WAV replay test on test/fixtures/mexico-bass-take1.wav
+make diagnostic        # copy test/diagnostic-inject.js to clipboard for paste
 make dev               # start slopsmith with this plugin mounted
 make logs              # tail the container
 make verify-mount      # confirm the plugin is visible inside
@@ -241,13 +245,32 @@ is better for development because:
 
 ## Tests
 
-    npm test
+    make test                       # full suite
+    make test FILE=mapping-bass     # just test/mapping-bass.test.js
+    make test-wav                   # puppeteer WAV replay against a running slopsmith
+    make test-wav WAV=path/to.wav   # override the fixture
 
-Runs a Node `vm`-based harness (Node 18+, no dependencies) that loads the shipped
-`screen.js` against DOM stubs and exercises its real pitch-detection and mapping
-functions with synthetic signals. Tests cover YIN detection at guitar/bass
-frequencies, the arrangement-aware string/fret mapping, the chart-context-aware
-display fingering resolver, and noise-tolerance regression guards.
+The default `make test` runs a Node `vm`-based harness (Node 18+, no
+dependencies) that loads the shipped `screen.js` against DOM stubs and exercises
+its real pitch-detection and mapping functions with synthetic signals. Tests
+cover YIN detection at guitar/bass frequencies, the arrangement-aware
+string/fret mapping, the chart-context-aware display fingering resolver, and
+noise-tolerance regression guards.
+
+`make test-wav` is the end-to-end replay harness (`test/perfect-play.test.js`).
+It uploads a WAV fixture to a running Slopsmith, replays it through the
+detection pipeline in a puppeteer-controlled browser, and reports hit count vs.
+chart note count. Requires `make dev` to be running. Fixtures in
+`test/fixtures/` ship with a companion `.json` that supplies `chartStartTime`
+automatically, so `--wav-offset` is not required.
+
+### Diagnostic panel
+
+`make diagnostic` copies `test/diagnostic-inject.js` to the clipboard. Paste it
+into the Slopsmith browser devtools console to spawn a floating panel of
+layer-by-layer probes (plugin loaded? detection active? detections flowing?
+chart matched? misses? timing?). Useful when a test fails and you need to
+bisect which layer of the pipeline broke.
 
 See `test/README.md` for the full rationale. Adding tests when changing
 detection or mapping logic is encouraged — the `vm` loader means tests

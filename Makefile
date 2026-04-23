@@ -50,9 +50,44 @@ check-slopsmith:
 	    echo "       set SLOPSMITH_DIR=/path/to/slopsmith"; \
 	    exit 1; }
 
+# Scope to a single file with FILE=<name> (with or without .test.js suffix):
+#   make test FILE=perfect-play
+#   make test FILE=mapping-bass.test.js
+TEST_FILES := $(if $(FILE),test/$(FILE:.test.js=).test.js,test/*.test.js)
+
 .PHONY: test
-test: ## Run the plugin's node:test suite (no deps)
-	npm test
+test: ## Run node:test suite (FILE=<name> scopes to test/<name>.test.js)
+	node --test $(TEST_FILES)
+
+# Default fixture matches the "4/127" baseline (commit 2e99ab0). Override with
+# WAV=<path> for other takes. Companion .json in test/fixtures/ supplies
+# chartStartTime automatically, so --wav-offset is not required.
+WAV ?= test/fixtures/mexico-bass-take1.wav
+
+.PHONY: test-wav
+test-wav: ## Run WAV replay test on a fixture (WAV=<path> to override)
+	node test/perfect-play.test.js --song Mexico --arrangement 3 --max-notes 200 --wav $(WAV)
+
+.PHONY: diagnostic
+diagnostic: ## Copy test/diagnostic-inject.js to clipboard; paste into Slopsmith browser console
+	@command -v xclip >/dev/null 2>&1 || { echo "error: xclip not found (install xclip)"; exit 1; }
+	@xclip -sel clip < test/diagnostic-inject.js
+	@echo "diagnostic-inject.js copied to clipboard ($$(wc -c < test/diagnostic-inject.js) bytes)"
+	@echo
+	@echo "1. Open http://localhost:$(SLOPSMITH_PORT) and start a song"
+	@echo "2. Open browser devtools console (F12)"
+	@echo "3. Paste (Ctrl-V) and press Enter — floating diagnostic panel appears"
+
+.PHONY: orient
+orient: ## Session-start overview: recent commits, working tree, docs
+	@echo "=== Recent commits ==="
+	@git log --oneline -10
+	@echo
+	@echo "=== Working tree ==="
+	@git status -s
+	@echo
+	@echo "=== docs/ ==="
+	@ls docs/
 
 .PHONY: dev
 dev: check-slopsmith ## Start slopsmith with this plugin mounted (http://localhost:$(SLOPSMITH_PORT))
