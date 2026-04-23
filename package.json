@@ -5,5 +5,8 @@
   "description": "Slopsmith note detection plugin — test harness for detection core",
   "scripts": {
     "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.42.0"
   }
 }

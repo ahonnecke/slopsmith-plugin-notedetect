@@ -9056,3 +9056,282 @@ function _ndDiagInjectHits() {
     }
     console.log(`[nd-diag] Injected ${count} fake hits across ${notes.length} total notes. t=${t.toFixed(1)}s`);
 }
+
+// ── Programmatic Audio Test Harness ───────────────────────────────────────
+// Injects synthetic sine-wave audio into the detection pipeline via
+// OscillatorNode → same gain/analyser/processor chain as the mic.
+// No guitar, no human, no browser interaction needed.
+
+let _ndTestOscillators = [];
+let _ndTestGainNode = null;
+
+function _ndMidiToFreq(midi) {
+    return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+/**
+ * Inject a sequence of synthetic notes into the detection pipeline.
+ * @param {Array<{midi: number, startTime: number, duration: number}>} noteSequence
+ * @param {object} [options]
+ * @param {number} [options.amplitude=0.3] - oscillator amplitude (0-1)
+ * @param {string} [options.waveform='sine'] - oscillator waveform
+ * @returns {Promise<{hits: number, misses: number, total: number, noteResults: Array}>}
+ */
+async function _ndInjectTestAudio(noteSequence, options = {}) {
+    const amplitude = options.amplitude ?? 0.3;
+    const waveform = options.waveform ?? 'sine';
+
+    // Stop any existing test oscillators
+    _ndTestCleanup();
+
+    // Create AudioContext if not already running
+    if (!_ndAudioCtx) {
+        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (_ndAudioCtx.state === 'suspended') {
+        await _ndAudioCtx.resume();
+    }
+
+    // Build processing chain if not already set up (mirrors _ndStartAudio but
+    // without getUserMedia). If the mic chain is already running, tap into it.
+    let processorNode = _ndWorklet;
+    if (!processorNode) {
+        const processor = _ndAudioCtx.createScriptProcessor(_ndFrameSize, 1, 1);
+        _ndWorklet = processor;
+        _ndAccumBuffer = new Float32Array(0);
+        _ndPendingBuffer = null;
+
+        processor.onaudioprocess = (e) => {
+            if (!_ndEnabled) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const prev = _ndAccumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= _ndMinYinSamples) {
+                const start = combined.length - _ndMinYinSamples;
+                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
+                _ndAccumBuffer = new Float32Array(0);
+            } else {
+                _ndAccumBuffer = combined;
+            }
+        };
+
+        processor.connect(_ndAudioCtx.destination);
+        processorNode = processor;
+
+        // Start detection timer if not running
+        if (!_ndDetectInterval) {
+            _ndDetectInterval = setInterval(() => {
+                if (_ndPendingBuffer) {
+                    const buf = _ndPendingBuffer;
+                    _ndPendingBuffer = null;
+                    _ndProcessFrame(buf);
+                }
+            }, 50);
+        }
+
+        // Start level meter for silence gate
+        if (!_ndLevelAnalyser) {
+            _ndLevelAnalyser = _ndAudioCtx.createAnalyser();
+            _ndLevelAnalyser.fftSize = 512;
+            _ndLevelAnalyser.smoothingTimeConstant = 0.8;
+        }
+        _ndStartLevelMeter();
+    }
+
+    // Gain node for test oscillators
+    _ndTestGainNode = _ndAudioCtx.createGain();
+    _ndTestGainNode.gain.value = amplitude;
+
+    // Connect test gain → analyser → processor (same chain as mic)
+    if (_ndLevelAnalyser) {
+        _ndTestGainNode.connect(_ndLevelAnalyser);
+        _ndLevelAnalyser.connect(processorNode);
+    } else {
+        _ndTestGainNode.connect(processorNode);
+    }
+
+    // Reset scoring
+    _ndResetScoring();
+    _ndEnabled = true;
+
+    // Schedule oscillators
+    const baseTime = _ndAudioCtx.currentTime + 0.1; // small buffer
+    const lastNote = noteSequence[noteSequence.length - 1];
+    const totalDuration = lastNote.startTime + lastNote.duration + 0.5; // +0.5s padding
+
+    for (const note of noteSequence) {
+        const osc = _ndAudioCtx.createOscillator();
+        osc.type = waveform;
+        osc.frequency.value = _ndMidiToFreq(note.midi);
+        osc.connect(_ndTestGainNode);
+        osc.start(baseTime + note.startTime);
+        osc.stop(baseTime + note.startTime + note.duration);
+        _ndTestOscillators.push(osc);
+    }
+
+    console.log(`[nd-test] Injecting ${noteSequence.length} notes over ${totalDuration.toFixed(1)}s`);
+
+    // Wait for all oscillators to finish + detection pipeline to drain
+    await new Promise(resolve => setTimeout(resolve, (totalDuration + 1) * 1000));
+
+    // Collect results
+    const results = [];
+    _ndNoteResults.forEach((v, k) => results.push({ key: k, ...v }));
+
+    const summary = {
+        hits: _ndHits,
+        misses: _ndMisses,
+        pitchMisses: _ndPitchMisses,
+        timingMisses: _ndTimingMisses,
+        total: _ndHits + _ndMisses,
+        hitRate: _ndHits + _ndMisses > 0 ? (_ndHits / (_ndHits + _ndMisses) * 100).toFixed(1) : '0.0',
+        noteResults: results,
+        settings: {
+            latencyOffset: _ndLatencyOffset,
+            timingTolerance: _ndTimingTolerance,
+            pitchTolerance: _ndPitchTolerance,
+            silenceGate: _ndSilenceGate,
+            stabilityWindow: _ND_STABILITY_WINDOW,
+            stabilityRequired: _ND_STABILITY_REQUIRED,
+        },
+    };
+
+    // Auto-dump to server
+    _ndAutoDumpPost();
+
+    console.log(`[nd-test] Done: ${summary.hits}/${summary.total} hits (${summary.hitRate}%)`);
+    _ndTestCleanup();
+    return summary;
+}
+
+function _ndTestCleanup() {
+    for (const osc of _ndTestOscillators) {
+        try { osc.stop(); osc.disconnect(); } catch (e) { /* already stopped */ }
+    }
+    _ndTestOscillators = [];
+    if (_ndTestGainNode) {
+        try { _ndTestGainNode.disconnect(); } catch (e) {}
+        _ndTestGainNode = null;
+    }
+}
+
+/**
+ * Generate a test sequence from the current chart. Plays every note
+ * as a perfect sine wave at the exact chart time.
+ * @param {object} [options]
+ * @param {number} [options.maxNotes=50] - limit notes to test
+ * @param {number} [options.noteDuration=0.3] - duration of each sine burst (seconds)
+ * @returns {Array<{midi, startTime, duration, chartNote}>}
+ */
+function _ndTestBuildChartSequence(options = {}) {
+    const maxNotes = options.maxNotes ?? 50;
+    const noteDuration = options.noteDuration ?? 0.3;
+
+    const notes = highway.getNotes() || [];
+    const chords = highway.getChords() || [];
+
+    // Collect all notes with their chart times
+    const allNotes = [];
+    for (const n of notes) {
+        if (n.mt) continue; // skip muted
+        const midi = _ndMidiFromStringFret(n.s, n.f);
+        allNotes.push({ midi, t: n.t, s: n.s, f: n.f });
+    }
+    for (const c of chords) {
+        for (const cn of (c.notes || [])) {
+            if (cn.mt) continue;
+            const midi = _ndMidiFromStringFret(cn.s, cn.f);
+            allNotes.push({ midi, t: c.t, s: cn.s, f: cn.f });
+        }
+    }
+
+    // Sort by time
+    allNotes.sort((a, b) => a.t - b.t);
+
+    // Take first maxNotes
+    const selected = allNotes.slice(0, maxNotes);
+    if (selected.length === 0) {
+        console.error('[nd-test] No chart notes found. Load a song first.');
+        return [];
+    }
+
+    // Offset so the first note starts at t=0
+    const baseTime = selected[0].t;
+    const sequence = selected.map(n => ({
+        midi: n.midi,
+        startTime: n.t - baseTime,
+        duration: Math.min(noteDuration, // cap at noteDuration
+            // but don't overlap the next note
+            selected.indexOf(n) < selected.length - 1
+                ? Math.max(0.05, (selected[selected.indexOf(n) + 1].t - n.t) * 0.8)
+                : noteDuration),
+        chartNote: `s${n.s}/f${n.f}`,
+    }));
+
+    console.log(`[nd-test] Built sequence: ${sequence.length} notes from chart time ${baseTime.toFixed(3)}s to ${(selected[selected.length - 1].t).toFixed(3)}s`);
+    return sequence;
+}
+
+/**
+ * Run a perfect-play test against the current chart.
+ * Generates sine waves matching every chart note and verifies detection.
+ *
+ * IMPORTANT: This tests the detection pipeline only (YIN + stability + matching).
+ * It does NOT test mic input, real instrument harmonics, or browser audio latency.
+ * The highway must be playing (or have notes loaded) for chart matching to work.
+ *
+ * @returns {Promise<{hits, misses, total, hitRate, noteResults}>}
+ */
+async function _ndTestPerfectPlay(options = {}) {
+    const sequence = _ndTestBuildChartSequence(options);
+    if (sequence.length === 0) return null;
+
+    // The test needs to sync with the highway's time. Since we can't control
+    // the highway clock, we use a different approach: inject audio while the
+    // highway is NOT playing, and mock highway.getTime() to advance in sync
+    // with our oscillator schedule.
+    //
+    // Save the real getTime and replace it with one that tracks our test timeline.
+    const realGetTime = highway.getTime.bind(highway);
+    const realGetAvOffset = highway.getAvOffset ? highway.getAvOffset.bind(highway) : () => 0;
+    const baseChartTime = (highway.getNotes() || [])[0]?.t ?? 0;
+
+    let testStartPerf = 0;
+
+    highway.getTime = () => {
+        if (testStartPerf === 0) return realGetTime();
+        // Map performance.now() to chart time, accounting for latency offset
+        const elapsed = (performance.now() - testStartPerf) / 1000;
+        return baseChartTime + elapsed + _ndLatencyOffset;
+    };
+    // Zero out AV offset during test — we're injecting directly, no audio output lag
+    highway.getAvOffset = () => 0;
+
+    console.log(`[nd-test] Starting perfect-play test: ${sequence.length} notes, base chart time ${baseChartTime.toFixed(3)}s`);
+    console.log(`[nd-test] Latency offset: ${(_ndLatencyOffset * 1000).toFixed(0)}ms`);
+
+    testStartPerf = performance.now();
+
+    const result = await _ndInjectTestAudio(sequence, options);
+
+    // Restore real highway functions
+    highway.getTime = realGetTime;
+    highway.getAvOffset = realGetAvOffset;
+
+    // Log detailed results
+    console.log('[nd-test] === RESULTS ===');
+    console.log(`[nd-test] Hit rate: ${result.hits}/${result.total} (${result.hitRate}%)`);
+    if (result.noteResults.length > 0) {
+        console.log('[nd-test] Note details:');
+        for (const r of result.noteResults) {
+            const te = r.timingError != null ? `${Math.round(r.timingError)}ms` : '—';
+            console.log(`[nd-test]   ${r.key} → ${r.primary} timing=${te} det:${r.detectedMidi} exp:${r.expectedMidi}`);
+        }
+    }
+
+    // Expose for Puppeteer
+    window._ndTestResult = result;
+    return result;
+}
