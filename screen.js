@@ -2059,10 +2059,39 @@ function createNoteDetector(options = {}) {
                 }
             }
 
-            // Onset detection DISABLED — flushing the buffer forces re-accumulation
-            // from scratch (~170ms) which is SLOWER than the natural sliding window
-            // (~85ms). The flush also re-contaminates with the onset chunk itself.
-            // See frame log analysis: onset flush added ~400ms latency vs ~170ms without.
+            // Onset detection: flush STABILITY VOTES (not the audio buffer) on
+            // energy spike. When a new pluck arrives, the buffer still contains
+            // energy from the previous note. Stability voting holds the OLD pitch
+            // until enough new-pitch frames push it out. Flushing the vote history
+            // lets the new pitch stabilize in 2 frames (~100ms) instead of 4-5.
+            //
+            // NOTE: buffer flushing was tried and DISABLED (forced re-accumulation
+            // from scratch, slower than sliding window). This only flushes votes.
+            {
+                let rms = 0;
+                for (let j = 0; j < input.length; j++) rms += input[j] * input[j];
+                rms = Math.sqrt(rms / input.length);
+
+                if (rms > _ND_ONSET_MIN_RMS) {
+                    _ndOnsetRmsHistory.push(rms);
+                    if (_ndOnsetRmsHistory.length > _ND_ONSET_HISTORY_LEN) _ndOnsetRmsHistory.shift();
+
+                    if (_ndOnsetRmsHistory.length >= 3) {
+                        // Compare current RMS to the average of older frames
+                        const older = _ndOnsetRmsHistory.slice(0, -1);
+                        const avg = older.reduce((s, v) => s + v, 0) / older.length;
+                        if (rms > avg * _ND_ONSET_RATIO) {
+                            // Energy spike — new pluck. Flush stability votes.
+                            _ndRawMidiHistory = [];
+                            _ndStableMidi = -1;
+                            _ndOnsetCount++;
+                        }
+                    }
+                } else {
+                    // Below noise floor — decay the history
+                    if (_ndOnsetRmsHistory.length > 0) _ndOnsetRmsHistory.shift();
+                }
+            }
 
             // Accumulate samples for low-frequency detection (need 4096 at 48kHz for low E)
             const prev = _ndAccumBuffer;
@@ -9301,6 +9330,10 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
     // Attack noise: add broadband burst at note onset
     const attackNoiseSec = options.attackNoise ?? 0; // seconds of noise burst
 
+    // Amplitude envelope: simulate real string (sharp attack, exponential decay)
+    // When enabled, the onset detector can see energy spikes between notes.
+    const useEnvelope = options.envelope ?? (sustainOverlapSec > 0); // auto-enable with overlap
+
     for (let i = 0; i < noteSequence.length; i++) {
         const note = noteSequence[i];
         const freq = _ndMidiToFreq(note.midi);
@@ -9310,14 +9343,24 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
             dur = gap + sustainOverlapSec; // extend into next note
         }
 
+        // Create envelope gain node for this note (attack + exponential decay)
+        let noteGain = _ndTestGainNode; // default: flat amplitude
+        if (useEnvelope) {
+            noteGain = _ndAudioCtx.createGain();
+            noteGain.connect(_ndTestGainNode);
+            const t0 = baseTime + note.startTime;
+            noteGain.gain.setValueAtTime(0, t0);
+            noteGain.gain.linearRampToValueAtTime(1.0, t0 + 0.005); // 5ms attack
+            noteGain.gain.exponentialRampToValueAtTime(0.15, t0 + dur); // decay to 15%
+        }
+
         if (harmonics) {
-            // Multiple oscillators per note: fundamental + harmonics
             for (let h = 0; h < harmonicAmplitudes.length; h++) {
                 const hFreq = freq * (h + 1);
-                if (hFreq > 20000) break; // skip inaudible harmonics
+                if (hFreq > 20000) break;
                 const hGain = _ndAudioCtx.createGain();
                 hGain.gain.value = harmonicAmplitudes[h];
-                hGain.connect(_ndTestGainNode);
+                hGain.connect(noteGain);
                 const osc = _ndAudioCtx.createOscillator();
                 osc.type = 'sine';
                 osc.frequency.value = hFreq;
@@ -9330,7 +9373,7 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
             const osc = _ndAudioCtx.createOscillator();
             osc.type = waveform;
             osc.frequency.value = freq;
-            osc.connect(_ndTestGainNode);
+            osc.connect(noteGain);
             osc.start(baseTime + note.startTime);
             osc.stop(baseTime + note.startTime + dur);
             _ndTestOscillators.push(osc);
