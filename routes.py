@@ -25,12 +25,18 @@ def setup(app: FastAPI, context: dict):
         return {"error": "no dump yet"}
 
     @app.post("/api/plugins/note_detect/recording")
-    async def save_recording(file: UploadFile = File(...)):
+    async def save_recording(request: Request, file: UploadFile = File(...)):
         RECORDING_DIR.mkdir(exist_ok=True)
-        dest = RECORDING_DIR / (file.filename or "recording.wav")
+        name = file.filename or "recording.wav"
+        dest = RECORDING_DIR / name
         content = await file.read()
         dest.write_bytes(content)
-        return {"ok": True, "path": str(dest), "size": len(content)}
+        # Save chart start time as sidecar metadata
+        chart_start = request.query_params.get("chartStartTime", "0")
+        meta = {"chartStartTime": float(chart_start), "sampleRate": 48000, "filename": name}
+        meta_path = dest.with_suffix(".json")
+        meta_path.write_text(json.dumps(meta, indent=2))
+        return {"ok": True, "path": str(dest), "size": len(content), "chartStartTime": float(chart_start)}
 
     @app.get("/api/plugins/note_detect/recording/{filename}")
     async def get_recording(filename: str):

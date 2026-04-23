@@ -36,6 +36,7 @@ const USE_HARMONICS = args.includes('--harmonics');
 const SUSTAIN_OVERLAP = parseFloat(getArg('sustain-overlap', '0')); // seconds
 const ATTACK_NOISE = parseFloat(getArg('attack-noise', '0'));       // seconds
 const WAV_FILE = getArg('wav', null);                                // path to WAV file
+const WAV_OFFSET = parseFloat(getArg('wav-offset', 'NaN'));          // chart time at WAV t=0
 
 async function main() {
     console.log('=== Slopsmith Perfect-Play Test ===');
@@ -137,17 +138,91 @@ async function main() {
         });
 
         // 6. Run the test
-        const testOpts = {
-            maxNotes: MAX_NOTES,
-            amplitude: 0.5,
-            harmonics: USE_HARMONICS,
-            sustainOverlap: SUSTAIN_OVERLAP,
-            attackNoise: ATTACK_NOISE,
-        };
-        console.log(`\n5. Running perfect-play test (${MAX_NOTES} notes)...`);
-        const result = await page.evaluate(async (opts) => {
-            return await _ndTestPerfectPlay(opts);
-        }, testOpts);
+        let result;
+        if (WAV_FILE) {
+            // WAV replay mode: upload the file to the server, then replay in browser
+            const fs = require('fs');
+            const path = require('path');
+            const wavPath = path.resolve(WAV_FILE);
+            const wavData = fs.readFileSync(wavPath);
+            const wavName = path.basename(wavPath);
+
+            // Upload via multipart form to the recording endpoint
+            console.log(`\n5. Uploading WAV (${(wavData.length / 1024).toFixed(0)} KB)...`);
+            await page.evaluate(async (name, b64) => {
+                const binary = atob(b64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                const blob = new Blob([bytes], { type: 'audio/wav' });
+                const form = new FormData();
+                form.append('file', blob, name);
+                await fetch('/api/plugins/note_detect/recording', { method: 'POST', body: form });
+            }, wavName, wavData.toString('base64'));
+
+            // Try to get chart start time from sidecar metadata, or use CLI arg
+            let chartStartTime = WAV_OFFSET;
+            if (isNaN(chartStartTime)) {
+                try {
+                    const metaResp = await page.evaluate(async (name) => {
+                        const r = await fetch(`/api/plugins/note_detect/recording/${name.replace('.wav', '.json')}`);
+                        if (!r.ok) return null;
+                        return r.json();
+                    }, wavName);
+                    if (metaResp && metaResp.chartStartTime !== undefined) {
+                        chartStartTime = metaResp.chartStartTime;
+                        console.log(`   Chart start time from metadata: ${chartStartTime.toFixed(3)}s`);
+                    }
+                } catch (e) { /* no metadata */ }
+            }
+            if (isNaN(chartStartTime)) {
+                console.log('   WARNING: No --wav-offset and no metadata. Using 0 (WAV t=0 = chart t=0).');
+                chartStartTime = 0;
+            } else {
+                console.log(`   Chart start time: ${chartStartTime.toFixed(3)}s`);
+            }
+
+            console.log(`   Running WAV replay test...`);
+            result = await page.evaluate(async (name, wavChartStart) => {
+                // Mock highway.getTime() so WAV playback aligns to chart.
+                // WAV t=0 corresponds to chart time wavChartStart.
+                // _ndTestWavPlaybackStart is set inside _ndInjectTestWav right
+                // when source.start() fires, so fetch/decode overhead is excluded.
+                const realGetTime = highway.getTime.bind(highway);
+                const realGetAvOffset = highway.getAvOffset ? highway.getAvOffset.bind(highway) : () => 0;
+                window._ndTestWavPlaybackStart = 0;
+                highway.getTime = () => {
+                    if (window._ndTestWavPlaybackStart === 0) return realGetTime();
+                    const elapsed = (performance.now() - window._ndTestWavPlaybackStart) / 1000;
+                    return wavChartStart + elapsed;
+                };
+                highway.getAvOffset = () => 0;
+
+                _ndResetScoring();
+                _ndEnabled = true;
+
+                const wavUrl = `/api/plugins/note_detect/recording/${name}`;
+                const summary = await _ndInjectTestWav(wavUrl);
+
+                highway.getTime = realGetTime;
+                highway.getAvOffset = realGetAvOffset;
+
+                window._ndTestResult = summary;
+                return summary;
+            }, wavName, chartStartTime);
+        } else {
+            // Synthetic audio mode
+            const testOpts = {
+                maxNotes: MAX_NOTES,
+                amplitude: 0.5,
+                harmonics: USE_HARMONICS,
+                sustainOverlap: SUSTAIN_OVERLAP,
+                attackNoise: ATTACK_NOISE,
+            };
+            console.log(`\n5. Running perfect-play test (${MAX_NOTES} notes)...`);
+            result = await page.evaluate(async (opts) => {
+                return await _ndTestPerfectPlay(opts);
+            }, testOpts);
+        }
 
         // 7. Also grab the dump from the server
         let serverDump = null;

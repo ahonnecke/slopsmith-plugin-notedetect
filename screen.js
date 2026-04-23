@@ -278,13 +278,16 @@ let _ndRecordMaxSamples = 0;
 let _ndRecordTotalSamples = 0;
 let _ndRecordSampleRate = 48000;
 
+let _ndRecordChartStartTime = 0; // chart time when recording started
+
 function _ndRecordStart(maxSeconds = 60) {
     _ndRecordChunks = [];
     _ndRecordTotalSamples = 0;
     _ndRecordSampleRate = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
     _ndRecordMaxSamples = maxSeconds * _ndRecordSampleRate;
+    _ndRecordChartStartTime = highway.getTime ? highway.getTime() : 0;
     _ndRecording = true;
-    console.log(`[note_detect] Recording started (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz)`);
+    console.log(`[note_detect] Recording started (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz, chart time ${_ndRecordChartStartTime.toFixed(3)}s)`);
 }
 
 function _ndRecordStop() {
@@ -337,16 +340,16 @@ async function _ndRecordSave(filename = 'recording.wav') {
     if (!pcm) return;
     const blob = _ndRecordToWavBlob(pcm, _ndRecordSampleRate);
 
-    // POST to server
+    // POST to server — include chart start time as query param for alignment
     const formData = new FormData();
     formData.append('file', blob, filename);
     try {
-        const resp = await fetch('/api/plugins/note_detect/recording', {
+        const resp = await fetch(`/api/plugins/note_detect/recording?chartStartTime=${_ndRecordChartStartTime.toFixed(3)}`, {
             method: 'POST',
             body: formData,
         });
         const result = await resp.json();
-        console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB)`);
+        console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB, chart start ${_ndRecordChartStartTime.toFixed(3)}s)`);
     } catch (e) {
         console.warn('[note_detect] Server save failed, downloading locally:', e);
         const url = URL.createObjectURL(blob);
@@ -468,7 +471,15 @@ function _ndLoadSettings() {
         if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
         if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
-        if (s.latencyOffset !== undefined) _ndDetectionLatencySec = s.latencyOffset;
+        if (s.latencyOffset !== undefined) {
+            // Physically, pipeline latency for YIN on bass is ~150–500ms
+            // (2048-sample buffer + 2-of-3 stability votes + audio hop).
+            // Values above 0.7s are almost certainly calibration overshoot —
+            // symptom: hits cluster with dtMs strongly negative (detections
+            // land before chart notes after compensation). Clamp to 0.5 to
+            // restore sane behavior; user can retune via the slider.
+            _ndDetectionLatencySec = s.latencyOffset > 0.7 ? 0.5 : s.latencyOffset;
+        }
         if (s.silenceGate !== undefined) _ndSilenceGate = s.silenceGate;
         if (s.pitchOffset !== undefined) {
             // Reject saved offsets > ±1 — they're from the feedback loop bug
@@ -2475,15 +2486,13 @@ function _ndMatchNotes() {
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
-    // Hit window. _ndDetectionLatencySec compensates the *median* pipeline
-    // bias, but per-note latency varies wildly (observed 260–1118 ms in a
-    // single session — stability voting completes in 2–6 frames depending
-    // on attack cleanliness). The window floors below exist to absorb that
-    // variance; the slider widens further for users who want more latitude.
-    // Pitch selectivity (50 cents) does the actual disambiguation.
-    // See docs/ROCKSMITH_TIMING_MODEL.md.
-    const earlyWindowSec = Math.max(_ndTimingTolerance * 2, 0.5);
-    const lateWindowSec = Math.max(_ndTimingTolerance * 3, 0.6);
+    // Asymmetric hit window per docs/ROCKSMITH_TIMING_MODEL.md.
+    // _ndDetectionLatencySec compensates the pipeline bias; late bound is
+    // 2× early to absorb residual detection-pipeline jitter. If hits land
+    // with dtMs consistently negative, the latency offset is over-calibrated
+    // — fix the latency, don't widen the window.
+    const earlyWindowSec = _ndTimingTolerance;
+    const lateWindowSec = _ndTimingTolerance * 2;
     const centsTolerance = _ndPitchTolerance;
 
     const candidateNotes = [];
@@ -3264,10 +3273,9 @@ function _ndCheckMisses() {
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
     const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
     // A note is missed once it has passed the late bound of the hit window.
-    // Matches _ndMatchNotes's window (with floors for pipeline variance);
-    // see docs/ROCKSMITH_TIMING_MODEL.md. Grace period absorbs detections
-    // that arrive right at the edge.
-    const lateWindowSec = Math.max(_ndTimingTolerance * 3, 0.6);
+    // Matches _ndMatchNotes's window; see docs/ROCKSMITH_TIMING_MODEL.md.
+    // Grace period absorbs detections arriving at the edge.
+    const lateWindowSec = _ndTimingTolerance * 2;
     const missGraceSec = 0.050;
     const missDeadline = t - lateWindowSec - missGraceSec;
     const notes = highway.getNotes();
@@ -9470,10 +9478,16 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
     source.buffer = audioBuffer;
     source.connect(_ndTestGainNode);
     source.start();
+    // Mark playback start for highway time mock alignment
+    window._ndTestWavPlaybackStart = performance.now();
     _ndTestOscillators.push(source);
 
     // Wait for playback + pipeline drain
     await new Promise(r => setTimeout(r, (dur + 1.5) * 1000));
+
+    // Force miss checking — the draw hook (which normally calls _ndCheckMisses)
+    // may not be running in headless mode
+    if (typeof _ndCheckMisses === 'function') _ndCheckMisses();
 
     const results = [];
     _ndNoteResults.forEach((v, k) => results.push({ key: k, ...v }));
@@ -9486,6 +9500,14 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
         total: _ndHits + _ndMisses,
         hitRate: _ndHits + _ndMisses > 0 ? (_ndHits / (_ndHits + _ndMisses) * 100).toFixed(1) : '0.0',
         noteResults: results,
+        settings: {
+            latencyOffset: _ndDetectionLatencySec,
+            timingTolerance: _ndTimingTolerance,
+            pitchTolerance: _ndPitchTolerance,
+            silenceGate: _ndSilenceGate,
+            stabilityWindow: _ND_STABILITY_WINDOW,
+            stabilityRequired: _ND_STABILITY_REQUIRED,
+        },
     };
 
     _ndAutoDumpPost();
