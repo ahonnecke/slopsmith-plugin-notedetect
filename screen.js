@@ -268,6 +268,94 @@ let _ndFrameLog = [];
 const _ND_FRAME_LOG_MAX = 2000;
 let _ndOnsetCount = 0; // count onset flushes for diagnostics
 
+// ── Audio Recording ──────────────────────────────────────────────────────
+// Records raw audio from the ScriptProcessor (exactly what YIN sees).
+// Start with _ndRecordStart(maxSeconds), stop with _ndRecordStop().
+// Downloads as WAV or POSTs to the server.
+let _ndRecording = false;
+let _ndRecordChunks = [];  // Float32Array chunks
+let _ndRecordMaxSamples = 0;
+let _ndRecordTotalSamples = 0;
+let _ndRecordSampleRate = 48000;
+
+function _ndRecordStart(maxSeconds = 60) {
+    _ndRecordChunks = [];
+    _ndRecordTotalSamples = 0;
+    _ndRecordSampleRate = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
+    _ndRecordMaxSamples = maxSeconds * _ndRecordSampleRate;
+    _ndRecording = true;
+    console.log(`[note_detect] Recording started (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz)`);
+}
+
+function _ndRecordStop() {
+    _ndRecording = false;
+    if (_ndRecordChunks.length === 0) {
+        console.log('[note_detect] No audio recorded');
+        return null;
+    }
+    // Concatenate chunks into a single Float32Array
+    const totalLen = _ndRecordChunks.reduce((s, c) => s + c.length, 0);
+    const pcm = new Float32Array(totalLen);
+    let offset = 0;
+    for (const chunk of _ndRecordChunks) {
+        pcm.set(chunk, offset);
+        offset += chunk.length;
+    }
+    console.log(`[note_detect] Recording stopped: ${(totalLen / _ndRecordSampleRate).toFixed(1)}s, ${totalLen} samples`);
+    _ndRecordChunks = [];
+    return pcm;
+}
+
+function _ndRecordToWavBlob(pcm, sampleRate) {
+    // Encode Float32 PCM as 16-bit WAV
+    const numSamples = pcm.length;
+    const buffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(buffer);
+    const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);       // chunk size
+    view.setUint16(20, 1, true);        // PCM
+    view.setUint16(22, 1, true);        // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); // byte rate
+    view.setUint16(32, 2, true);        // block align
+    view.setUint16(34, 16, true);       // bits per sample
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+    for (let i = 0; i < numSamples; i++) {
+        const s = Math.max(-1, Math.min(1, pcm[i]));
+        view.setInt16(44 + i * 2, s * 0x7FFF, true);
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+
+async function _ndRecordSave(filename = 'recording.wav') {
+    const pcm = _ndRecordStop();
+    if (!pcm) return;
+    const blob = _ndRecordToWavBlob(pcm, _ndRecordSampleRate);
+
+    // POST to server
+    const formData = new FormData();
+    formData.append('file', blob, filename);
+    try {
+        const resp = await fetch('/api/plugins/note_detect/recording', {
+            method: 'POST',
+            body: formData,
+        });
+        const result = await resp.json();
+        console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB)`);
+    } catch (e) {
+        console.warn('[note_detect] Server save failed, downloading locally:', e);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+    }
+}
+
 // Auto-dump: POST diagnostic data to server automatically so the user never
 // has to click a button while holding a guitar. Fires on loop restart (time
 // jumps backward) and periodically every 30s while playing.
@@ -1950,6 +2038,16 @@ function createNoteDetector(options = {}) {
             if (!_ndEnabled) return;
             const input = e.inputBuffer.getChannelData(0);
 
+            // Record raw audio if recording is active
+            if (_ndRecording && _ndRecordTotalSamples < _ndRecordMaxSamples) {
+                _ndRecordChunks.push(new Float32Array(input));
+                _ndRecordTotalSamples += input.length;
+                if (_ndRecordTotalSamples >= _ndRecordMaxSamples) {
+                    console.log('[note_detect] Recording max duration reached, auto-stopping');
+                    _ndRecordSave('auto-recording.wav');
+                }
+            }
+
             // Onset detection DISABLED — flushing the buffer forces re-accumulation
             // from scratch (~170ms) which is SLOWER than the natural sliding window
             // (~85ms). The flush also re-contaminates with the onset chunk itself.
@@ -2377,12 +2475,15 @@ function _ndMatchNotes() {
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
-    // Asymmetric hit window. _ndDetectionLatencySec already compensates the
-    // bulk of pipeline bias; remaining jitter leans late, so the late bound
-    // is 2× the early bound. _ndTimingTolerance is the user-tunable "early"
-    // window. See docs/ROCKSMITH_TIMING_MODEL.md.
-    const earlyWindowSec = _ndTimingTolerance;
-    const lateWindowSec = _ndTimingTolerance * 2;
+    // Hit window. _ndDetectionLatencySec compensates the *median* pipeline
+    // bias, but per-note latency varies wildly (observed 260–1118 ms in a
+    // single session — stability voting completes in 2–6 frames depending
+    // on attack cleanliness). The window floors below exist to absorb that
+    // variance; the slider widens further for users who want more latitude.
+    // Pitch selectivity (50 cents) does the actual disambiguation.
+    // See docs/ROCKSMITH_TIMING_MODEL.md.
+    const earlyWindowSec = Math.max(_ndTimingTolerance * 2, 0.5);
+    const lateWindowSec = Math.max(_ndTimingTolerance * 3, 0.6);
     const centsTolerance = _ndPitchTolerance;
 
     const candidateNotes = [];
@@ -3163,9 +3264,10 @@ function _ndCheckMisses() {
     const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
     const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
     // A note is missed once it has passed the late bound of the hit window.
-    // Matches _ndMatchNotes's asymmetric window; see docs/ROCKSMITH_TIMING_MODEL.md.
-    // Extra grace period prevents racing a detection that arrives right at the edge.
-    const lateWindowSec = _ndTimingTolerance * 2;
+    // Matches _ndMatchNotes's window (with floors for pipeline variance);
+    // see docs/ROCKSMITH_TIMING_MODEL.md. Grace period absorbs detections
+    // that arrive right at the edge.
+    const lateWindowSec = Math.max(_ndTimingTolerance * 3, 0.6);
     const missGraceSec = 0.050;
     const missDeadline = t - lateWindowSec - missGraceSec;
     const notes = highway.getNotes();

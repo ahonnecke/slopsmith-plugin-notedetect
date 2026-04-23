@@ -1,12 +1,14 @@
-"""Note detect plugin routes — diagnostic dump endpoint."""
+"""Note detect plugin routes — diagnostic dump and audio recording endpoints."""
 
 import json
 import os
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.responses import FileResponse
 
 
 DUMP_FILE = Path("/tmp/nd_diag_dump.json")
+RECORDING_DIR = Path("/tmp/nd_recordings")
 
 
 def setup(app: FastAPI, context: dict):
@@ -21,3 +23,25 @@ def setup(app: FastAPI, context: dict):
         if DUMP_FILE.exists():
             return json.loads(DUMP_FILE.read_text())
         return {"error": "no dump yet"}
+
+    @app.post("/api/plugins/note_detect/recording")
+    async def save_recording(file: UploadFile = File(...)):
+        RECORDING_DIR.mkdir(exist_ok=True)
+        dest = RECORDING_DIR / (file.filename or "recording.wav")
+        content = await file.read()
+        dest.write_bytes(content)
+        return {"ok": True, "path": str(dest), "size": len(content)}
+
+    @app.get("/api/plugins/note_detect/recording/{filename}")
+    async def get_recording(filename: str):
+        path = RECORDING_DIR / filename
+        if path.exists():
+            return FileResponse(path, media_type="audio/wav")
+        return {"error": "recording not found"}
+
+    @app.get("/api/plugins/note_detect/recordings")
+    async def list_recordings():
+        if not RECORDING_DIR.exists():
+            return {"recordings": []}
+        files = sorted(RECORDING_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return {"recordings": [{"name": f.name, "size": f.stat().st_size} for f in files]}
