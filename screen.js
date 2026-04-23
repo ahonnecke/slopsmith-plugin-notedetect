@@ -169,8 +169,15 @@ let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
 // docs/ROCKSMITH_TIMING_MODEL.md. Distinct from avOffsetMs (chart-vs-audio display
 // offset): subtract this from chart time when translating a detection *event* back
 // to "when the string was actually struck."
-let _ndDetectionLatencySec = 0.350;
-let _ndSilenceGate = 0.02;       // reject detections below this input level (scaled RMS)
+// 0.600 matches the calibrated value from CREPE.log working session
+// (598.7 ms) on this hardware. 0.350 (prior default) leaves detections
+// landing ~250 ms past every chart note, producing near-zero hits out of box.
+let _ndDetectionLatencySec = 0.600;
+// Gate must sit below typical bass RMS (p95 ~0.005 on observed hardware).
+// 0.020 (prior default) killed 59% of frames before pitch detection ran;
+// 0.005 still rejects the idle noise floor (~0.001–0.003) but lets quiet
+// bass notes through.
+let _ndSilenceGate = 0.005;
 let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensates for chart CentOffset / tuning errors
 // NOTE: localStorage may have a stale -1 from a bad calibration run. The
 // Quick Calibrate proved G/D/A all match at 0 offset for Mexico by Cake.
@@ -9173,14 +9180,64 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
     const lastNote = noteSequence[noteSequence.length - 1];
     const totalDuration = lastNote.startTime + lastNote.duration + 0.5; // +0.5s padding
 
-    for (const note of noteSequence) {
-        const osc = _ndAudioCtx.createOscillator();
-        osc.type = waveform;
-        osc.frequency.value = _ndMidiToFreq(note.midi);
-        osc.connect(_ndTestGainNode);
-        osc.start(baseTime + note.startTime);
-        osc.stop(baseTime + note.startTime + note.duration);
-        _ndTestOscillators.push(osc);
+    // Harmonics mode: generate fundamental + overtones matching a real bass string
+    // Bass strings have strong 2nd harmonic (octave), weaker 3rd, 4th.
+    const harmonics = options.harmonics ?? false;  // true = add overtones
+    const harmonicAmplitudes = options.harmonicAmplitudes ?? [1.0, 0.5, 0.25, 0.12]; // fund, 2nd, 3rd, 4th
+
+    // Sustain overlap: extend note duration to bleed into the next note
+    const sustainOverlapSec = options.sustainOverlap ?? 0; // seconds of overlap
+
+    // Attack noise: add broadband burst at note onset
+    const attackNoiseSec = options.attackNoise ?? 0; // seconds of noise burst
+
+    for (let i = 0; i < noteSequence.length; i++) {
+        const note = noteSequence[i];
+        const freq = _ndMidiToFreq(note.midi);
+        let dur = note.duration;
+        if (sustainOverlapSec > 0 && i < noteSequence.length - 1) {
+            const gap = noteSequence[i + 1].startTime - note.startTime;
+            dur = gap + sustainOverlapSec; // extend into next note
+        }
+
+        if (harmonics) {
+            // Multiple oscillators per note: fundamental + harmonics
+            for (let h = 0; h < harmonicAmplitudes.length; h++) {
+                const hFreq = freq * (h + 1);
+                if (hFreq > 20000) break; // skip inaudible harmonics
+                const hGain = _ndAudioCtx.createGain();
+                hGain.gain.value = harmonicAmplitudes[h];
+                hGain.connect(_ndTestGainNode);
+                const osc = _ndAudioCtx.createOscillator();
+                osc.type = 'sine';
+                osc.frequency.value = hFreq;
+                osc.connect(hGain);
+                osc.start(baseTime + note.startTime);
+                osc.stop(baseTime + note.startTime + dur);
+                _ndTestOscillators.push(osc);
+            }
+        } else {
+            const osc = _ndAudioCtx.createOscillator();
+            osc.type = waveform;
+            osc.frequency.value = freq;
+            osc.connect(_ndTestGainNode);
+            osc.start(baseTime + note.startTime);
+            osc.stop(baseTime + note.startTime + dur);
+            _ndTestOscillators.push(osc);
+        }
+
+        // Attack noise burst at note onset
+        if (attackNoiseSec > 0) {
+            const noiseLen = Math.ceil(_ndAudioCtx.sampleRate * attackNoiseSec);
+            const noiseBuf = _ndAudioCtx.createBuffer(1, noiseLen, _ndAudioCtx.sampleRate);
+            const noiseData = noiseBuf.getChannelData(0);
+            for (let j = 0; j < noiseLen; j++) noiseData[j] = (Math.random() * 2 - 1) * 0.3;
+            const noiseSrc = _ndAudioCtx.createBufferSource();
+            noiseSrc.buffer = noiseBuf;
+            noiseSrc.connect(_ndTestGainNode);
+            noiseSrc.start(baseTime + note.startTime);
+            _ndTestOscillators.push(noiseSrc);
+        }
     }
 
     console.log(`[nd-test] Injecting ${noteSequence.length} notes over ${totalDuration.toFixed(1)}s`);
@@ -9227,6 +9284,112 @@ function _ndTestCleanup() {
         try { _ndTestGainNode.disconnect(); } catch (e) {}
         _ndTestGainNode = null;
     }
+}
+
+/**
+ * Replay a recorded WAV file through the detection pipeline.
+ * Routes the audio through the same gain → analyser → processor chain.
+ * @param {string} wavUrl - URL of the WAV file (can be a blob URL or server path)
+ * @param {number} [durationSec] - override duration (auto-detected from buffer if omitted)
+ * @returns {Promise<{hits, misses, total, hitRate, noteResults}>}
+ */
+async function _ndInjectTestWav(wavUrl, durationSec) {
+    _ndTestCleanup();
+
+    if (!_ndAudioCtx) {
+        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (_ndAudioCtx.state === 'suspended') await _ndAudioCtx.resume();
+
+    // Reuse _ndInjectTestAudio's setup for processing chain
+    // (call with empty sequence to set up, then inject our own source)
+    // Actually, just set up the chain manually:
+    let processorNode = _ndWorklet;
+    if (!processorNode) {
+        const processor = _ndAudioCtx.createScriptProcessor(_ndFrameSize, 1, 1);
+        _ndWorklet = processor;
+        _ndAccumBuffer = new Float32Array(0);
+        _ndPendingBuffer = null;
+        processor.onaudioprocess = (e) => {
+            if (!_ndEnabled) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const prev = _ndAccumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= _ndMinYinSamples) {
+                const start = combined.length - _ndMinYinSamples;
+                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
+                _ndAccumBuffer = new Float32Array(0);
+            } else {
+                _ndAccumBuffer = combined;
+            }
+        };
+        processor.connect(_ndAudioCtx.destination);
+        processorNode = processor;
+        if (!_ndDetectInterval) {
+            _ndDetectInterval = setInterval(() => {
+                if (_ndPendingBuffer) {
+                    const buf = _ndPendingBuffer;
+                    _ndPendingBuffer = null;
+                    _ndProcessFrame(buf);
+                }
+            }, 50);
+        }
+        if (!_ndLevelAnalyser) {
+            _ndLevelAnalyser = _ndAudioCtx.createAnalyser();
+            _ndLevelAnalyser.fftSize = 512;
+            _ndLevelAnalyser.smoothingTimeConstant = 0.8;
+        }
+        _ndStartLevelMeter();
+    }
+
+    _ndTestGainNode = _ndAudioCtx.createGain();
+    _ndTestGainNode.gain.value = 1.0;
+    if (_ndLevelAnalyser) {
+        _ndTestGainNode.connect(_ndLevelAnalyser);
+        _ndLevelAnalyser.connect(processorNode);
+    } else {
+        _ndTestGainNode.connect(processorNode);
+    }
+
+    _ndResetScoring();
+    _ndEnabled = true;
+
+    // Fetch and decode the WAV
+    console.log(`[nd-test] Loading WAV: ${wavUrl}`);
+    const response = await fetch(wavUrl);
+    const arrayBuffer = await response.arrayBuffer();
+    const audioBuffer = await _ndAudioCtx.decodeAudioData(arrayBuffer);
+    const dur = durationSec ?? audioBuffer.duration;
+    console.log(`[nd-test] WAV loaded: ${audioBuffer.duration.toFixed(1)}s, ${audioBuffer.sampleRate}Hz, ${audioBuffer.numberOfChannels}ch`);
+
+    const source = _ndAudioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(_ndTestGainNode);
+    source.start();
+    _ndTestOscillators.push(source);
+
+    // Wait for playback + pipeline drain
+    await new Promise(r => setTimeout(r, (dur + 1.5) * 1000));
+
+    const results = [];
+    _ndNoteResults.forEach((v, k) => results.push({ key: k, ...v }));
+
+    const summary = {
+        hits: _ndHits,
+        misses: _ndMisses,
+        pitchMisses: _ndPitchMisses,
+        timingMisses: _ndTimingMisses,
+        total: _ndHits + _ndMisses,
+        hitRate: _ndHits + _ndMisses > 0 ? (_ndHits / (_ndHits + _ndMisses) * 100).toFixed(1) : '0.0',
+        noteResults: results,
+    };
+
+    _ndAutoDumpPost();
+    console.log(`[nd-test] WAV done: ${summary.hits}/${summary.total} hits (${summary.hitRate}%)`);
+    _ndTestCleanup();
+    return summary;
 }
 
 /**

@@ -31,11 +31,21 @@ const ARRANGEMENT = getArg('arrangement', null);
 const MAX_NOTES = parseInt(getArg('max-notes', '30'), 10);
 const HEADLESS = !args.includes('--headed');
 
+// Test mode flags
+const USE_HARMONICS = args.includes('--harmonics');
+const SUSTAIN_OVERLAP = parseFloat(getArg('sustain-overlap', '0')); // seconds
+const ATTACK_NOISE = parseFloat(getArg('attack-noise', '0'));       // seconds
+const WAV_FILE = getArg('wav', null);                                // path to WAV file
+
 async function main() {
     console.log('=== Slopsmith Perfect-Play Test ===');
     console.log(`URL: ${SLOPSMITH_URL}`);
     console.log(`Headless: ${HEADLESS}`);
     console.log(`Max notes: ${MAX_NOTES}`);
+    if (USE_HARMONICS) console.log('Mode: harmonics (fundamental + overtones)');
+    if (SUSTAIN_OVERLAP > 0) console.log(`Mode: sustain overlap (${SUSTAIN_OVERLAP}s)`);
+    if (ATTACK_NOISE > 0) console.log(`Mode: attack noise (${ATTACK_NOISE}s burst)`);
+    if (WAV_FILE) console.log(`Mode: WAV replay (${WAV_FILE})`);
 
     const browser = await puppeteer.launch({
         headless: HEADLESS ? 'new' : false,
@@ -126,11 +136,18 @@ async function main() {
             console.log('[nd-test] Base MIDI:', JSON.stringify(_ndStandardMidiFor(_ndCurrentArrangement)));
         });
 
-        // 6. Run the perfect-play test
+        // 6. Run the test
+        const testOpts = {
+            maxNotes: MAX_NOTES,
+            amplitude: 0.5,
+            harmonics: USE_HARMONICS,
+            sustainOverlap: SUSTAIN_OVERLAP,
+            attackNoise: ATTACK_NOISE,
+        };
         console.log(`\n5. Running perfect-play test (${MAX_NOTES} notes)...`);
-        const result = await page.evaluate(async (maxNotes) => {
-            return await _ndTestPerfectPlay({ maxNotes, amplitude: 0.5 });
-        }, MAX_NOTES);
+        const result = await page.evaluate(async (opts) => {
+            return await _ndTestPerfectPlay(opts);
+        }, testOpts);
 
         // 7. Also grab the dump from the server
         let serverDump = null;
