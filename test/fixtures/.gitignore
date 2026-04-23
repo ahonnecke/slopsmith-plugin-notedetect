@@ -1,2 +1,7 @@
 *.wav
 baseline-events.json
+# Diagnostic outputs — regenerated on each run, not useful to version.
+*.yin-offline.json
+*.bakeoff.json
+*.latency.json
+take-*.json

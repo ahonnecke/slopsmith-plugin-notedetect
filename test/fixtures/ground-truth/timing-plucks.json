@@ -1,0 +1,28 @@
+{
+  "wav": "timing-plucks.wav",
+  "sampleRate": 48000,
+  "arrangement": "bass",
+  "kind": "timing-latency",
+  "plucks": [
+    {
+      "label": "pluck 1 MIDI 28",
+      "attackT": 3.42,
+      "expectedMidi": 28
+    },
+    {
+      "label": "pluck 2 MIDI 33",
+      "attackT": 4.1,
+      "expectedMidi": 33
+    },
+    {
+      "label": "pluck 3 MIDI 38",
+      "attackT": 4.7,
+      "expectedMidi": 38
+    },
+    {
+      "label": "pluck 4 MIDI 43",
+      "attackT": 5.3,
+      "expectedMidi": 43
+    }
+  ]
+}

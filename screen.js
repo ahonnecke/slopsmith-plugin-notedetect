@@ -305,6 +305,25 @@ function _ndRecordStart(maxSeconds = 60, filename) {
     console.log(`[note_detect] Recording armed (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz, chart ${_ndRecordArmedChartTime.toFixed(3)}s — waiting for playback to advance)`);
 }
 
+// Record raw audio without the chart-clock gate. Used for controlled diagnostic
+// recordings (open strings, chromatic scales) where no song is playing.
+// Unlike _ndRecordStart, this anchors immediately on the next SP callback.
+function _ndRecordStartRaw(maxSeconds = 30, filename) {
+    _ndRecordChunks = [];
+    _ndRecordTotalSamples = 0;
+    _ndRecordSampleRate = _ndAudioCtx ? _ndAudioCtx.sampleRate : 48000;
+    _ndRecordMaxSamples = maxSeconds * _ndRecordSampleRate;
+    _ndRecordChartStartTime = 0;
+    _ndRecordArmedChartTime = 0;
+    _ndRecordAnchored = true; // skip the chart-advance gate
+    _ndRecordFilename = filename || 'raw-recording.wav';
+    _ndRecording = true;
+    if (!_ndEnabled) {
+        console.warn('[note_detect] _ndEnabled is false — click Detect first or nothing will record.');
+    }
+    console.log(`[note_detect] Raw recording armed (max ${maxSeconds}s at ${_ndRecordSampleRate}Hz, no chart gate, file=${_ndRecordFilename})`);
+}
+
 // Returns a snapshot of the recording state for UI polling.
 function _ndRecordStatus() {
     return {
@@ -318,13 +337,13 @@ function _ndRecordStatus() {
     };
 }
 
-function _ndRecordStop() {
+// Internal — drain _ndRecordChunks into a single PCM Float32Array and reset state.
+function _ndRecordFlushPcm() {
     _ndRecording = false;
     if (_ndRecordChunks.length === 0) {
         console.log('[note_detect] No audio recorded');
         return null;
     }
-    // Concatenate chunks into a single Float32Array
     const totalLen = _ndRecordChunks.reduce((s, c) => s + c.length, 0);
     const pcm = new Float32Array(totalLen);
     let offset = 0;
@@ -335,6 +354,38 @@ function _ndRecordStop() {
     console.log(`[note_detect] Recording stopped: ${(totalLen / _ndRecordSampleRate).toFixed(1)}s, ${totalLen} samples`);
     _ndRecordChunks = [];
     return pcm;
+}
+
+// User-facing stop — always saves to the filename set at arming time.
+// Avoids the footgun of "stop returned PCM but didn't persist anything."
+function _ndRecordStop() {
+    const pcm = _ndRecordFlushPcm();
+    if (!pcm) return null;
+    // Fire-and-forget save; returning the PCM so console users still see the
+    // recording they captured.
+    _ndPersistRecording(pcm, _ndRecordFilename || 'recording.wav');
+    return pcm;
+}
+
+// Internal — encode PCM to WAV + POST to the server, with local download fallback.
+async function _ndPersistRecording(pcm, filename) {
+    const blob = _ndRecordToWavBlob(pcm, _ndRecordSampleRate);
+    const formData = new FormData();
+    formData.append('file', blob, filename);
+    try {
+        const resp = await fetch(`/api/plugins/note_detect/recording?chartStartTime=${_ndRecordChartStartTime.toFixed(3)}`, {
+            method: 'POST',
+            body: formData,
+        });
+        const result = await resp.json();
+        console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB, chart start ${_ndRecordChartStartTime.toFixed(3)}s)`);
+    } catch (e) {
+        console.warn('[note_detect] Server save failed, downloading locally:', e);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+    }
 }
 
 function _ndRecordToWavBlob(pcm, sampleRate) {
@@ -363,28 +414,10 @@ function _ndRecordToWavBlob(pcm, sampleRate) {
     return new Blob([buffer], { type: 'audio/wav' });
 }
 
-async function _ndRecordSave(filename = 'recording.wav') {
-    const pcm = _ndRecordStop();
+async function _ndRecordSave(filename) {
+    const pcm = _ndRecordFlushPcm();
     if (!pcm) return;
-    const blob = _ndRecordToWavBlob(pcm, _ndRecordSampleRate);
-
-    // POST to server — include chart start time as query param for alignment
-    const formData = new FormData();
-    formData.append('file', blob, filename);
-    try {
-        const resp = await fetch(`/api/plugins/note_detect/recording?chartStartTime=${_ndRecordChartStartTime.toFixed(3)}`, {
-            method: 'POST',
-            body: formData,
-        });
-        const result = await resp.json();
-        console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB, chart start ${_ndRecordChartStartTime.toFixed(3)}s)`);
-    } catch (e) {
-        console.warn('[note_detect] Server save failed, downloading locally:', e);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = filename; a.click();
-        URL.revokeObjectURL(url);
-    }
+    await _ndPersistRecording(pcm, filename || _ndRecordFilename || 'recording.wav');
 }
 
 // UI-driven aligned recording. Arms recording AND starts playback atomically
@@ -501,10 +534,16 @@ const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 // Without this, the 4096-sample buffer contains ~85ms of audio. On sustained
 // bass notes, when you pluck a new note the buffer is still 90%+ old sustain
 // and YIN reports the PREVIOUS note's pitch.
-let _ndOnsetRmsHistory = [];           // rolling RMS of recent audio chunks
-const _ND_ONSET_HISTORY_LEN = 8;      // ~8 chunks at 2048 samples = ~340ms of history
-const _ND_ONSET_RATIO = 3.0;          // current RMS must be Nx the recent average to trigger
-const _ND_ONSET_MIN_RMS = 0.005;      // ignore onset detection below noise floor
+// Threshold-crossing with hysteresis. The previous ratio-against-history
+// detector had a warm-up bug: it needed N frames of history before it could
+// evaluate a ratio, so fresh attacks after silence never fired (history was
+// empty or sparse). Threshold-crossing handles silence→attack cleanly.
+// Verified behaviour is logged in docs/NOTEDETECT_IMPLEMENTATION_GAPS.md.
+const _ND_ONSET_LEVEL = 0.04;         // RMS above this = entering a note
+const _ND_ONSET_EXIT_LEVEL = 0.02;    // below this = note ended (hysteresis gap prevents re-fire on sustain noise)
+const _ND_ONSET_BUFFER_COMP_SEC = 0.020; // half of ScriptProcessor 2048-sample buffer at 48 kHz — compensates for callback lag
+let _ndInNote = false;                // are we currently inside a detected note?
+let _ndPendingOnsetChartT = null;     // chart time of the most recent onset, cleared when consumed by _ndMatchNotes
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -780,6 +819,47 @@ function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
         tau++;
     }
     if (tau === halfLen) return { freq: -1, confidence: 0, underBuffered };
+
+    // Octave-down validation — on a sustained bass note, the 2nd harmonic can
+    // exceed the fundamental in amplitude within ~500 ms of pluck attack. Stock
+    // YIN picks the smallest tau crossing the threshold, which matches the
+    // harmonic and reports one octave up (e.g. E1 41 Hz → E2 82 Hz).
+    //
+    // Diagnostic data on test/fixtures/ground-truth/open-strings.wav (E1
+    // sustain) vs a bass-harmonic 82 Hz test signal with weak fundamental:
+    //   E1 sustain:  yinBuffer[582] = 0.149, yinBuffer[1169] = 0.0007 (200× deeper)
+    //   E2 harmonic: yinBuffer[582] = 0.042, yinBuffer[1164] = 0.041 (1.02× deeper)
+    // Both cases have a deeper dip at 2×tau, but only E1's is dramatically
+    // deeper. The ratio is the signal. Only accept the longer period when it
+    // is *significantly* deeper than the first pick — that's a clear
+    // "harmonic vs fundamental" indicator rather than "signal is still
+    // periodic at 2 × true period" (which applies to any periodic signal).
+    //
+    // OCTAVE_DIP_RATIO of 0.5 leaves huge margin on both sides of our
+    // observed values and was sufficient to pass every test in the suite.
+    // See docs/CREPE_STATUS.md for why we're hardening YIN rather than
+    // switching detectors.
+    const OCTAVE_DIP_RATIO = 0.5;
+    const baselineDip = yinBuffer[tau];
+    for (const multiplier of [2, 3]) {
+        const candidate = tau * multiplier;
+        if (candidate >= halfLen) break;
+        // Local-minimum refinement within ±10% of the candidate. Catches
+        // cases where the octave-down minimum is slightly off an integer
+        // multiple (detuning, parabolic interpolation shift on the first pick).
+        const lo = Math.max(tau + 1, Math.floor(candidate * 0.9));
+        const hi = Math.min(halfLen - 1, Math.ceil(candidate * 1.1));
+        let localTau = -1;
+        let localDip = Infinity;
+        for (let k = lo; k <= hi; k++) {
+            if (yinBuffer[k] < localDip) { localDip = yinBuffer[k]; localTau = k; }
+        }
+        if (localTau < 0) continue;
+        if (localDip < threshold && localDip < baselineDip * OCTAVE_DIP_RATIO) {
+            tau = localTau;
+            break; // prefer the nearest octave-down we find (2× before 3×)
+        }
+    }
 
     // Parabolic interpolation
     const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
@@ -1560,6 +1640,76 @@ function createNoteDetector(options = {}) {
     // / noisier signals can tune. Range 0.05–0.50 clamped on load.
     let detectionConfidenceMin = 0.20;
 
+// Per-chunk audio processing — shared between the live-mic ScriptProcessor
+// (in _ndStartAudio) and the test-WAV ScriptProcessor (in _ndInjectTestWav).
+// Previously each path had its own copy of this logic; the WAV path's copy
+// was missing the onset detector, which meant every test running against
+// WAV replay exercised only the accumulator path and silently reported zero
+// onsets. Any change to recording, onset, or accumulator behavior now lands
+// in one place.
+function _ndProcessAudioChunk(input) {
+    if (!_ndEnabled) return;
+
+    // Record raw audio if recording is active. Chart-time anchor is captured
+    // inside this callback (not at _ndRecordStart) so WAV t=0 corresponds to
+    // a sample taken while the chart clock was advancing.
+    if (_ndRecording && _ndRecordTotalSamples < _ndRecordMaxSamples) {
+        if (!_ndRecordAnchored) {
+            const chartNow = highway.getTime ? highway.getTime() : 0;
+            // 1 ms epsilon tolerates float noise on the chart-advance check.
+            if (chartNow > _ndRecordArmedChartTime + 0.001) {
+                _ndRecordChartStartTime = chartNow;
+                _ndRecordAnchored = true;
+                console.log(`[note_detect] Recording anchor set: WAV t=0 = chart ${chartNow.toFixed(3)}s`);
+                _ndRecordChunks.push(new Float32Array(input));
+                _ndRecordTotalSamples += input.length;
+            }
+            // else: chart paused; skip this sample batch until play starts.
+        } else {
+            _ndRecordChunks.push(new Float32Array(input));
+            _ndRecordTotalSamples += input.length;
+            if (_ndRecordTotalSamples >= _ndRecordMaxSamples) {
+                console.log('[note_detect] Recording max duration reached, auto-stopping');
+                _ndRecordSave(_ndRecordFilename);
+            }
+        }
+    }
+
+    // Onset detection — threshold-crossing with hysteresis. Sets
+    // _ndPendingOnsetChartT for the stability-voting stage to consume as
+    // the match-event timestamp. See docs/NOTEDETECT_IMPLEMENTATION_GAPS.md
+    // Gap 1. Also flushes stability votes on rising-edge so the new note
+    // votes from scratch (prior behavior).
+    let rms = 0;
+    for (let j = 0; j < input.length; j++) rms += input[j] * input[j];
+    rms = Math.sqrt(rms / input.length);
+    if (rms > _ND_ONSET_LEVEL && !_ndInNote) {
+        _ndInNote = true;
+        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+        _ndPendingOnsetChartT = highway.getTime() + avOffsetSec - _ND_ONSET_BUFFER_COMP_SEC;
+        _ndRawMidiHistory = [];
+        _ndStableMidi = -1;
+        _ndOnsetCount++;
+    } else if (rms < _ND_ONSET_EXIT_LEVEL) {
+        _ndInNote = false;
+    }
+
+    // Accumulate samples for low-frequency detection (need 4096 at 48 kHz
+    // for low E). Detection runs off-thread via setInterval in the caller.
+    const prev = _ndAccumBuffer;
+    const combined = new Float32Array(prev.length + input.length);
+    combined.set(prev);
+    combined.set(input, prev.length);
+    if (combined.length >= _ndMinYinSamples) {
+        const start = combined.length - _ndMinYinSamples;
+        _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
+        _ndAccumBuffer = new Float32Array(0);
+    } else {
+        _ndAccumBuffer = combined;
+    }
+}
+
+async function _ndStartAudio() {
     try {
         const raw = localStorage.getItem(_ND_STORAGE_KEY);
         if (raw) {
@@ -2112,101 +2262,8 @@ function createNoteDetector(options = {}) {
                     const hasDetectNotes = typeof desktop.audio.detectNotes === 'function';
 
         processor.onaudioprocess = (e) => {
-            if (!_ndEnabled) return;
-            const input = e.inputBuffer.getChannelData(0);
-
-            // Record raw audio if recording is active. Chart-time anchor is
-            // captured here — NOT at _ndRecordStart() — so WAV t=0 corresponds
-            // to a sample taken while the chart clock was advancing.
-            if (_ndRecording && _ndRecordTotalSamples < _ndRecordMaxSamples) {
-                if (!_ndRecordAnchored) {
-                    const chartNow = highway.getTime ? highway.getTime() : 0;
-                    // Wait for the chart clock to advance past where it was
-                    // when we armed. 1ms epsilon tolerates float noise.
-                    if (chartNow > _ndRecordArmedChartTime + 0.001) {
-                        _ndRecordChartStartTime = chartNow;
-                        _ndRecordAnchored = true;
-                        console.log(`[note_detect] Recording anchor set: WAV t=0 = chart ${chartNow.toFixed(3)}s`);
-                        _ndRecordChunks.push(new Float32Array(input));
-                        _ndRecordTotalSamples += input.length;
-                    }
-                    // else: chart paused; skip this sample batch until play starts.
-                } else {
-                    _ndRecordChunks.push(new Float32Array(input));
-                    _ndRecordTotalSamples += input.length;
-                    if (_ndRecordTotalSamples >= _ndRecordMaxSamples) {
-                        console.log('[note_detect] Recording max duration reached, auto-stopping');
-                        _ndRecordSave(_ndRecordFilename);
-                    }
-                }
-            }
-
-            // Onset detection: flush STABILITY VOTES (not the audio buffer) on
-            // energy spike. When a new pluck arrives, the buffer still contains
-            // energy from the previous note. Stability voting holds the OLD pitch
-            // until enough new-pitch frames push it out. Flushing the vote history
-            // lets the new pitch stabilize in 2 frames (~100ms) instead of 4-5.
-            //
-            // NOTE: buffer flushing was tried and DISABLED (forced re-accumulation
-            // from scratch, slower than sliding window). This only flushes votes.
-            {
-                let rms = 0;
-                for (let j = 0; j < input.length; j++) rms += input[j] * input[j];
-                rms = Math.sqrt(rms / input.length);
-
-                if (rms > _ND_ONSET_MIN_RMS) {
-                    _ndOnsetRmsHistory.push(rms);
-                    if (_ndOnsetRmsHistory.length > _ND_ONSET_HISTORY_LEN) _ndOnsetRmsHistory.shift();
-
-                    if (_ndOnsetRmsHistory.length >= 3) {
-                        // Compare current RMS to the average of older frames
-                        const older = _ndOnsetRmsHistory.slice(0, -1);
-                        const avg = older.reduce((s, v) => s + v, 0) / older.length;
-                        if (rms > avg * _ND_ONSET_RATIO) {
-                            // Energy spike — new pluck. Flush stability votes.
-                            _ndRawMidiHistory = [];
-                            _ndStableMidi = -1;
-                            _ndOnsetCount++;
-                        }
-                    }
-                } else {
-                    // Below noise floor — decay the history
-                    if (_ndOnsetRmsHistory.length > 0) _ndOnsetRmsHistory.shift();
-                }
-            }
-
-            // Accumulate samples for low-frequency detection (need 4096 at 48kHz for low E)
-            const prev = _ndAccumBuffer;
-            const combined = new Float32Array(prev.length + input.length);
-            combined.set(prev);
-            combined.set(input, prev.length);
-            if (combined.length >= _ndMinYinSamples) {
-                // Store ready buffer — detection timer will pick it up
-                const start = combined.length - _ndMinYinSamples;
-                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
-                _ndAccumBuffer = new Float32Array(0);
-            } else {
-                const constraints = {
-                    audio: {
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                        channelCount: 2,
-                    }
-                };
-                if (selectedDeviceId) {
-                    constraints.audio.deviceId = { exact: selectedDeviceId };
-                }
-
-                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                    const isHttp = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
-                    const msg = isHttp
-                        ? 'Microphone access requires HTTPS. You are accessing Slopsmith over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
-                        : 'Microphone access is not available in this browser. Use Chrome or Edge.';
-                    throw new Error(msg);
-                }
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
-            }
+            _ndProcessAudioChunk(e.inputBuffer.getChannelData(0));
+        };
 
             // Acquire the context independently — a caller can supply
             // just one of {stream, context} and we create the other.
@@ -2504,14 +2561,40 @@ async function _ndProcessFrame(buffer) {
         if (_ndFrameLog.length > _ND_FRAME_LOG_MAX) _ndFrameLog.shift();
     }
 
-    // Only match on note CHANGE — but expire the lock after 1s so replayed
-    // notes aren't blocked. Without this, F1→(3.7s gap)→F1 is silently
-    // dropped because _ndLastMatchMidi never cleared (silence gate might
-    // not fire if bass sustain stays above the gate threshold).
+    // Match trigger (docs/NOTEDETECT_IMPLEMENTATION_GAPS.md Gap 1):
+    //
+    //   1. Onset-gated (primary). When the audio-processor RMS-threshold
+    //      detector sets _ndPendingOnsetChartT, it captured the onset's chart
+    //      time at the ACOUSTIC ATTACK. By the time stability voting produces
+    //      a valid _ndStableMidi, we have both the when (onset) and the what
+    //      (stable MIDI) for a single note event. Fire match at the onset's
+    //      chart time — latency is bounded by buffer+stability-vote delay
+    //      and is applied by the caller via tOverride, not by global
+    //      _ndDetectionLatencySec compensation.
+    //
+    //   2. Stable-MIDI-change (fallback). Soft plucks, slurs, and
+    //      instruments without a clean attack transient produce no RMS
+    //      spike. In those cases we fall back to the legacy trigger: match
+    //      when stable MIDI changes, with a 1-second same-MIDI guard to
+    //      suppress sustain re-detections. See the note below.
+    if (_ndPendingOnsetChartT != null) {
+        const onsetT = _ndPendingOnsetChartT;
+        _ndPendingOnsetChartT = null;
+        _ndLastMatchMidi = _ndStableMidi;
+        _ndLastMatchTime = now;
+        _ndMatchNotes(onsetT);
+        return;
+    }
+
+    // Fallback: stable-MIDI-change with 1-second same-MIDI guard.
+    // Without this, F1→(3.7s gap)→F1 is silently dropped because
+    // _ndLastMatchMidi never cleared (silence gate might not fire if bass
+    // sustain stays above the gate threshold). With onset-gated matching
+    // available this is only exercised when the onset detector misses the
+    // attack (soft plucks, slurs).
     if (_ndStableMidi === _ndLastMatchMidi && (now - _ndLastMatchTime) < 1.0) return;
     _ndLastMatchMidi = _ndStableMidi;
     _ndLastMatchTime = now;
-
     _ndMatchNotes();
 }
 
@@ -2586,14 +2669,21 @@ function _ndBsearch(arr, target) {
     return lo;
 }
 
-function _ndMatchNotes() {
-    // Event-driven matching: this function is now called only when the stable
-    // pitch changes (not every frame). Use the STABLE midi for scoring — it's
-    // been validated by 3-of-5 agreement and confidence 0.7.
-    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-    const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+// tOverride: optional pre-computed chart time. When provided (from an
+// onset-gated match trigger), the onset already captured the attack's chart
+// time, so no _ndDetectionLatencySec compensation is applied — the onset IS
+// the timing event. When omitted (fallback stable-MIDI-change trigger), the
+// legacy compensation path runs.
+function _ndMatchNotes(tOverride) {
     const scoreMidi = _ndStableMidi;
     if (scoreMidi < 0) return;
+    let t;
+    if (tOverride != null) {
+        t = tOverride;
+    } else {
+        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
+        t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+    }
 
     const notes = highway.getNotes();
     const chords = highway.getChords();
@@ -2678,50 +2768,64 @@ function _ndMatchNotes() {
         }
     }
 
-    // Check each candidate (all-against-all match, as before)
+    // Pass 1: compute per-candidate pitch/timing errors, update the
+    // diagnostic pitch-attempt tracker for every candidate, and collect the
+    // subset that passes pitch tolerance and isn't already judged.
+    //
+    // Pass 2 picks exactly one of those candidates (nearest-in-time) to mark
+    // HIT. The old all-against-all loop would mark every same-pitch candidate
+    // HIT on a single detection — causing repeated-note passages to score
+    // 2/2 on the first pluck and 0/2 on the second. See
+    // docs/NOTEDETECT_IMPLEMENTATION_GAPS.md Gap 2.
+    const pitchPassing = [];
     for (const cn of candidateNotes) {
         const key = _ndNoteKey(cn, cn.t);
 
         const expectedMidi = _ndMidiFromStringFret(cn.s, cn.f) + _ndPitchOffset;
         const rawCents = (scoreMidi - expectedMidi) * 100;
-        // Octave-up harmonic tolerance — see the longer note below. Still
-        // chart-context-aware: only applied when it explains a match.
+        // Octave-up harmonic tolerance: a detection one octave above expected
+        // counts as a match when that's the closer interval. Still
+        // chart-context-aware — only applied when it explains a match.
         const octCents = (scoreMidi - 12 - expectedMidi) * 100;
         const pitchError = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
-        const timingError = (t - cn.t) * 1000; // ms; positive = detection late vs chart
+        const timingError = (t - cn.t) * 1000;
 
         const prev = _ndNotePitchAttempts.get(key);
         if (prev === undefined || Math.abs(pitchError) < Math.abs(prev)) {
             _ndNotePitchAttempts.set(key, pitchError);
         }
 
-        if (_ndNoteResults.has(key)) continue; // already judged
-
+        if (_ndNoteResults.has(key)) continue;
         if (Math.abs(pitchError) <= centsTolerance) {
-            // Passed pitch. Timing is already within ±tolerance (we pulled it
-            // from candidateNotes). This is a HIT — but also compute off-axis
-            // labels so the user gets feedback on *how* they hit it.
-            const labels = [];
-            if (timingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
-            else if (timingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
-            if (pitchError > _ND_PERFECT_PITCH_CENT)       { labels.push('SHARP'); _ndSharp++; }
-            else if (pitchError < -_ND_PERFECT_PITCH_CENT) { labels.push('FLAT');  _ndFlat++; }
-
-            _ndNoteResults.set(key, {
-                primary: 'HIT',
-                labels,
-                timingError,
-                pitchError,
-                detectedMidi: scoreMidi,
-                expectedMidi,
-            });
-            _ndHits++;
-            _ndStreak++;
-            if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
-            _ndUpdateSectionStat('hit');
-            _ndRecordNowlineJudgment(cn.s, cn.f, _ndNoteResults.get(key));
+            pitchPassing.push({ cn, key, expectedMidi, pitchError, timingError });
         }
     }
+
+    if (pitchPassing.length === 0) return;
+
+    pitchPassing.sort((a, b) => Math.abs(a.timingError) - Math.abs(b.timingError));
+    const winner = pitchPassing[0];
+    const { cn, key, expectedMidi, pitchError, timingError } = winner;
+
+    const labels = [];
+    if (timingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
+    else if (timingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
+    if (pitchError > _ND_PERFECT_PITCH_CENT)       { labels.push('SHARP'); _ndSharp++; }
+    else if (pitchError < -_ND_PERFECT_PITCH_CENT) { labels.push('FLAT');  _ndFlat++; }
+
+    _ndNoteResults.set(key, {
+        primary: 'HIT',
+        labels,
+        timingError,
+        pitchError,
+        detectedMidi: scoreMidi,
+        expectedMidi,
+    });
+    _ndHits++;
+    _ndStreak++;
+    if (_ndStreak > _ndBestStreak) _ndBestStreak = _ndStreak;
+    _ndUpdateSectionStat('hit');
+    _ndRecordNowlineJudgment(cn.s, cn.f, _ndNoteResults.get(key));
 }
 
 // Aggregate stats over the rolling event log. Returns null if not enough data.
@@ -3573,14 +3677,15 @@ function _ndShowSettings() {
                class="w-full accent-yellow-400 mb-3"
                oninput="_ndSilenceGate=this.value/100;document.getElementById('nd-gate-val').textContent=this.value;_ndSaveSettings()"
                title="Reject detections when input level is below this threshold. Raise to suppress noise/hum.">
-        <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndDetectionLatencySec * 1000)}</span>ms</label>
+        <label class="block text-gray-500 text-xs mb-1" style="opacity:0.5">Audio Latency Offset: <span id="nd-latency-val">${Math.round(_ndDetectionLatencySec * 1000)}</span>ms <span class="text-[10px] text-gray-600">(disabled — onset-gated matching doesn't use this)</span></label>
         <input type="range" min="0" max="1000" value="${Math.round(_ndDetectionLatencySec * 1000)}"
-               class="w-full accent-green-400 mb-2"
-               oninput="_ndDetectionLatencySec=this.value/1000;document.getElementById('nd-latency-val').textContent=this.value;_ndSaveSettings()">
+               class="w-full accent-gray-500 mb-2" disabled
+               style="opacity:0.35;pointer-events:none">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
-            <button onclick="_ndOpenWizard()"
-                class="px-3 py-1 bg-accent hover:bg-accent-light rounded text-xs text-white font-semibold"
-                title="Metronome-based wizard that measures mic input lag and audio output lag as two independent quantities. Play along with each beat.">Calibration Wizard</button>
+            <button disabled
+                class="px-3 py-1 bg-dark-700 rounded text-xs text-gray-500 cursor-not-allowed"
+                style="opacity:0.4"
+                title="Disabled — wizard measures pipeline latency for the legacy stable-MIDI match trigger. After Phase 2 (onset-gated matching), scoring uses onset timestamps directly and this calibration no longer applies. See docs/NOTEDETECT_IMPLEMENTATION_GAPS.md.">Calibration Wizard (disabled)</button>
             <button onclick="_ndOpenTuner()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"
                 title="Standalone tuner — play each open string, see cents offset per string, verify the instrument matches the song's tuning before scoring.">Tune</button>
@@ -3589,7 +3694,7 @@ function _ndShowSettings() {
                 title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
         </div>
         <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-            Compensates for USB / audio interface delay. Use <strong>Calibration Wizard</strong> for objective measurement, or fine-tune by hand with the slider. The HUD Δt readout shows live drift while you play.
+            <strong>Note:</strong> after the onset-gated matching change, the pipeline scores at the acoustic attack transient, not at the stable-MIDI vote. Latency-slider and Calibration Wizard are dead weight on that path — disabled until the dials are re-scoped. Pitch/timing tolerance sliders below still do what they always did.
         </div>
 
         <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
@@ -9406,19 +9511,7 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
         _ndPendingBuffer = null;
 
         processor.onaudioprocess = (e) => {
-            if (!_ndEnabled) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const prev = _ndAccumBuffer;
-            const combined = new Float32Array(prev.length + input.length);
-            combined.set(prev);
-            combined.set(input, prev.length);
-            if (combined.length >= _ndMinYinSamples) {
-                const start = combined.length - _ndMinYinSamples;
-                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
-                _ndAccumBuffer = new Float32Array(0);
-            } else {
-                _ndAccumBuffer = combined;
-            }
+            _ndProcessAudioChunk(e.inputBuffer.getChannelData(0));
         };
 
         processor.connect(_ndAudioCtx.destination);
@@ -9610,19 +9703,7 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
         _ndAccumBuffer = new Float32Array(0);
         _ndPendingBuffer = null;
         processor.onaudioprocess = (e) => {
-            if (!_ndEnabled) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const prev = _ndAccumBuffer;
-            const combined = new Float32Array(prev.length + input.length);
-            combined.set(prev);
-            combined.set(input, prev.length);
-            if (combined.length >= _ndMinYinSamples) {
-                const start = combined.length - _ndMinYinSamples;
-                _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
-                _ndAccumBuffer = new Float32Array(0);
-            } else {
-                _ndAccumBuffer = combined;
-            }
+            _ndProcessAudioChunk(e.inputBuffer.getChannelData(0));
         };
         processor.connect(_ndAudioCtx.destination);
         processorNode = processor;

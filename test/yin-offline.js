@@ -212,7 +212,7 @@ function main() {
         chartStartTime: meta.chartStartTime,
         params: { YIN_BUF, HOP_MS, STABILITY, CENTS_TOL },
         summary: { hits, pitchMiss, noCandidate, totalChart: chartNotes.length, rawDet: rawDetections.length, stableDet: stableDetections.length },
-        stableDetections, details,
+        rawDetections, stableDetections, details,
     }, null, 2));
     console.log(`\n  details written to ${path.relative(process.cwd(), outPath)}`);
 }

@@ -1,0 +1,11 @@
+{
+  "wav": "open-strings.wav",
+  "sampleRate": 48000,
+  "arrangement": "bass",
+  "segments": [
+    {"label": "open E1", "tStart": 2.10, "tEnd": 5.40, "expectedMidi": 28},
+    {"label": "open A1", "tStart": 5.90, "tEnd": 8.95, "expectedMidi": 33},
+    {"label": "open D2", "tStart": 9.30, "tEnd": 11.85, "expectedMidi": 38},
+    {"label": "open G2", "tStart": 12.50, "tEnd": 15.00, "expectedMidi": 43}
+  ]
+}
