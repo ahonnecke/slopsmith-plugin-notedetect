@@ -146,22 +146,48 @@ function analyzeNoteWindow(samples, sampleRate, wavTchart, expectedMidi) {
     };
 }
 
-function classifyNote(audio, pipelineVerdict, chartNote, centsTolerance) {
-    // If the pipeline called HIT, it IS a hit by the user's chosen
-    // tolerance definition. We don't second-guess. "FALSE_POSITIVE" was
-    // earlier used to flag pipeline hits that offline YIN couldn't
-    // confirm at the same cents window, but since tolerance is the
-    // source of truth for scoring, that label was misleading.
-    if (pipelineVerdict === 'HIT') return 'PIPELINE_HIT';
+function classifyNote(audio, verdict, chartNote, centsTolerance) {
+    // verdict is either a string 'MISS' (no dump) or a {primary, detectedMidi, ...}
+    // object from the dump.
+    const primary = typeof verdict === 'string' ? verdict : verdict.primary;
+    if (primary === 'HIT') return 'PIPELINE_HIT';
 
-    // Pipeline MISS. Categorise by what the audio actually contained.
     const audioHasExpected = audio.bestCents != null
         && Math.abs(audio.bestCents) <= centsTolerance;
     const audioHasAnyPitch = audio.pitchedFrames >= MIN_EXPECTED_FRAMES;
 
-    if (audioHasExpected) return 'PIPELINE_MISSED_REAL_PLAY';
-    if (audioHasAnyPitch) return 'USER_WRONG_PITCH';
-    return 'USER_SILENT';
+    // If audio lacks expected pitch, buckets are easy.
+    if (!audioHasExpected) return audioHasAnyPitch ? 'USER_WRONG_PITCH' : 'USER_SILENT';
+
+    // Audio HAS expected pitch but pipeline missed it. Distinguish:
+    //   PIPELINE_MISSED_REAL_PLAY  — no detection attempted (onset didn't fire)
+    //   PIPELINE_YIN_DISAGREES     — live YIN produced a different pitch than
+    //                                offline YIN sees in the audio. That's a
+    //                                live-state issue (buffer mixing,
+    //                                octave-down misfire) distinct from onset.
+    //   USER_WRONG_PITCH           — both live and offline YIN agree on a
+    //                                pitch that doesn't match chart (the
+    //                                detection was correctly attributed to
+    //                                a same-pitch neighbor via nearest-in-time;
+    //                                offline YIN happens to find the expected
+    //                                pitch nearby but it's not what this
+    //                                specific chart note got).
+    if (primary === 'MISSED_NO_DETECTION') return 'PIPELINE_MISSED_REAL_PLAY';
+
+    if (primary === 'MISSED_WRONG_PITCH' && typeof verdict === 'object'
+            && verdict.pitchError != null && verdict.expectedMidi != null
+            && audio.dominantMidi != null) {
+        // Dump stores pitchError but NOT detectedMidi on MISS entries
+        // (detectedMidi is null for MISSes). Reconstruct what live YIN
+        // returned: scoreMidi = expectedMidi + pitchError/100, rounded.
+        // (For MISS entries this is unambiguous — if the octave-up
+        // adjustment would have been a closer fit, the note would have
+        // been scored HIT rather than MISSED_WRONG_PITCH.)
+        const liveMidi = Math.round(verdict.expectedMidi + verdict.pitchError / 100);
+        const liveOfflineAgree = Math.abs(liveMidi - audio.dominantMidi) <= 0.5;
+        if (!liveOfflineAgree) return 'PIPELINE_YIN_DISAGREES';
+    }
+    return 'USER_WRONG_PITCH';
 }
 
 // Dump key format: "chartT_string_fret" — a stringified triple, e.g. "11.918_0_1".
@@ -177,9 +203,27 @@ function loadPipelineVerdicts(dumpPath) {
     const byChartT = new Map();
     for (const r of dump.noteResults || []) {
         const parsed = parseDumpKey(r.key);
-        if (parsed) byChartT.set(Math.round(parsed.chartT * 1000), r.primary || 'HIT');
+        if (!parsed) continue;
+        byChartT.set(Math.round(parsed.chartT * 1000), {
+            primary: r.primary || 'HIT',
+            detectedMidi: r.detectedMidi,  // what live YIN output; null on NO_DETECTION
+            pitchError: r.pitchError,
+            expectedMidi: r.expectedMidi,
+        });
     }
     return byChartT;
+}
+
+// The pipeline's primary flag distinguishes two kinds of MISS:
+//   MISSED_NO_DETECTION  — no pitched audio attempted this note's window
+//   MISSED_WRONG_PITCH   — a detection was attempted but failed pitch tolerance
+// Classifier uses these to separate "pipeline dropped a correct pluck" (the
+// real bug bucket) from "pipeline saw something that didn't match"
+// (including nearest-in-time consumption by a same-pitch neighbor).
+function pipelineMissKind(primary) {
+    if (primary === 'MISSED_NO_DETECTION') return 'NO_DETECTION';
+    if (primary === 'MISSED_WRONG_PITCH') return 'WRONG_PITCH_ATTEMPTED';
+    return 'UNKNOWN'; // dump didn't judge this note at all
 }
 
 function chartFromDump(dumpPath) {
@@ -318,7 +362,7 @@ function main() {
     // Summary
     const buckets = new Map();
     for (const c of classifications) buckets.set(c.category, (buckets.get(c.category) || 0) + 1);
-    const order = ['PIPELINE_HIT', 'PIPELINE_MISSED_REAL_PLAY', 'USER_WRONG_PITCH', 'USER_SILENT'];
+    const order = ['PIPELINE_HIT', 'PIPELINE_MISSED_REAL_PLAY', 'PIPELINE_YIN_DISAGREES', 'USER_WRONG_PITCH', 'USER_SILENT'];
 
     console.log('=== Classification ===');
     for (const k of order) {
