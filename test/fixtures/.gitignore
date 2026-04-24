@@ -6,4 +6,6 @@ baseline-events.json
 *.latency.json
 *.classification.json
 *.dump.json
+*.report.md
+latest.*
 take-*.json
