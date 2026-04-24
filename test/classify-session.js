@@ -39,17 +39,13 @@ function getArg(n, d) { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i
 const WAV_PATH = getArg('wav', 'test/fixtures/mexico-bass-take2.wav');
 const CHART_PATH = getArg('chart', path.join(__dirname, 'fixtures', 'mexico-bass-notes.json'));
 const DUMP_PATH = getArg('dump', null);
-// --chart-from-dump: reconstruct chart notes from the dump's noteResults
-// (each entry's key is "chartT_string_fret"). Use this when the dump's
-// chart doesn't match a stored chart JSON — happens when slopsmith's
-// rendering of the song has different timing than what dump-chart-notes.js
-// captured previously.
-const CHART_FROM_DUMP = args.includes('--chart-from-dump');
-// --auto-align: override the sidecar's chartStartTime by sweeping offsets
-// and picking the one that maximizes audio-chart matches. Required when
-// the WAV was captured with _ndRecordStartRaw (chartStartTime=0) and the
-// true offset depends on user click lag.
-const AUTO_ALIGN = args.includes('--auto-align');
+// Flags kept for explicit override, but the sensible defaults are
+// automatic: if a dump is supplied, use its chart (fresher than any
+// stored JSON); if the sidecar says chartStartTime=0, sweep for the
+// real offset. --no-chart-from-dump and --no-auto-align disable them.
+const CHART_FROM_DUMP = !args.includes('--no-chart-from-dump');
+const AUTO_ALIGN_FORCE_ON = args.includes('--auto-align');
+const AUTO_ALIGN_DISABLE = args.includes('--no-auto-align');
 const AUTO_ALIGN_MIN = parseFloat(getArg('align-min', '-15'));
 const AUTO_ALIGN_MAX = parseFloat(getArg('align-max', '5'));
 const AUTO_ALIGN_STEP = parseFloat(getArg('align-step', '0.25'));
@@ -151,17 +147,18 @@ function analyzeNoteWindow(samples, sampleRate, wavTchart, expectedMidi) {
 }
 
 function classifyNote(audio, pipelineVerdict, chartNote, centsTolerance) {
-    // "Audio has expected" — the best (closest-in-cents) frame in the
-    // window was within centsTolerance of the expected MIDI. Cents-based,
-    // not rounded-MIDI-based, so a detection at e.g. -82¢ counts as a
-    // match at 100¢ tolerance even though its rounded MIDI differs.
+    // If the pipeline called HIT, it IS a hit by the user's chosen
+    // tolerance definition. We don't second-guess. "FALSE_POSITIVE" was
+    // earlier used to flag pipeline hits that offline YIN couldn't
+    // confirm at the same cents window, but since tolerance is the
+    // source of truth for scoring, that label was misleading.
+    if (pipelineVerdict === 'HIT') return 'PIPELINE_HIT';
+
+    // Pipeline MISS. Categorise by what the audio actually contained.
     const audioHasExpected = audio.bestCents != null
         && Math.abs(audio.bestCents) <= centsTolerance;
     const audioHasAnyPitch = audio.pitchedFrames >= MIN_EXPECTED_FRAMES;
 
-    if (pipelineVerdict === 'HIT') {
-        return audioHasExpected ? 'PIPELINE_HIT' : 'FALSE_POSITIVE';
-    }
     if (audioHasExpected) return 'PIPELINE_MISSED_REAL_PLAY';
     if (audioHasAnyPitch) return 'USER_WRONG_PITCH';
     return 'USER_SILENT';
@@ -249,11 +246,13 @@ function main() {
     const wavDur = wav.samples.length / wav.sampleRate;
     const hasDump = DUMP_PATH != null;
 
-    // Chart source: dump (per-session truth) or stored JSON file.
-    const chart = CHART_FROM_DUMP && DUMP_PATH
+    // Chart source: dump when available (captures this session's actual
+    // chart), fallback to stored JSON file. Override with --no-chart-from-dump.
+    const useDumpChart = CHART_FROM_DUMP && DUMP_PATH;
+    const chart = useDumpChart
         ? chartFromDump(DUMP_PATH)
         : JSON.parse(fs.readFileSync(CHART_PATH, 'utf8'));
-    const chartSource = CHART_FROM_DUMP && DUMP_PATH ? `dump (${DUMP_PATH})` : CHART_PATH;
+    const chartSource = useDumpChart ? `dump (${DUMP_PATH})` : CHART_PATH;
 
     // Cents tolerance + window: prefer the dump's live settings so classifier
     // judges "audio has expected" with the SAME thresholds the pipeline
@@ -272,8 +271,13 @@ function main() {
         } catch { /* ignore */ }
     }
 
-    // chartStartTime: sidecar value, or auto-aligned if requested.
-    const chartStart = AUTO_ALIGN
+    // chartStartTime: auto-align when the sidecar's value is 0 (common when
+    // the recording was made before song playback started and no chart-advance
+    // gate captured the offset), or when --auto-align is explicit. --no-auto-align
+    // suppresses even when sidecar=0.
+    const shouldAutoAlign = !AUTO_ALIGN_DISABLE &&
+        (AUTO_ALIGN_FORCE_ON || meta.chartStartTime === 0);
+    const chartStart = shouldAutoAlign
         ? autoAlign(wav.samples, wav.sampleRate, chart, wavDur, centsTolerance)
         : meta.chartStartTime;
 
@@ -283,7 +287,7 @@ function main() {
 
     console.log(`WAV:          ${WAV_PATH}  (${wavDur.toFixed(1)}s at ${wav.sampleRate}Hz)`);
     console.log(`Chart source: ${chartSource}  (${chart.length} total, ${inWindow.length} in window)`);
-    console.log(`chartStartTime: ${chartStart.toFixed(3)}s  ${AUTO_ALIGN ? '(auto-aligned)' : '(from sidecar)'}`);
+    console.log(`chartStartTime: ${chartStart.toFixed(3)}s  ${shouldAutoAlign ? '(auto-aligned)' : '(from sidecar)'}`);
     console.log(`Dump:         ${hasDump ? DUMP_PATH : '(none — audio-truth mode; pipeline verdict assumed MISS)'}`);
     console.log(`Cents tol:    ±${centsTolerance}¢  ${hasDump ? '(from dump settings.pitchTolerance)' : '(default)'}`);
     console.log(`Params: yin=${YIN_BUF}, hop=${HOP_MS}ms, window=${-WINDOW_BEFORE_MS}..+${WINDOW_AFTER_MS}ms`);
@@ -314,7 +318,7 @@ function main() {
     // Summary
     const buckets = new Map();
     for (const c of classifications) buckets.set(c.category, (buckets.get(c.category) || 0) + 1);
-    const order = ['PIPELINE_HIT', 'PIPELINE_MISSED_REAL_PLAY', 'USER_WRONG_PITCH', 'USER_SILENT', 'FALSE_POSITIVE'];
+    const order = ['PIPELINE_HIT', 'PIPELINE_MISSED_REAL_PLAY', 'USER_WRONG_PITCH', 'USER_SILENT'];
 
     console.log('=== Classification ===');
     for (const k of order) {

@@ -131,21 +131,53 @@ test-detector-bakeoff: check-slopsmith ## YIN vs CREPE side-by-side on the open-
 #      _ndRecordStop() earlier.
 #   3) make classify-session SESSION=session  (pulls WAV + dump, runs classifier)
 
-SESSION ?= session
+# SESSION is optional — if unset, the latest .wav in the container is
+# auto-selected. If set to a substring, the newest matching .wav is picked
+# (so you can use SESSION=mexico to pick the latest mexico recording
+# without knowing the timestamp suffix).
+SESSION ?=
+
+.PHONY: sessions
+sessions: ## List available session recordings in the container (newest first)
+	@docker exec slopsmith-web-1 sh -c 'ls -lt /tmp/nd_recordings/*.wav 2>/dev/null | awk "{ print \$$NF, \"(\"\$$5\" bytes)\" }"' | sed 's|/tmp/nd_recordings/||'
+
+# Internal: resolve SESSION into an actual container filename stem.
+# - SESSION empty           → newest .wav in the container
+# - SESSION=foo (no dot)    → newest .wav whose name contains "foo"
+# - SESSION=foo.wav or path → use verbatim (strip dir + .wav)
+define RESOLVE_SESSION
+  SRC=$$(docker exec slopsmith-web-1 sh -c '\
+    if [ -z "$(SESSION)" ]; then \
+      ls -t /tmp/nd_recordings/*.wav 2>/dev/null | head -1; \
+    else \
+      ls -t /tmp/nd_recordings/*$(SESSION)*.wav 2>/dev/null | head -1; \
+    fi'); \
+  if [ -z "$$SRC" ]; then \
+    echo "no session WAV found$(if $(SESSION), matching '$(SESSION)',); available:"; \
+    docker exec slopsmith-web-1 sh -c 'ls -t /tmp/nd_recordings/*.wav 2>/dev/null | sed "s|/tmp/nd_recordings/||"' | head -10 | sed 's/^/  /'; \
+    exit 1; \
+  fi; \
+  NAME=$$(basename "$$SRC" .wav)
+endef
 
 .PHONY: pull-session
-pull-session: ## Pull a recorded session + pipeline dump out of the container (SESSION=<name>)
-	@docker cp slopsmith-web-1:/tmp/nd_recordings/$(SESSION).wav test/fixtures/$(SESSION).wav 2>&1 \
-	    || { echo "error: /tmp/nd_recordings/$(SESSION).wav not found in container — did you _ndRecordStartRaw($(SESSION).wav) / _ndRecordStop()?"; exit 1; }
-	@docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/$(SESSION).dump.json 2>&1 \
-	    || { echo "warn: no /tmp/nd_diag_dump.json in container (auto-dump needs to have fired at least once)"; }
-	@echo "Session artifacts pulled to test/fixtures/$(SESSION).{wav,dump.json}"
+pull-session: ## Pull the latest (or matching) session + pipeline dump out of the container (SESSION=<substring> optional)
+	@$(RESOLVE_SESSION); \
+	echo "Pulling $$NAME..."; \
+	docker cp slopsmith-web-1:$$SRC test/fixtures/$$NAME.wav && \
+	(docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/$$NAME.dump.json 2>/dev/null \
+	    || echo "warn: no /tmp/nd_diag_dump.json in container (auto-dump needs to have fired)") ; \
+	echo "Session artifacts: test/fixtures/$$NAME.{wav,dump.json}"
 
 .PHONY: classify-session
-classify-session: pull-session ## Bucket a session's chart notes into PIPELINE_HIT / PIPELINE_MISSED_REAL_PLAY / USER_WRONG_PITCH / USER_SILENT
-	@node test/classify-session.js \
-	    --wav test/fixtures/$(SESSION).wav \
-	    $(if $(wildcard test/fixtures/$(SESSION).dump.json),--dump test/fixtures/$(SESSION).dump.json,)
+classify-session: ## Bucket a session (SESSION=<substring> optional; newest match if unset)
+	@$(RESOLVE_SESSION); \
+	docker cp slopsmith-web-1:$$SRC test/fixtures/$$NAME.wav >/dev/null; \
+	docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/$$NAME.dump.json >/dev/null 2>&1 || true; \
+	echo "Classifying $$NAME..."; \
+	DUMP_ARG=""; \
+	[ -f test/fixtures/$$NAME.dump.json ] && DUMP_ARG="--dump test/fixtures/$$NAME.dump.json"; \
+	node test/classify-session.js --wav test/fixtures/$$NAME.wav $$DUMP_ARG
 
 .PHONY: test-all
 test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency

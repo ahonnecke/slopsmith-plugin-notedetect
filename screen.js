@@ -430,8 +430,9 @@ async function _ndRecordAlignedStart(seconds = 60) {
         return null;
     }
     const info = highway.getSongInfo && highway.getSongInfo();
-    const songSlug = info?.filename
-        ? info.filename.replace(/\.\w+$/, '').replace(/[^a-z0-9-]/gi, '_').toLowerCase()
+    const slugSource = info?.filename || info?.title || '';
+    const songSlug = slugSource
+        ? slugSource.replace(/\.\w+$/, '').replace(/[^a-z0-9-]/gi, '_').toLowerCase()
         : 'take';
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const filename = `${songSlug}-${stamp}.wav`;
