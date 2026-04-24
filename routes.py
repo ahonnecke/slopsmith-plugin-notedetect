@@ -36,6 +36,19 @@ def setup(app: FastAPI, context: dict):
         meta = {"chartStartTime": float(chart_start), "sampleRate": 48000, "filename": name}
         meta_path = dest.with_suffix(".json")
         meta_path.write_text(json.dumps(meta, indent=2))
+        # Also snapshot the diagnostic dump beside the recording so each
+        # session has its own immutable judgement log. The global
+        # /tmp/nd_diag_dump.json is overwritten on every auto-dump, which
+        # made post-hoc classify-session unreliable — pulling a dump
+        # alongside an older recording grabbed whichever session's dump
+        # had been written last. The per-recording snapshot here is what
+        # the classify-session Makefile target now reads.
+        dump_dest = dest.with_name(dest.stem + ".dump.json")
+        if DUMP_FILE.exists():
+            try:
+                dump_dest.write_text(DUMP_FILE.read_text())
+            except Exception:
+                pass
         return {"ok": True, "path": str(dest), "size": len(content), "chartStartTime": float(chart_start)}
 
     @app.get("/api/plugins/note_detect/recording/{filename}")

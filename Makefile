@@ -173,10 +173,14 @@ pull-session: ## Pull the latest (or matching) session + pipeline dump out of th
 classify-session: ## Bucket a session (SESSION=<substring> optional; newest match if unset)
 	@$(RESOLVE_SESSION); \
 	docker cp slopsmith-web-1:$$SRC test/fixtures/$$NAME.wav >/dev/null; \
-	docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/$$NAME.dump.json >/dev/null 2>&1 || true; \
+	docker cp slopsmith-web-1:/tmp/nd_recordings/$$NAME.dump.json test/fixtures/$$NAME.dump.json >/dev/null 2>&1 || true; \
 	echo "Classifying $$NAME..."; \
 	DUMP_ARG=""; \
-	[ -f test/fixtures/$$NAME.dump.json ] && DUMP_ARG="--dump test/fixtures/$$NAME.dump.json"; \
+	if [ -f test/fixtures/$$NAME.dump.json ]; then \
+	    DUMP_ARG="--dump test/fixtures/$$NAME.dump.json"; \
+	else \
+	    echo "warn: no per-recording dump snapshot for $$NAME (session was recorded before routes.py started snapshotting them)"; \
+	fi; \
 	node test/classify-session.js --wav test/fixtures/$$NAME.wav $$DUMP_ARG
 
 .PHONY: test-all
