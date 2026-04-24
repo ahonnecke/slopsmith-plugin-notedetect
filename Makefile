@@ -183,6 +183,16 @@ classify-session: ## Bucket a session (SESSION=<substring> optional; newest matc
 	fi; \
 	node test/classify-session.js --wav test/fixtures/$$NAME.wav $$DUMP_ARG
 
+.PHONY: session-report
+session-report: classify-session ## Classify the newest session + emit a human-readable report (markdown + terminal summary)
+	@$(RESOLVE_SESSION); \
+	node test/session-report.js --session $$NAME
+
+.PHONY: report-dump
+report-dump: ## Report on the current pipeline dump only (no WAV needed — for when you played without clicking Record)
+	@docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/latest.dump.json >/dev/null
+	@node test/session-report.js --dump test/fixtures/latest.dump.json
+
 .PHONY: test-all
 test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency
 	$(MAKE) --no-print-directory test-pipeline

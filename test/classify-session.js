@@ -208,7 +208,9 @@ function loadPipelineVerdicts(dumpPath) {
             primary: r.primary || 'HIT',
             detectedMidi: r.detectedMidi,  // what live YIN output; null on NO_DETECTION
             pitchError: r.pitchError,
+            timingError: r.timingError,
             expectedMidi: r.expectedMidi,
+            labels: r.labels || [],
         });
     }
     return byChartT;
