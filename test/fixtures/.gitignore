@@ -4,4 +4,6 @@ baseline-events.json
 *.yin-offline.json
 *.bakeoff.json
 *.latency.json
+*.classification.json
+*.dump.json
 take-*.json

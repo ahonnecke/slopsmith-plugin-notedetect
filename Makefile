@@ -111,6 +111,35 @@ test-synth-replay: check-slopsmith ## Replay-baseline on the synthesized WAV (br
 test-detector-bakeoff: check-slopsmith ## YIN vs CREPE side-by-side on the open-strings ground-truth WAV (browser)
 	node test/detector-bakeoff.js
 
+# ── Session classifier ──────────────────────────────────────────────────────
+# Decomposes a live-play session score into real buckets:
+#   PIPELINE_HIT              — agreed by both pipeline and audio
+#   PIPELINE_MISSED_REAL_PLAY — pipeline bug: audio had the expected pitch
+#   USER_WRONG_PITCH          — player played different notes
+#   USER_SILENT               — no pitch in the window
+#
+# Flow for a live session:
+#   1) Before clicking play, paste into console:
+#        _ndRecordStartRaw(<seconds>, 'session.wav')
+#   2) Play through the song. Auto-stops at <seconds>, or call _ndRecordStop().
+#   3) make classify-session SESSION=session  (pulls WAV + dump, runs classifier)
+
+SESSION ?= session
+
+.PHONY: pull-session
+pull-session: ## Pull a recorded session + pipeline dump out of the container (SESSION=<name>)
+	@docker cp slopsmith-web-1:/tmp/nd_recordings/$(SESSION).wav test/fixtures/$(SESSION).wav 2>&1 \
+	    || { echo "error: /tmp/nd_recordings/$(SESSION).wav not found in container — did you _ndRecordStartRaw($(SESSION).wav) / _ndRecordStop()?"; exit 1; }
+	@docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/$(SESSION).dump.json 2>&1 \
+	    || { echo "warn: no /tmp/nd_diag_dump.json in container (auto-dump needs to have fired at least once)"; }
+	@echo "Session artifacts pulled to test/fixtures/$(SESSION).{wav,dump.json}"
+
+.PHONY: classify-session
+classify-session: pull-session ## Bucket a session's chart notes into PIPELINE_HIT / PIPELINE_MISSED_REAL_PLAY / USER_WRONG_PITCH / USER_SILENT
+	@node test/classify-session.js \
+	    --wav test/fixtures/$(SESSION).wav \
+	    $(if $(wildcard test/fixtures/$(SESSION).dump.json),--dump test/fixtures/$(SESSION).dump.json,)
+
 .PHONY: test-all
 test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency
 	$(MAKE) --no-print-directory test-pipeline
