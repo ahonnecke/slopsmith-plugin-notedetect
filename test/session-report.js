@@ -222,6 +222,10 @@ function main() {
         console.log();
     }
 
+    if (data.offsetSweep) {
+        printOffsetSweep(data.offsetSweep);
+    }
+
     // Emit markdown for sharing.
     const md = renderMarkdown(stem, notes, timings, pitches, strings, offenders, buckets, data);
     const mdPath = `${outBase}.report.md`;
@@ -285,6 +289,58 @@ function renderMarkdown(stem, notes, timings, pitches, strings, offenders, bucke
         }
         lines.push('');
     }
+
+    if (data.offsetSweep) {
+        lines.push(renderOffsetSweepMd(data.offsetSweep));
+    }
+    return lines.join('\n');
+}
+
+function printOffsetSweep(sweep) {
+    const { curve, peak, atZero, totalNotes, sweepWindowMs, centsTolerance } = sweep;
+    console.log(`── Offset sweep (audio-truth ceiling) ──`);
+    console.log(`  For each virtual input-latency Δ, count chart notes whose expected pitch`);
+    console.log(`  is audible within ±${sweepWindowMs}ms of Δ. Peak = where the audio for plucks`);
+    console.log(`  actually lands relative to chartT (i.e. effective mic→pipeline latency).`);
+    console.log(`  NOT a live-pipeline replay. Pitch within ±${centsTolerance}¢.`);
+    console.log();
+    const maxCeil = Math.max(...curve.map(p => p.ceiling), 1);
+    for (const p of curve) {
+        const bar = '█'.repeat(Math.round(p.ceiling / maxCeil * 40));
+        const pct = (p.ceiling / totalNotes * 100).toFixed(1);
+        const marks = [];
+        if (p.offsetMs === peak.offsetMs) marks.push('← peak');
+        if (p.offsetMs === atZero.offsetMs) marks.push('← 0ms (no comp)');
+        console.log(`    Δ=${String(p.offsetMs).padStart(5)}ms  ${String(p.ceiling).padStart(4)}/${totalNotes}  ${pct.padStart(5)}%  ${bar} ${marks.join(' ')}`);
+    }
+    const gain = peak.ceiling - atZero.ceiling;
+    const gainPp = (gain / totalNotes * 100).toFixed(1);
+    console.log();
+    console.log(`  Peak Δ=${peak.offsetMs}ms → ${(peak.ceiling / totalNotes * 100).toFixed(1)}%   current Δ=0 → ${(atZero.ceiling / totalNotes * 100).toFixed(1)}%   ceiling gain: +${gain} notes (+${gainPp}pp)`);
+    console.log();
+}
+
+function renderOffsetSweepMd(sweep) {
+    const { curve, peak, atZero, totalNotes, sweepWindowMs, centsTolerance } = sweep;
+    const lines = [];
+    lines.push(`## Offset sweep (audio-truth ceiling)\n`);
+    lines.push(`For each virtual input-latency Δ, count chart notes whose expected pitch is audible within ±${sweepWindowMs}ms of Δ.`);
+    lines.push(`Peak = where the audio for plucks actually lands relative to chartT (effective mic→pipeline latency).`);
+    lines.push(`NOT a replay of the live pipeline. Pitch within ±${centsTolerance}¢.\n`);
+    lines.push('```');
+    const maxCeil = Math.max(...curve.map(p => p.ceiling), 1);
+    for (const p of curve) {
+        const bar = '█'.repeat(Math.round(p.ceiling / maxCeil * 40));
+        const pct = (p.ceiling / totalNotes * 100).toFixed(1);
+        const marks = [];
+        if (p.offsetMs === peak.offsetMs) marks.push('← peak');
+        if (p.offsetMs === atZero.offsetMs) marks.push('← 0ms (no comp)');
+        lines.push(`Δ=${String(p.offsetMs).padStart(5)}ms  ${String(p.ceiling).padStart(4)}/${totalNotes}  ${pct.padStart(5)}%  ${bar} ${marks.join(' ')}`);
+    }
+    lines.push('```');
+    const gain = peak.ceiling - atZero.ceiling;
+    const gainPp = (gain / totalNotes * 100).toFixed(1);
+    lines.push(`\nPeak Δ=**${peak.offsetMs}ms** → ${(peak.ceiling / totalNotes * 100).toFixed(1)}%   current Δ=0 → ${(atZero.ceiling / totalNotes * 100).toFixed(1)}%   ceiling gain: **+${gain} notes (+${gainPp}pp)**\n`);
     return lines.join('\n');
 }
 

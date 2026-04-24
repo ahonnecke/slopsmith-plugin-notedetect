@@ -169,8 +169,13 @@ pull-session: ## Pull the latest (or matching) session + pipeline dump out of th
 	    || echo "warn: no /tmp/nd_diag_dump.json in container (auto-dump needs to have fired)") ; \
 	echo "Session artifacts: test/fixtures/$$NAME.{wav,dump.json}"
 
+# Optional flags passed through to classify-session.js:
+#   OFFSET_SWEEP=1 — run the audio-truth offset sweep to benchmark what score
+#                    ceiling each hypothesized input-latency Δ would yield.
+CLASSIFY_FLAGS := $(if $(OFFSET_SWEEP),--offset-sweep,)
+
 .PHONY: classify-session
-classify-session: ## Bucket a session (SESSION=<substring> optional; newest match if unset)
+classify-session: ## Bucket a session (SESSION=<substring> optional; OFFSET_SWEEP=1 runs latency-offset ceiling curve)
 	@$(RESOLVE_SESSION); \
 	docker cp slopsmith-web-1:$$SRC test/fixtures/$$NAME.wav >/dev/null; \
 	docker cp slopsmith-web-1:/tmp/nd_recordings/$$NAME.dump.json test/fixtures/$$NAME.dump.json >/dev/null 2>&1 || true; \
@@ -181,7 +186,7 @@ classify-session: ## Bucket a session (SESSION=<substring> optional; newest matc
 	else \
 	    echo "warn: no per-recording dump snapshot for $$NAME (session was recorded before routes.py started snapshotting them)"; \
 	fi; \
-	node test/classify-session.js --wav test/fixtures/$$NAME.wav $$DUMP_ARG
+	node test/classify-session.js --wav test/fixtures/$$NAME.wav $$DUMP_ARG $(CLASSIFY_FLAGS)
 
 .PHONY: session-report
 session-report: classify-session ## Classify the newest session + emit a human-readable report (markdown + terminal summary)

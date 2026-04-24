@@ -49,6 +49,28 @@ const AUTO_ALIGN_DISABLE = args.includes('--no-auto-align');
 const AUTO_ALIGN_MIN = parseFloat(getArg('align-min', '-15'));
 const AUTO_ALIGN_MAX = parseFloat(getArg('align-max', '5'));
 const AUTO_ALIGN_STEP = parseFloat(getArg('align-step', '0.25'));
+// Offset sweep: at each hypothesized input-latency Δ in [sweep-min..sweep-max],
+// count how many chart notes have an expected-pitch audio frame inside the
+// (offset-shifted) sweep window. This is the audio-truth *ceiling* — the best
+// score a perfect detector could achieve at that latency compensation. It
+// does NOT replay the live pipeline at Δ (that'd need a full onset-event log
+// in the dump; currently only the last 30 events are persisted).
+//
+// The sweep uses a TIGHTER window than the live pipeline's hit window, so the
+// curve actually differentiates across offsets. Example: if the pipeline runs
+// at 300ms tolerance (window is 900ms wide), the pluck is "in window" at
+// basically any Δ and the curve is flat at 100%. Using ±100ms asks the
+// sharper question: "where does the audio for each pluck actually land?"
+// If Δ=+200 peaks at 90% and Δ=0 sits at 60%, the mic→pipeline path is
+// systematically 200ms late. If peak==Δ=0, there's no latency bias.
+const OFFSET_SWEEP = args.includes('--offset-sweep');
+const SWEEP_MIN_MS = parseFloat(getArg('sweep-min-ms', '-200'));
+const SWEEP_MAX_MS = parseFloat(getArg('sweep-max-ms', '500'));
+const SWEEP_STEP_MS = parseFloat(getArg('sweep-step-ms', '25'));
+// Sweep window (symmetric half-width around Δ), independent of the pipeline's
+// live hit-window. Default 100ms — narrow enough to resolve bias, wide enough
+// to tolerate a bit of player jitter.
+const SWEEP_WINDOW_MS = parseFloat(getArg('sweep-window-ms', '100'));
 
 // Analysis parameters. The WINDOW_BEFORE/AFTER mirror the pipeline's
 // asymmetric hit window (early 110 ms, late 220 ms at default tolerance)
@@ -99,20 +121,17 @@ function rms(samples, start, n) {
     return Math.sqrt(s / (end - start)) * 5;
 }
 
-// For one chart note, analyze the audio window around chartT.
-// Returns {expectedFrames, pitchedFrames, totalFrames, dominantMidi,
-//          minCentsToMatch, bestCents} — the minimum cents tolerance
-// at which the dominant detection would match expected.
-function analyzeNoteWindow(samples, sampleRate, wavTchart, expectedMidi) {
-    const startSample = Math.max(0, Math.floor((wavTchart - WINDOW_BEFORE_MS / 1000) * sampleRate));
-    const endSample = Math.min(samples.length, Math.floor((wavTchart + WINDOW_AFTER_MS / 1000) * sampleRate));
+// Scan a "super-window" around a chart note — wide enough to cover the hit
+// window AT ALL swept offsets, so the sweep can reuse the same YIN output.
+// Returns {frames, summary} where frames is a list of every pitched frame
+// (tRelMs relative to chartT, cents to expected, matchesExpected) and
+// summary is the analyzeNoteWindow output filtered to the base hit window.
+function scanNoteSuperWindow(samples, sampleRate, wavTchart, expectedMidi, superBeforeMs, superAfterMs) {
+    const startSample = Math.max(0, Math.floor((wavTchart - superBeforeMs / 1000) * sampleRate));
+    const endSample = Math.min(samples.length, Math.floor((wavTchart + superAfterMs / 1000) * sampleRate));
     const hop = Math.floor(sampleRate * HOP_MS / 1000);
-
-    const midiCounts = new Map();
-    let expectedFrames = 0;
-    let pitchedFrames = 0;
+    const frames = [];
     let totalFrames = 0;
-    let bestCentsErr = Infinity;
 
     for (let s = startSample; s + YIN_BUF <= endSample; s += hop) {
         totalFrames++;
@@ -121,24 +140,36 @@ function analyzeNoteWindow(samples, sampleRate, wavTchart, expectedMidi) {
         const frame = samples.slice(s, s + YIN_BUF);
         const r = core.yinDetect(frame, sampleRate);
         if (r.freq <= 0 || r.confidence < MIN_CONFIDENCE) continue;
-        pitchedFrames++;
         const detMidi = Math.round(69 + 12 * Math.log2(r.freq / 440));
-        midiCounts.set(detMidi, (midiCounts.get(detMidi) || 0) + 1);
-        // Continuous-cents distance to expected (how close was the best frame?)
         const fineCents = (69 + 12 * Math.log2(r.freq / 440) - expectedMidi) * 100;
-        // Also consider octave-up harmonic: a detection 12 semitones high
-        // is tolerated by the live pipeline.
         const octCents = fineCents - 1200;
         const cents = Math.abs(octCents) < Math.abs(fineCents) ? octCents : fineCents;
-        if (Math.abs(cents) < Math.abs(bestCentsErr)) bestCentsErr = cents;
-        if (detMidi === expectedMidi) expectedFrames++;
+        const tRelMs = ((s + YIN_BUF / 2) / sampleRate - wavTchart) * 1000;
+        frames.push({ tRelMs, detMidi, cents });
     }
 
-    // Dominant detected MIDI (for the USER_WRONG_PITCH case)
+    return { frames, totalFrames };
+}
+
+// Summarize frames within the base hit window [-WINDOW_BEFORE, +WINDOW_AFTER]
+// for the classifier. Takes the pre-scanned frame list and filters it in-range.
+function summarizeFrames(frames, totalFrames, expectedMidi, centsTolerance) {
+    const midiCounts = new Map();
+    let expectedFrames = 0;
+    let pitchedFrames = 0;
+    let bestCentsErr = Infinity;
+
+    for (const fr of frames) {
+        if (fr.tRelMs < -WINDOW_BEFORE_MS || fr.tRelMs > WINDOW_AFTER_MS) continue;
+        pitchedFrames++;
+        midiCounts.set(fr.detMidi, (midiCounts.get(fr.detMidi) || 0) + 1);
+        if (Math.abs(fr.cents) < Math.abs(bestCentsErr)) bestCentsErr = fr.cents;
+        if (fr.detMidi === expectedMidi) expectedFrames++;
+    }
+
     const sorted = [...midiCounts.entries()].sort((a, b) => b[1] - a[1]);
     const dominantMidi = sorted[0]?.[0] ?? null;
     const dominantCount = sorted[0]?.[1] ?? 0;
-
     return {
         expectedFrames, pitchedFrames, totalFrames,
         dominantMidi, dominantCount,
@@ -343,14 +374,34 @@ function main() {
     const tolSweep = [25, 50, 75, 100, 150, 200];
     const tolWould = new Map(tolSweep.map(t => [t, 0]));
 
+    // Super-window width: must cover base hit window AND sweep window across
+    // its full range. When the sweep is off, this equals the base hit window.
+    const superBeforeMs = OFFSET_SWEEP
+        ? Math.max(WINDOW_BEFORE_MS, SWEEP_WINDOW_MS - SWEEP_MIN_MS)
+        : WINDOW_BEFORE_MS;
+    const superAfterMs = OFFSET_SWEEP
+        ? Math.max(WINDOW_AFTER_MS, SWEEP_WINDOW_MS + SWEEP_MAX_MS)
+        : WINDOW_AFTER_MS;
+
+    if (OFFSET_SWEEP) {
+        console.log(`Offset sweep: Δ in [${SWEEP_MIN_MS}..${SWEEP_MAX_MS}ms step ${SWEEP_STEP_MS}], window ±${SWEEP_WINDOW_MS}ms around Δ, ±${centsTolerance}¢`);
+    }
+
     for (const cn of inWindow) {
         const wavTchart = cn.chartT - chartStart;
-        const audio = analyzeNoteWindow(wav.samples, wav.sampleRate, wavTchart, cn.midi);
+        const { frames, totalFrames } = scanNoteSuperWindow(
+            wav.samples, wav.sampleRate, wavTchart, cn.midi, superBeforeMs, superAfterMs);
+        const audio = summarizeFrames(frames, totalFrames, cn.midi, centsTolerance);
         const verdictKey = Math.round(cn.chartT * 1000);
         const pipelineVerdict = verdicts.get(verdictKey) || 'MISS';
         const category = classifyNote(audio, pipelineVerdict, cn, centsTolerance);
 
-        classifications.push({ cn, audio, pipelineVerdict, category });
+        // Keep the raw frame list only when the sweep needs it. Otherwise the
+        // classification.json would grow by ~KB per note for no gain.
+        classifications.push({
+            cn, audio, pipelineVerdict, category,
+            frames: OFFSET_SWEEP ? frames : null,
+        });
 
         // Tolerance sweep: at each cents tolerance, would the BEST frame
         // have matched? Uses the (already-octave-aware) bestCents.
@@ -359,6 +410,38 @@ function main() {
                 if (Math.abs(audio.bestCents) <= t) tolWould.set(t, tolWould.get(t) + 1);
             }
         }
+    }
+
+    // Offset sweep — at each virtual input-latency Δ, count notes whose
+    // expected pitch is audible in a ±SWEEP_WINDOW_MS band around Δ.
+    // "Expected-pitch" = cents within centsTolerance AND rounded MIDI matches
+    // (same rules the classifier uses for `audioHasExpected`).
+    // NOT a live-pipeline replay — this is the audio-truth ceiling at each Δ
+    // given the chosen sweep window. Use a tighter window to resolve timing
+    // bias; the pipeline's live hit window is usually too wide to differentiate.
+    let offsetSweepResult = null;
+    if (OFFSET_SWEEP) {
+        const curve = [];
+        for (let offset = SWEEP_MIN_MS; offset <= SWEEP_MAX_MS + 1e-6; offset += SWEEP_STEP_MS) {
+            const wStart = -SWEEP_WINDOW_MS + offset;
+            const wEnd = SWEEP_WINDOW_MS + offset;
+            let ceiling = 0;
+            for (const c of classifications) {
+                if (!c.frames) continue;
+                const has = c.frames.some(fr =>
+                    fr.tRelMs >= wStart && fr.tRelMs <= wEnd && Math.abs(fr.cents) <= centsTolerance);
+                if (has) ceiling++;
+            }
+            curve.push({ offsetMs: Math.round(offset), ceiling });
+        }
+        const peak = curve.reduce((a, b) => b.ceiling > a.ceiling ? b : a, curve[0]);
+        const atZero = curve.find(p => p.offsetMs === 0) ?? curve.reduce((a, b) =>
+            Math.abs(b.offsetMs) < Math.abs(a.offsetMs) ? b : a, curve[0]);
+        offsetSweepResult = {
+            curve, peak, atZero,
+            sweepWindowMs: SWEEP_WINDOW_MS,
+            centsTolerance, totalNotes: inWindow.length,
+        };
     }
 
     // Summary
@@ -393,6 +476,32 @@ function main() {
         console.log(`  ${c.cn.chartT.toFixed(2).padStart(6)}s  ${String(c.cn.midi).padStart(3)}   ${String(a.dominantMidi ?? '—').padStart(8)}  ${String(a.expectedFrames).padStart(3)}/${String(a.pitchedFrames).padStart(3)}                    ${best}   ${c.category}`);
     }
 
+    if (offsetSweepResult) {
+        const { curve, peak, atZero, centsTolerance, totalNotes, sweepWindowMs } = offsetSweepResult;
+        console.log();
+        console.log('=== Offset sweep (audio-truth ceiling) ===');
+        console.log(`  For each virtual input-latency Δ, count chart notes whose expected pitch`);
+        console.log(`  is audible within ±${sweepWindowMs}ms of Δ. Peak = where the audio for plucks`);
+        console.log(`  actually lands relative to chartT (i.e. the effective mic→pipeline latency).`);
+        console.log(`  NOT a replay of the live pipeline. Pitch match within ±${centsTolerance}¢.`);
+        console.log();
+        const maxCeil = Math.max(...curve.map(p => p.ceiling), 1);
+        for (const p of curve) {
+            const bar = '█'.repeat(Math.round(p.ceiling / maxCeil * 40));
+            const pct = (p.ceiling / totalNotes * 100).toFixed(1);
+            const marks = [];
+            if (p === peak) marks.push('← peak');
+            if (p === atZero) marks.push('← 0ms (no comp)');
+            console.log(`  Δ=${String(p.offsetMs).padStart(5)}ms  ${String(p.ceiling).padStart(4)}/${totalNotes}  ${pct.padStart(5)}%  ${bar} ${marks.join(' ')}`);
+        }
+        const delta = peak.ceiling - atZero.ceiling;
+        const pctPts = (delta / totalNotes * 100).toFixed(1);
+        console.log();
+        console.log(`  Peak: Δ=${peak.offsetMs}ms → ${peak.ceiling}/${totalNotes} (${(peak.ceiling / totalNotes * 100).toFixed(1)}%)`);
+        console.log(`  Current (Δ=0): ${atZero.ceiling}/${totalNotes} (${(atZero.ceiling / totalNotes * 100).toFixed(1)}%)`);
+        console.log(`  Ceiling gain from shifting to peak: +${delta} notes (+${pctPts}pp)`);
+    }
+
     // Dump for further offline analysis (optional downstream consumers)
     const outPath = WAV_PATH.replace(/\.wav$/, '.classification.json');
     fs.writeFileSync(outPath, JSON.stringify({
@@ -404,6 +513,7 @@ function main() {
         totalNotes: inWindow.length,
         buckets: Object.fromEntries(buckets),
         toleranceSweep: Object.fromEntries(tolWould),
+        offsetSweep: offsetSweepResult,
         notes: classifications.map(c => ({
             chartT: c.cn.chartT,
             expectedMidi: c.cn.midi,
