@@ -183,6 +183,7 @@ let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensa
 // Quick Calibrate proved G/D/A all match at 0 offset for Mexico by Cake.
 // If localStorage has a non-zero value, it'll be loaded — use Quick Calibrate
 // or the settings slider to reset.
+let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable Detect
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -602,6 +603,7 @@ function _ndSaveSettings() {
             latencyOffset: _ndDetectionLatencySec,
             silenceGate: _ndSilenceGate,
             pitchOffset: _ndPitchOffset,
+            autoDetectOnPlay: _ndAutoDetectOnPlay,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -631,6 +633,7 @@ function _ndLoadSettings() {
             // Reject saved offsets > ±1 — they're from the feedback loop bug
             _ndPitchOffset = Math.abs(s.pitchOffset) <= 1 ? s.pitchOffset : 0;
         }
+        if (s.autoDetectOnPlay !== undefined) _ndAutoDetectOnPlay = !!s.autoDetectOnPlay;
     } catch (e) { /* ignore */ }
 }
 
@@ -1773,6 +1776,15 @@ function _ndProcessAudioChunk(input) {
         _ndLastOnsetPerfNow = nowPerfSec;
         _ndReattackArmed = false; // disarm until next release
         _ndOnsetCount++;
+        // Flush the YIN buffers so the next frame reads 100% post-onset audio.
+        // Without this, the first couple of post-onset YIN runs read a 4096-
+        // sample (~86 ms) buffer whose leading half still contains the
+        // previous note's sustain; the stability voter then locks onto that
+        // stale pitch. Confirmed on Level session: 9/18 YIN_DISAGREES returned
+        // a preceding chart note's pitch. Costs one extra ScriptProcessor
+        // chunk (~43 ms) of latency before the first valid stable reading.
+        _ndAccumBuffer = new Float32Array(0);
+        _ndPendingBuffer = null;
     }
 
     // Accumulate samples for low-frequency detection (need 4096 at 48 kHz
@@ -3745,6 +3757,12 @@ function _ndShowSettings() {
             <button onclick="document.getElementById('nd-settings-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
         </div>
 
+        <label class="flex items-center gap-2 text-gray-300 text-xs mb-3 cursor-pointer">
+            <input type="checkbox" id="nd-auto-detect-on-play" ${_ndAutoDetectOnPlay ? 'checked' : ''}
+                   onchange="_ndAutoDetectOnPlay=this.checked;_ndSaveSettings()">
+            <span>Auto-enable Detect when Play is pressed</span>
+        </label>
+
         <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
         <select id="nd-device-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
                 onchange="_ndOnDeviceChange(this.value)">
@@ -4487,6 +4505,21 @@ function _ndInjectButton() {
     diag.title = 'Detection diagnostics';
     diag.onclick = _ndToggleDiag;
     controls.insertBefore(diag, closeBtn);
+}
+
+// Auto-Detect-on-Play: hook the host's <audio id="audio"> 'play' event so
+// pressing Play in the host UI also flips Detect on. Idempotent — uses a
+// dataset flag so re-injection (multi-song sessions) doesn't stack listeners.
+function _ndAttachAutoDetectListener() {
+    const audio = document.getElementById('audio');
+    if (!audio || audio.dataset.ndAutoDetect === '1') return;
+    audio.dataset.ndAutoDetect = '1';
+    audio.addEventListener('play', () => {
+        if (_ndAutoDetectOnPlay && !_ndEnabled) {
+            console.log('[note_detect] Auto-enabling Detect on play');
+            _ndToggle();
+        }
+    });
 }
 
 function _ndUpdateButton() {
@@ -9011,21 +9044,15 @@ setInterval(() => {
         if (_ndShared.playSongRetries++ < _ND_PLAY_SONG_MAX_RETRIES) {
             setTimeout(_ndInstallPlaySongHook, 50);
         }
-        return;
-    }
-    // If this file was evaluated before, `window.playSong` already
-    // points at our wrapper. Bail rather than wrap it again.
-    if (origPlaySong._ndWrapped) return;
-    const wrapper = async function (...args) {
-        // Pin the CDLC filename — args[0] is the playSong filename
-        // arg; the WS song_info payload that hw.getSongInfo() returns
-        // doesn't carry this field, so this is our only reliable
-        // signal for the training-bundle manifest's CDLC File Name.
-        // Decode URI-encoded forms like 'sloppak%2Fbadramer.sloppak'.
-        if (typeof args[0] === 'string') {
-            let f = args[0];
-            try { f = decodeURIComponent(f); } catch (_) { /* leave raw */ }
-            _ndShared.currentFilename = f;
+        _ndResetScoring();
+        await origPlaySong(filename, arrangement);
+        _ndInjectButton();
+        _ndAttachAutoDetectListener();
+
+        // Read tuning from newly loaded song
+        const info = highway.getSongInfo();
+        if (info && info.tuning) {
+            _ndTuningOffsets = info.tuning;
         }
         // For each live instance: silent-disable if currently enabled
         // (stop audio + timers without popping a summary modal), then
