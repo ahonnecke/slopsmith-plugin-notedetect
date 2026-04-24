@@ -539,11 +539,39 @@ const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 // evaluate a ratio, so fresh attacks after silence never fired (history was
 // empty or sparse). Threshold-crossing handles silence→attack cleanly.
 // Verified behaviour is logged in docs/NOTEDETECT_IMPLEMENTATION_GAPS.md.
-const _ND_ONSET_LEVEL = 0.04;         // RMS above this = entering a note
+const _ND_ONSET_LEVEL = 0.04;         // RMS above this = entering a note (silence→playing transition)
 const _ND_ONSET_EXIT_LEVEL = 0.02;    // below this = note ended (hysteresis gap prevents re-fire on sustain noise)
 const _ND_ONSET_BUFFER_COMP_SEC = 0.020; // half of ScriptProcessor 2048-sample buffer at 48 kHz — compensates for callback lag
+// Sustain re-attack detection — fires a new onset when RMS spikes above the
+// recent running minimum during an in-progress note. Needed for repeated
+// plucks (Mexico bass is dense same-pitch E-string repeats) where sustain
+// keeps _ndInNote true between plucks, blocking the silence→playing trigger.
+// Validated via test/classify-session.js: 24 MISSED_NO_DETECTION notes in a
+// full Mexico play all had pre-attack RMS above the hysteresis exit level,
+// which is exactly the regime this handles.
+// Tuning: a bass attack envelope has a primary transient at ~20 ms, a
+// settling period of ~100 ms, then a secondary body-resonance peak that
+// can rebound by 1.5-1.8× above the local trough. Refractory has to cover
+// the whole envelope (~200 ms) to avoid the detector firing a spurious
+// second onset during that rebound. Ratio 2.0 provides headroom: a real
+// re-pluck during sustain produces ≥3× spike above the decaying tail.
+// Bass repeats at 16th notes / 120 BPM = 125 ms apart — too fast for this
+// refractory, but Mexico's gaps are 200+ ms so 200 ms works here.
+const _ND_REATTACK_RATIO = 2.0;
+const _ND_REATTACK_REFRACTORY_SEC = 0.200;
+const _ND_REATTACK_MIN_LEVEL = 0.04;
+const _ND_REATTACK_WINDOW = 4;
+// Fallback-path stability-vote compensation. The onset path uses the onset's
+// chart time directly; fallback only triggers when no onset fired, and at
+// that point we estimate the pluck happened just before stability converged.
+// A small fixed lag (~50 ms) matches real pipeline behaviour. NOT the same
+// as _ndDetectionLatencySec, which was the legacy calibration-wizard value
+// that shifted scoring 500 ms into the past and forced users to play late.
+const _ND_FALLBACK_STABILITY_LAG_SEC = 0.05;
 let _ndInNote = false;                // are we currently inside a detected note?
 let _ndPendingOnsetChartT = null;     // chart time of the most recent onset, cleared when consumed by _ndMatchNotes
+let _ndLastOnsetPerfNow = 0;          // performance.now()/1000 of the last onset (for refractory)
+let _ndReattackRmsBuf = [];           // running RMS window for the re-attack detector
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -1675,23 +1703,46 @@ function _ndProcessAudioChunk(input) {
         }
     }
 
-    // Onset detection — threshold-crossing with hysteresis. Sets
-    // _ndPendingOnsetChartT for the stability-voting stage to consume as
-    // the match-event timestamp. See docs/NOTEDETECT_IMPLEMENTATION_GAPS.md
-    // Gap 1. Also flushes stability votes on rising-edge so the new note
-    // votes from scratch (prior behavior).
+    // Onset detection — two triggers, each sets _ndPendingOnsetChartT for
+    // the stability-voting stage to consume as the match-event timestamp.
+    // See docs/NOTEDETECT_IMPLEMENTATION_GAPS.md Gap 1 for the primary
+    // trigger story; the re-attack trigger is a follow-on to recover
+    // repeated-note plucks during bass sustain.
     let rms = 0;
     for (let j = 0; j < input.length; j++) rms += input[j] * input[j];
     rms = Math.sqrt(rms / input.length);
-    if (rms > _ND_ONSET_LEVEL && !_ndInNote) {
+
+    _ndReattackRmsBuf.push(rms);
+    if (_ndReattackRmsBuf.length > _ND_REATTACK_WINDOW) _ndReattackRmsBuf.shift();
+
+    const nowPerfSec = performance.now() / 1000;
+    const refractoryOk = (nowPerfSec - _ndLastOnsetPerfNow) > _ND_REATTACK_REFRACTORY_SEC;
+
+    let fireOnset = false;
+    // Trigger 1: silence → playing (fresh note after a rest).
+    if (rms > _ND_ONSET_LEVEL && !_ndInNote && refractoryOk) {
         _ndInNote = true;
+        fireOnset = true;
+    }
+    // Trigger 2: sustain re-attack — RMS spike above recent running min.
+    // Catches repeated plucks where sustain keeps _ndInNote true between
+    // plucks, which would otherwise block Trigger 1.
+    else if (_ndInNote && refractoryOk && rms > _ND_REATTACK_MIN_LEVEL && _ndReattackRmsBuf.length >= 3) {
+        const recentMin = Math.min(..._ndReattackRmsBuf.slice(0, -1));
+        if (rms > recentMin * _ND_REATTACK_RATIO) fireOnset = true;
+    }
+    // Exit — hysteresis gap prevents re-fire on sustain noise.
+    else if (rms < _ND_ONSET_EXIT_LEVEL) {
+        _ndInNote = false;
+    }
+
+    if (fireOnset) {
         const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
         _ndPendingOnsetChartT = highway.getTime() + avOffsetSec - _ND_ONSET_BUFFER_COMP_SEC;
         _ndRawMidiHistory = [];
         _ndStableMidi = -1;
+        _ndLastOnsetPerfNow = nowPerfSec;
         _ndOnsetCount++;
-    } else if (rms < _ND_ONSET_EXIT_LEVEL) {
-        _ndInNote = false;
     }
 
     // Accumulate samples for low-frequency detection (need 4096 at 48 kHz
@@ -2681,8 +2732,16 @@ function _ndMatchNotes(tOverride) {
     if (tOverride != null) {
         t = tOverride;
     } else {
+        // Fallback path — no onset fired, match is triggered by stable-MIDI
+        // change. Use a small fixed stability-vote lag instead of the legacy
+        // _ndDetectionLatencySec value, which was historically set by the
+        // calibration wizard to ~500 ms for the stable-MIDI-change trigger.
+        // That 500 ms shift forced users to play LATE (200+ ms) for hits to
+        // register here — the fingerprint was HITs in the dump labelled LATE
+        // with +200 to +600 ms timing errors. See classify-session analysis
+        // of mexico_full_play_apr24.wav for the evidence.
         const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-        t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+        t = highway.getTime() + avOffsetSec - _ND_FALLBACK_STABILITY_LAG_SEC;
     }
 
     const notes = highway.getNotes();
