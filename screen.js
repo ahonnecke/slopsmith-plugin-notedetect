@@ -3789,8 +3789,10 @@ function _ndShowSettings() {
                 <select id="nd-record-secs" class="bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200">
                     <option value="15">15s</option>
                     <option value="30">30s</option>
-                    <option value="60" selected>60s</option>
+                    <option value="60">60s</option>
                     <option value="120">120s</option>
+                    <option value="300" selected>5 min</option>
+                    <option value="600">10 min</option>
                 </select>
                 <button id="nd-record-btn" onclick="_ndOnRecordClick()"
                     class="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs text-red-200 font-semibold">
