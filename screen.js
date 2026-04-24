@@ -864,11 +864,17 @@ function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     // "harmonic vs fundamental" indicator rather than "signal is still
     // periodic at 2 × true period" (which applies to any periodic signal).
     //
-    // OCTAVE_DIP_RATIO of 0.5 leaves huge margin on both sides of our
-    // observed values and was sufficient to pass every test in the suite.
-    // See docs/CREPE_STATUS.md for why we're hardening YIN rather than
-    // switching detectors.
-    const OCTAVE_DIP_RATIO = 0.5;
+    // OCTAVE_DIP_RATIO tightened to 0.1 (was 0.5) after a sustain-to-new-pluck
+    // transition in Mexico produced MIDI 26 (subharmonic of 38) where the
+    // audio contained clean MIDI 38. Analysis of the failure:
+    //   E1 sustain (switch desired): fund dip 0.0007, harmonic dip 0.149 → ratio 0.005
+    //   E2 bass-harmonic (skip desired): ratio 0.976
+    //   MIDI 38+36 mixed (skip desired): fund dip 0.08, 2×tau dip 0.03 → ratio 0.375
+    // The old 0.5 threshold let the mixed-sustain case through. 0.1 requires
+    // the 2×tau dip to be a full 10× deeper, which happens on a true harmonic
+    // alias but not on coincidental LCM alignments between two different
+    // sustained periods in the buffer. Clean E1 still passes by 20× margin.
+    const OCTAVE_DIP_RATIO = 0.1;
     const baselineDip = yinBuffer[tau];
     for (const multiplier of [2, 3]) {
         const candidate = tau * multiplier;
