@@ -562,6 +562,18 @@ const _ND_REATTACK_RATIO = 2.0;
 const _ND_REATTACK_REFRACTORY_SEC = 0.200;
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
+// Release-before-retrigger: after any onset fires, another re-attack can't
+// fire until RMS has dipped below _ND_REATTACK_REARM_LEVEL at least once.
+// Prevents the cascade where a noisy body-peak during sustain fires a
+// spurious re-attack, its 200 ms refractory keeps the real next-pluck's
+// onset blocked. The Level session showed 5 clean plucks (peak RMS 0.19-0.25,
+// attack-vs-preattack ratio 50-250×) that the pipeline missed — hypothesis
+// is chained spurious body-peak retriggers blocked them via refractory.
+// Re-arm threshold is the exit level (0.02): if RMS decays below that
+// between plucks, we know the previous note is truly releasing and a
+// subsequent spike is a fresh pluck, not envelope noise.
+const _ND_REATTACK_REARM_LEVEL = 0.02;
+let _ndReattackArmed = true;          // true when a release has been seen since last onset
 // Fallback-path stability-vote compensation. The onset path uses the onset's
 // chart time directly; fallback only triggers when no onset fired, and at
 // that point we estimate the pluck happened just before stability converged.
@@ -1725,16 +1737,26 @@ function _ndProcessAudioChunk(input) {
     const nowPerfSec = performance.now() / 1000;
     const refractoryOk = (nowPerfSec - _ndLastOnsetPerfNow) > _ND_REATTACK_REFRACTORY_SEC;
 
+    // Re-arm the re-attack gate as soon as we observe a release — a frame
+    // whose RMS is below the rearm level. Done OUTSIDE the onset-decision
+    // branch so it tracks the envelope independently of whether an onset
+    // fires. If the envelope dips low between attacks, we know the previous
+    // note's sustain has genuinely released, and a subsequent spike is a
+    // fresh pluck rather than body-peak noise from the ongoing note.
+    if (rms < _ND_REATTACK_REARM_LEVEL) _ndReattackArmed = true;
+
     let fireOnset = false;
     // Trigger 1: silence → playing (fresh note after a rest).
     if (rms > _ND_ONSET_LEVEL && !_ndInNote && refractoryOk) {
         _ndInNote = true;
         fireOnset = true;
     }
-    // Trigger 2: sustain re-attack — RMS spike above recent running min.
-    // Catches repeated plucks where sustain keeps _ndInNote true between
-    // plucks, which would otherwise block Trigger 1.
-    else if (_ndInNote && refractoryOk && rms > _ND_REATTACK_MIN_LEVEL && _ndReattackRmsBuf.length >= 3) {
+    // Trigger 2: sustain re-attack — RMS spike above recent running min
+    // AND armed by a prior release. Catches repeated plucks where sustain
+    // keeps _ndInNote true between plucks (blocking Trigger 1), without
+    // cascading spurious fires on a single note's body-peak resonance.
+    else if (_ndInNote && refractoryOk && _ndReattackArmed
+             && rms > _ND_REATTACK_MIN_LEVEL && _ndReattackRmsBuf.length >= 3) {
         const recentMin = Math.min(..._ndReattackRmsBuf.slice(0, -1));
         if (rms > recentMin * _ND_REATTACK_RATIO) fireOnset = true;
     }
@@ -1749,6 +1771,7 @@ function _ndProcessAudioChunk(input) {
         _ndRawMidiHistory = [];
         _ndStableMidi = -1;
         _ndLastOnsetPerfNow = nowPerfSec;
+        _ndReattackArmed = false; // disarm until next release
         _ndOnsetCount++;
     }
 
