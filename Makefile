@@ -119,9 +119,16 @@ test-detector-bakeoff: check-slopsmith ## YIN vs CREPE side-by-side on the open-
 #   USER_SILENT               — no pitch in the window
 #
 # Flow for a live session:
-#   1) Before clicking play, paste into console:
-#        _ndRecordStartRaw(<seconds>, 'session.wav')
-#   2) Play through the song. Auto-stops at <seconds>, or call _ndRecordStop().
+#   1) Load the song (don't click play yet). Paste into console:
+#        _ndRecordStart(<seconds>, 'session.wav')
+#      Use _ndRecordStart — NOT _ndRecordStartRaw — because _ndRecordStart
+#      waits for the chart clock to advance before anchoring WAV t=0. That
+#      elides the paste-to-click human lag and stores the correct
+#      chartStartTime in the sidecar JSON, which the classifier needs for
+#      per-chart-note alignment. _ndRecordStartRaw anchors at console-paste
+#      time and is only correct when no song is playing.
+#   2) Click play. Play through the song. Auto-stops at <seconds>, or call
+#      _ndRecordStop() earlier.
 #   3) make classify-session SESSION=session  (pulls WAV + dump, runs classifier)
 
 SESSION ?= session
