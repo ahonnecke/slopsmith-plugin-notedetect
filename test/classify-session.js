@@ -39,6 +39,20 @@ function getArg(n, d) { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i
 const WAV_PATH = getArg('wav', 'test/fixtures/mexico-bass-take2.wav');
 const CHART_PATH = getArg('chart', path.join(__dirname, 'fixtures', 'mexico-bass-notes.json'));
 const DUMP_PATH = getArg('dump', null);
+// --chart-from-dump: reconstruct chart notes from the dump's noteResults
+// (each entry's key is "chartT_string_fret"). Use this when the dump's
+// chart doesn't match a stored chart JSON — happens when slopsmith's
+// rendering of the song has different timing than what dump-chart-notes.js
+// captured previously.
+const CHART_FROM_DUMP = args.includes('--chart-from-dump');
+// --auto-align: override the sidecar's chartStartTime by sweeping offsets
+// and picking the one that maximizes audio-chart matches. Required when
+// the WAV was captured with _ndRecordStartRaw (chartStartTime=0) and the
+// true offset depends on user click lag.
+const AUTO_ALIGN = args.includes('--auto-align');
+const AUTO_ALIGN_MIN = parseFloat(getArg('align-min', '-15'));
+const AUTO_ALIGN_MAX = parseFloat(getArg('align-max', '5'));
+const AUTO_ALIGN_STEP = parseFloat(getArg('align-step', '0.25'));
 
 // Analysis parameters. The WINDOW_BEFORE/AFTER mirror the pipeline's
 // asymmetric hit window (early 110 ms, late 220 ms at default tolerance)
@@ -46,11 +60,19 @@ const DUMP_PATH = getArg('dump', null);
 // was early/late.
 const YIN_BUF = 4096;
 const HOP_MS = 25;
-const WINDOW_BEFORE_MS = 150;
-const WINDOW_AFTER_MS = 350;
+// Analysis window — matches the pipeline's asymmetric hit window at the
+// session's timingTolerance (early=tolerance, late=2*tolerance). Widened
+// when a dump supplies the live setting. Defaults cover the most-lenient
+// 300 ms tolerance (early 300, late 600).
+let WINDOW_BEFORE_MS = parseFloat(getArg('window-before-ms', '300'));
+let WINDOW_AFTER_MS = parseFloat(getArg('window-after-ms', '600'));
 const SILENCE_LEVEL = 0.01;       // same as pipeline silence gate
 const MIN_CONFIDENCE = 0.7;       // same as pipeline
 const MIN_EXPECTED_FRAMES = 2;    // need at least this many frames of expected pitch to call it "in the audio"
+// Cents tolerance for "audio contains the expected pitch" — overridden by
+// the dump's pitchTolerance when a dump is provided. Default matches the
+// pipeline default of 50¢.
+const DEFAULT_CENTS_TOLERANCE = parseFloat(getArg('cents-tolerance', '50'));
 
 function readWav(p) {
     const buf = fs.readFileSync(p);
@@ -128,47 +150,143 @@ function analyzeNoteWindow(samples, sampleRate, wavTchart, expectedMidi) {
     };
 }
 
-function classifyNote(audio, pipelineVerdict, chartNote) {
-    // "Audio has expected" — at least N frames detected the expected MIDI.
-    const audioHasExpected = audio.expectedFrames >= MIN_EXPECTED_FRAMES;
+function classifyNote(audio, pipelineVerdict, chartNote, centsTolerance) {
+    // "Audio has expected" — the best (closest-in-cents) frame in the
+    // window was within centsTolerance of the expected MIDI. Cents-based,
+    // not rounded-MIDI-based, so a detection at e.g. -82¢ counts as a
+    // match at 100¢ tolerance even though its rounded MIDI differs.
+    const audioHasExpected = audio.bestCents != null
+        && Math.abs(audio.bestCents) <= centsTolerance;
     const audioHasAnyPitch = audio.pitchedFrames >= MIN_EXPECTED_FRAMES;
 
     if (pipelineVerdict === 'HIT') {
         return audioHasExpected ? 'PIPELINE_HIT' : 'FALSE_POSITIVE';
     }
-    // Pipeline MISS (or no verdict — treat as miss for out-of-pipeline runs).
     if (audioHasExpected) return 'PIPELINE_MISSED_REAL_PLAY';
     if (audioHasAnyPitch) return 'USER_WRONG_PITCH';
     return 'USER_SILENT';
 }
 
+// Dump key format: "chartT_string_fret" — a stringified triple, e.g. "11.918_0_1".
+function parseDumpKey(k) {
+    const m = /^([\d.]+)_(\d+)_(\d+)$/.exec(k);
+    if (!m) return null;
+    return { chartT: parseFloat(m[1]), s: parseInt(m[2], 10), f: parseInt(m[3], 10) };
+}
+
 function loadPipelineVerdicts(dumpPath) {
     if (!dumpPath) return new Map(); // audio-truth mode — every note defaults to MISS
     const dump = JSON.parse(fs.readFileSync(dumpPath, 'utf8'));
-    // noteResults is an array of {key, primary, ...} — key is like "s0/f3@32.17"
     const byChartT = new Map();
     for (const r of dump.noteResults || []) {
-        const m = /@([\d.]+)$/.exec(r.key);
-        if (m) byChartT.set(Math.round(parseFloat(m[1]) * 1000), r.primary || 'HIT');
+        const parsed = parseDumpKey(r.key);
+        if (parsed) byChartT.set(Math.round(parsed.chartT * 1000), r.primary || 'HIT');
     }
     return byChartT;
+}
+
+function chartFromDump(dumpPath) {
+    const dump = JSON.parse(fs.readFileSync(dumpPath, 'utf8'));
+    const notes = [];
+    const seen = new Set();
+    for (const r of dump.noteResults || []) {
+        const parsed = parseDumpKey(r.key);
+        if (!parsed) continue;
+        if (seen.has(r.key)) continue;
+        seen.add(r.key);
+        // expectedMidi is present on the result when the note ever had a pitch
+        // attempt; default to computing from string/fret if absent.
+        notes.push({
+            chartT: parsed.chartT,
+            s: parsed.s,
+            f: parsed.f,
+            midi: r.expectedMidi ?? null,
+        });
+    }
+    notes.sort((a, b) => a.chartT - b.chartT);
+    return notes;
+}
+
+// Audio-truth scoring of a proposed chartStartTime — count chart notes
+// whose audio window contains the expected pitch within `centsTolerance`.
+// Cents-based (not rounded-MIDI) so a detection at e.g. -82¢ still counts
+// when the pipeline's tolerance is 100¢. Used by auto-align.
+function scoreAlignment(samples, sampleRate, chart, chartStartTime, wavDur, centsTolerance) {
+    let matches = 0;
+    for (const cn of chart) {
+        const wavT = cn.chartT - chartStartTime;
+        if (wavT < 0 || wavT >= wavDur) continue;
+        const startSample = Math.floor((wavT + 0.05) * sampleRate);
+        if (startSample + YIN_BUF > samples.length) continue;
+        const level = rms(samples, startSample, YIN_BUF);
+        if (level < SILENCE_LEVEL) continue;
+        const frame = samples.slice(startSample, startSample + YIN_BUF);
+        const r = core.yinDetect(frame, sampleRate);
+        if (r.freq <= 0 || r.confidence < MIN_CONFIDENCE) continue;
+        const fineCents = (69 + 12 * Math.log2(r.freq / 440) - cn.midi) * 100;
+        const octCents = fineCents - 1200;
+        const cents = Math.abs(octCents) < Math.abs(fineCents) ? octCents : fineCents;
+        if (Math.abs(cents) <= centsTolerance) matches++;
+    }
+    return matches;
+}
+
+function autoAlign(samples, sampleRate, chart, wavDur, centsTolerance) {
+    let bestOffset = 0;
+    let bestScore = -1;
+    console.log(`\nAuto-aligning: sweeping chartStartTime from ${AUTO_ALIGN_MIN}s to ${AUTO_ALIGN_MAX}s (step ${AUTO_ALIGN_STEP}s), cents≤${centsTolerance}…`);
+    for (let off = AUTO_ALIGN_MIN; off <= AUTO_ALIGN_MAX; off += AUTO_ALIGN_STEP) {
+        const score = scoreAlignment(samples, sampleRate, chart, off, wavDur, centsTolerance);
+        if (score > bestScore) { bestScore = score; bestOffset = off; }
+    }
+    console.log(`  best chartStartTime=${bestOffset.toFixed(2)}s with ${bestScore} audio-chart matches`);
+    return bestOffset;
 }
 
 function main() {
     const wav = readWav(WAV_PATH);
     const meta = readSidecar(WAV_PATH);
-    const chartStart = meta.chartStartTime;
     const wavDur = wav.samples.length / wav.sampleRate;
-    const chart = JSON.parse(fs.readFileSync(CHART_PATH, 'utf8'));
+    const hasDump = DUMP_PATH != null;
+
+    // Chart source: dump (per-session truth) or stored JSON file.
+    const chart = CHART_FROM_DUMP && DUMP_PATH
+        ? chartFromDump(DUMP_PATH)
+        : JSON.parse(fs.readFileSync(CHART_PATH, 'utf8'));
+    const chartSource = CHART_FROM_DUMP && DUMP_PATH ? `dump (${DUMP_PATH})` : CHART_PATH;
+
+    // Cents tolerance + window: prefer the dump's live settings so classifier
+    // judges "audio has expected" with the SAME thresholds the pipeline
+    // used to call HITs live. Falls back to defaults / explicit flags.
+    let centsTolerance = DEFAULT_CENTS_TOLERANCE;
+    if (hasDump) {
+        try {
+            const dump = JSON.parse(fs.readFileSync(DUMP_PATH, 'utf8'));
+            if (dump.settings?.pitchTolerance) centsTolerance = dump.settings.pitchTolerance;
+            if (dump.settings?.timingTolerance != null) {
+                // Pipeline uses early=timingTolerance, late=2*timingTolerance.
+                // Override only if user didn't explicitly set --window-*.
+                if (!args.includes('--window-before-ms')) WINDOW_BEFORE_MS = dump.settings.timingTolerance * 1000;
+                if (!args.includes('--window-after-ms'))  WINDOW_AFTER_MS = dump.settings.timingTolerance * 2 * 1000;
+            }
+        } catch { /* ignore */ }
+    }
+
+    // chartStartTime: sidecar value, or auto-aligned if requested.
+    const chartStart = AUTO_ALIGN
+        ? autoAlign(wav.samples, wav.sampleRate, chart, wavDur, centsTolerance)
+        : meta.chartStartTime;
+
     const inWindow = chart.filter(n => n.chartT >= chartStart && n.chartT <= chartStart + wavDur);
 
     const verdicts = loadPipelineVerdicts(DUMP_PATH);
-    const hasDump = DUMP_PATH != null;
 
-    console.log(`WAV:    ${WAV_PATH}  (${wavDur.toFixed(1)}s at ${wav.sampleRate}Hz)`);
-    console.log(`Chart:  ${CHART_PATH}  — ${inWindow.length} notes in window [${chartStart}..${(chartStart + wavDur).toFixed(1)}]s`);
-    console.log(`Dump:   ${hasDump ? DUMP_PATH : '(none — audio-truth mode; pipeline verdict assumed MISS)'}`);
-    console.log(`Params: yin=${YIN_BUF}, hop=${HOP_MS}ms, window=${-WINDOW_BEFORE_MS}..+${WINDOW_AFTER_MS}ms, min-expected-frames=${MIN_EXPECTED_FRAMES}`);
+    console.log(`WAV:          ${WAV_PATH}  (${wavDur.toFixed(1)}s at ${wav.sampleRate}Hz)`);
+    console.log(`Chart source: ${chartSource}  (${chart.length} total, ${inWindow.length} in window)`);
+    console.log(`chartStartTime: ${chartStart.toFixed(3)}s  ${AUTO_ALIGN ? '(auto-aligned)' : '(from sidecar)'}`);
+    console.log(`Dump:         ${hasDump ? DUMP_PATH : '(none — audio-truth mode; pipeline verdict assumed MISS)'}`);
+    console.log(`Cents tol:    ±${centsTolerance}¢  ${hasDump ? '(from dump settings.pitchTolerance)' : '(default)'}`);
+    console.log(`Params: yin=${YIN_BUF}, hop=${HOP_MS}ms, window=${-WINDOW_BEFORE_MS}..+${WINDOW_AFTER_MS}ms`);
     console.log();
 
     const classifications = [];
@@ -180,7 +298,7 @@ function main() {
         const audio = analyzeNoteWindow(wav.samples, wav.sampleRate, wavTchart, cn.midi);
         const verdictKey = Math.round(cn.chartT * 1000);
         const pipelineVerdict = verdicts.get(verdictKey) || 'MISS';
-        const category = classifyNote(audio, pipelineVerdict, cn);
+        const category = classifyNote(audio, pipelineVerdict, cn, centsTolerance);
 
         classifications.push({ cn, audio, pipelineVerdict, category });
 
