@@ -2869,8 +2869,22 @@ function _ndMatchNotes(tOverride) {
 
     if (pitchPassing.length === 0) return;
 
-    pitchPassing.sort((a, b) => Math.abs(a.timingError) - Math.abs(b.timingError));
-    const winner = pitchPassing[0];
+    // Two-tier selection: prefer exact-pitch candidates over boundary-pitch
+    // ones regardless of timing, then pick nearest-in-time within the tier.
+    //
+    // Without this, a single detection can get pulled to a neighbour chart
+    // note whose expected pitch is right at the tolerance boundary (e.g.
+    // MIDI 30 accepting a MIDI 31 detection at +100¢) instead of a
+    // same-pitch chart note slightly further away in time. Observed on the
+    // Level session: chart 129.360 (MIDI 31, exact match) was stolen by
+    // chart 129.764 (MIDI 30, +100¢ boundary match) because the latter was
+    // 60 ms timing-closer. Tiering fixes this cleanly without widening or
+    // narrowing any tolerance.
+    const EXACT_PITCH_CENTS = 25;
+    const exactPitch = pitchPassing.filter(p => Math.abs(p.pitchError) < EXACT_PITCH_CENTS);
+    const pool = exactPitch.length > 0 ? exactPitch : pitchPassing;
+    pool.sort((a, b) => Math.abs(a.timingError) - Math.abs(b.timingError));
+    const winner = pool[0];
     const { cn, key, expectedMidi, pitchError, timingError } = winner;
 
     const labels = [];
