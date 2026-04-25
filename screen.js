@@ -1,160 +1,381 @@
 // Note Detection plugin
+// Captures guitar audio, detects pitch via CREPE or YIN, scores against highway notes.
 //
-// Factory pattern — `createNoteDetector(options)` returns an independent
-// detector instance with its own audio pipeline, scoring, HUD, timers,
-// draw hook, and DOM subtree. A default singleton (`window.noteDetect`)
-// is created on load for the standard single-panel case; additional
-// instances can be constructed via `window.createNoteDetector(...)` by
-// plugins like splitscreen that need per-panel detection.
+// Also publishes window.slopsmith.notes — a shared detection bus that other
+// plugins (flashcard, mute-trainer, scales, …) subscribe to instead of opening
+// their own mic. See the NotesBus IIFE immediately below; the legacy scoring
+// pipeline that follows runs independently and is unchanged.
+
+// ── window.slopsmith.notes — shared detection bus ──────────────────────────
 //
-// Originally proposed by topkoa in PR #2 on this repo; this takeover
-// re-applies the factory design on top of 5-string-bass (#14),
-// per-note hit/miss events (#12), CI (#13), and HPS (#15) which all
-// landed after his branch diverged. Co-Authored-By: topkoa.
+// Public API (attached on plugin script load, before any consumer needs it):
 //
-// ── What this revision adds and why ───────────────────────────────────────
+//   await window.slopsmith.notes.start({ deviceId? })   // refcounted
+//   window.slopsmith.notes.stop()                       // refcounted
+//   window.slopsmith.notes.isActive() → bool
+//   window.slopsmith.notes.current() → { stableMidi, level, lastSilenceAt, lastTransientAt }
+//   const unsub = window.slopsmith.notes.on(eventName, cb)   // returns unsubscribe
 //
-// BACKGROUND: WHY CHORD DETECTION NEEDED A DIFFERENT APPROACH
+// Events:
+//   'frame'     ~50ms cadence: { midi, conf, level, timeMs } (midi = -1 if not locked)
+//   'note'      stable-MIDI change: { midi, name, octave, conf, cents, timeMs, string, fret }
+//   'silence'   RMS < gate sustained ≥ 80 ms: { durationMs, timeMs }
+//   'transient' RMS attack from silence with no fundamental: { peakLevel, timeMs }
 //
-// YIN, HPS, and CREPE are all monophonic pitch detectors — they return one
-// frequency from the full mixed signal. That works well for single notes, but
-// a guitar chord produces 2–6 simultaneous fundamentals plus their harmonics
-// all overlapping in the spectrum. The detectors lock onto whichever string
-// is loudest (usually the lowest) and score the whole chord against that one
-// pitch, silently missing every other note. This revision adds a parallel
-// detection path for chords that avoids the problem entirely.
-//
-// The core insight (from a design brief accompanying this change): instead of
-// asking "what pitch is playing?" — which is hard for chords — ask "is there
-// energy near the frequency I *expect* on string S right now?" That is a much
-// simpler question. Because the arrangement XML already tells us exactly which
-// string plays which fret at every moment, we can compute the expected
-// frequency per string and check for it independently in that string's
-// frequency band. This turns one hard polyphonic detection problem into N easy
-// monophonic band-energy checks, one per string.
-//
-// The existing YIN/HPS/CREPE path is left completely intact for single notes,
-// where it already works well. The constraint path is additive: it activates
-// only when the chart has ≥2 simultaneous notes in the timing window.
-//
-// ── CHANGE 1: 8-string guitar tuning ─────────────────────────────────────
-//
-// _ND_TUNING_GUITAR_8 added: [30, 35, 40, 45, 50, 55, 59, 64]
-// That is F#1 B1 E2 A2 D3 G3 B3 E4 — standard Ibanez/Schecter 8-string
-// tuning, a perfect fourth below the 7-string low B.
-//
-// _ndStandardMidiFor() now branches on stringCount === 8 before the existing
-// 7-string check. Every downstream function — MIDI mapping, display labels,
-// and the new constraint band calculator — derives from this table, so no
-// other callsites required changes.
-//
-// ── CHANGE 2: Dynamic string-count sizing (prerequisite for changes 1 & 3) ─
-//
-// Previously, `tuningOffsets` was initialised as a hardcoded 6-element array
-// and never resized. Every call that passed `tuningOffsets.length` as the
-// stringCount argument to mapping helpers was therefore always passing 6,
-// regardless of what instrument was actually loaded. This silently produced
-// wrong frequency bands for 5-string bass, 7-string guitar, and would have
-// been completely broken for 8-string guitar.
-//
-// Fix: a new `currentStringCount` variable is set at enable() time from
-// `hw.getSongInfo().tuning.length` — the authoritative source. All three
-// call sites that were passing `tuningOffsets.length` into mapping helpers
-// now use `currentStringCount` instead. This was a prerequisite for both
-// 8-string support and for the constraint checker computing correct frequency
-// bands on non-6-string instruments.
-//
-// ── CHANGE 3: Constraint-based chord detection ────────────────────────────
-//
-// Three new module-level functions (after _ndHpsDetect, before _ndLoadCrepe):
-//
-//   _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo)
-//     Returns [loHz, hiHz] for a given string covering frets 0–24, with ±10%
-//     headroom for tuning offsets, capo, and bent notes. Derived from the
-//     tuning tables rather than hardcoded, so all instrument types are covered.
-//
-//   _ndBandEnergy(magnitudes, binHz, loHz, hiHz)
-//     Measures the fraction of total spectrum energy (0..1) that falls in a
-//     frequency band, operating on the magnitude spectrum from _ndFftMagnitude.
-//     NOTE: reuses the module-level FFT scratch buffers (_ndFftInterleavedScratch,
-//     _ndFftMagnitudesScratch). This is safe because the FFT is synchronous and
-//     JS is single-threaded — see the existing comment on those buffers. If this
-//     code is ever moved to an AudioWorklet or Web Worker, per-call scratch
-//     buffers would be needed instead.
-//
-//   _ndConstraintCheckString(buffer, sampleRate, stringIdx, fret, ...)
-//     The core per-string check. Calls _ndFftMagnitude once (which reuses the
-//     scratch), measures band energy for this string's frequency range, and
-//     optionally verifies that the dominant bin in the band is within
-//     pitchCheckCents of the expected frequency. Returns { hit, bandEnergy,
-//     centsDiff }. energyThreshold and pitchCheckCents are caller-adjustable
-//     to support technique-specific loosening (see change 4).
-//
-//   _ndScoreChord(buffer, sampleRate, chordNotes, ..., minHitRatio)
-//     Runs _ndConstraintCheckString for each note in a chord group, applies
-//     per-technique threshold adjustments (see change 4), and returns
-//     { score, hitStrings, totalStrings, results, isHit } where isHit is
-//     true if score >= minHitRatio.
-//
-// ROUTING IN matchNotes():
-//   Candidate notes (from the chart's timing window) are now bucketed by
-//   timestamp. A bucket with 1 note goes through the existing MIDI comparison
-//   against the YIN/HPS/CREPE result, unchanged. A bucket with ≥2 notes runs
-//   polyphonic chord scoring. The browser path calls _ndScoreChord on the
-//   accumulated `pendingBuffer` (same audio just analysed for pitch). The
-//   slopsmith-desktop bridge path dispatches the chord context over the
-//   `audio:scoreChord` IPC, where the native JUCE ChordScorer reads from
-//   the engine's own input ring — no audio buffer crosses IPC. Both paths
-//   return the same { score, hitStrings, totalStrings, isHit, results[] }
-//   shape. Each string's individual result is stored in noteResults so the
-//   draw overlay can colour fret gems per-note. The chord hit/miss is
-//   counted as a single judgment and fires a notedetect:hit event with
-//   { chord: true, hitStrings, totalStrings, score } instead of the usual
-//   { note, expectedMidi }.
-//
-// ── CHANGE 4: Technique-aware thresholds ─────────────────────────────────
-//
-// The arrangement XML includes technique flags on individual notes. _ndScoreChord
-// reads these from the chord note objects and adjusts thresholds before calling
-// _ndConstraintCheckString:
-//
-//   ho / po (hammer-on / pull-off)
-//     No fresh pick attack, so string energy will be lower than a picked note.
-//     energyThreshold is halved from 0.03 to 0.015.
-//
-//   b / sl (bend / slide)
-//     Pitch is moving continuously during the note. pitchCheckCents is widened
-//     to at least 100 cents (a semitone) so a note mid-bend still registers.
-//
-//   hm (harmonic)
-//     The fundamental is suppressed; the audible pitch is at 2x or 1.5x the
-//     fret frequency. Pitch checking against the fundamental is unreliable, so
-//     pitchCheckCents is set to 0 (energy-only check). A proper harmonic
-//     frequency check (checking at 2x/1.5x) is a known TODO — see the comment
-//     inside _ndScoreChord.
-//
-// ── CHANGE 5: chordHitRatio setting ──────────────────────────────────────
-//
-// The fraction of a chord's strings that must register energy to count as a
-// hit. Default 0.6 (60% — e.g. 4 of 6 strings for a full barre chord). Lower
-// values suit beginners or players using lighter touches on inner strings;
-// higher values enforce stricter accuracy.
-//
-// Exposed in the settings panel as "Chord Leniency" (slider: 25–100%).
-// Persisted in localStorage under the existing _ND_STORAGE_KEY alongside all
-// other settings. Loaded and clamped to [0.25, 1] on construction so a stale
-// persisted value can't put scoring in a state the slider can't represent.
-//
-// ── CHANGE 6: HUD chord display ──────────────────────────────────────────
-//
-// The cyan detected-note line in the HUD (`.nd-hud-detected`) previously only
-// showed output when a confident single-note detection existed. It now also
-// shows the most recent chord constraint result when no single note is detected,
-// e.g. "chord 4/6 (66%)". This gives the player real-time visibility into
-// whether the constraint scorer is seeing their strings ring, which is useful
-// for diagnosing audio input issues and tuning the Chord Leniency setting.
-// lastChordScore / lastChordHit / lastChordTotal are reset with the rest of
-// scoring state in resetScoring().
+// Constants below match notedetect's production-calibrated defaults
+// (3-of-3 stability, 0.005 silence gate). See calibration history at
+// docs/ROCKSMITH_TIMING_MODEL.md.
+(function _slopsmithNotesBus() {
+    'use strict';
+    if (typeof window === 'undefined') return;
+    if (window.slopsmith && window.slopsmith.notes) return;
+    if (!window.slopsmith) {
+        // Host app.js initializes window.slopsmith before plugins load. If this
+        // plugin somehow runs first (or in a test harness), give consumers a
+        // place to attach without crashing — host's later EventTarget mixin
+        // will overwrite this stub but keep the .notes property by reference.
+        window.slopsmith = {};
+    }
+
+    const NB_FRAME_SIZE = 2048;
+    const NB_MIN_YIN_SAMPLES = 4096;
+    const NB_CONFIDENCE_THRESHOLD = 0.7;
+    const NB_SILENCE_GATE = 0.005;     // matches notedetect production
+    const NB_SILENCE_HOLD_MS = 80;
+    const NB_STABILITY_WINDOW = 3;     // matches notedetect production
+    const NB_STABILITY_REQUIRED = 2;
+    const NB_YIN_THRESHOLD = 0.15;
+    const NB_MIN_FREQ = 30;
+    const NB_MAX_FREQ = 1500;
+    const NB_TRANSIENT_GATE = 0.05;
+    const NB_TRANSIENT_DEBOUNCE_MS = 100;
+    const NB_NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    const NB_GUITAR_OPEN = [40, 45, 50, 55, 59, 64]; // E2 A2 D3 G3 B3 E4
+    const NB_BASS_OPEN = [28, 33, 38, 43];           // E1 A1 D2 G2
+
+    // Audio + detection state
+    let nbAudioCtx = null;
+    let nbStream = null;
+    let nbProcessor = null;
+    let nbAnalyser = null;
+    let nbAccumBuffer = new Float32Array(0);
+    let nbPendingBuffer = null;
+    let nbDetectInterval = null;
+    let nbLevelRaf = null;
+    let nbInputLevel = 0;
+    let nbPrevLevel = 0;
+    let nbRawMidiHistory = [];
+    let nbStableMidi = -1;
+    let nbPrevStableMidi = -1;
+    let nbInSilence = false;
+    let nbSilenceStartT = 0;
+    let nbLastSilenceAt = 0;
+    let nbLastTransientAt = 0;
+    let nbStarters = 0; // refcount across consumers
+
+    const nbTarget = new EventTarget();
+    function nbEmit(name, detail) {
+        nbTarget.dispatchEvent(new CustomEvent(name, { detail }));
+    }
+
+    function nbFreqToMidi(f) {
+        return 12 * Math.log2(f / 440) + 69;
+    }
+
+    function nbMidiToName(m) {
+        return NB_NOTE_NAMES[((m % 12) + 12) % 12];
+    }
+
+    // YIN — same algorithm as flashcard/notedetect; kept self-contained so the
+    // bus has zero coupling to the legacy notedetect pipeline below.
+    function nbYinDetect(buffer, sampleRate) {
+        const halfLen = Math.floor(buffer.length / 2);
+        const yinBuffer = new Float32Array(halfLen);
+        let runningSum = 0;
+        yinBuffer[0] = 1;
+        for (let tau = 1; tau < halfLen; tau++) {
+            let sum = 0;
+            for (let i = 0; i < halfLen; i++) {
+                const delta = buffer[i] - buffer[i + tau];
+                sum += delta * delta;
+            }
+            yinBuffer[tau] = sum;
+            runningSum += sum;
+            yinBuffer[tau] *= tau / runningSum;
+        }
+        let tau = 2;
+        while (tau < halfLen) {
+            if (yinBuffer[tau] < NB_YIN_THRESHOLD) {
+                while (tau + 1 < halfLen && yinBuffer[tau + 1] < yinBuffer[tau]) tau++;
+                break;
+            }
+            tau++;
+        }
+        if (tau === halfLen) return { freq: -1, confidence: 0 };
+        const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
+        const s1 = yinBuffer[tau];
+        const s2 = tau + 1 < halfLen ? yinBuffer[tau + 1] : yinBuffer[tau];
+        const betterTau = tau + (s0 - s2) / (2 * (s0 - 2 * s1 + s2));
+        return {
+            freq: sampleRate / betterTau,
+            confidence: Math.max(0, 1 - yinBuffer[tau]),
+        };
+    }
+
+    // Tuning lookup from highway. Falls back to bass standard since this
+    // hardware is bass-primary (per calibration_reference). When highway has
+    // no song loaded, string/fret will be derived against bass tuning — still
+    // useful for free-play games like flashcard.
+    function nbTuningOpenMidis() {
+        try {
+            const info = window.highway && typeof window.highway.getSongInfo === 'function'
+                ? window.highway.getSongInfo()
+                : null;
+            if (info && Array.isArray(info.tuning)) {
+                const offsets = info.tuning;
+                const capo = info.capo || 0;
+                const arrName = (info.arrangement || '').toLowerCase();
+                const isBass = arrName.includes('bass') || offsets.length === 4;
+                const base = isBass ? NB_BASS_OPEN : NB_GUITAR_OPEN;
+                return base.map((m, i) => m + (offsets[i] || 0) + capo);
+            }
+        } catch (e) { /* fall through */ }
+        return NB_BASS_OPEN;
+    }
+
+    function nbMidiToFretboard(midi) {
+        const tuning = nbTuningOpenMidis();
+        const positions = [];
+        for (let s = 0; s < tuning.length; s++) {
+            const fret = midi - tuning[s];
+            if (fret >= 0 && fret <= 24) positions.push({ string: s, fret });
+        }
+        positions.sort((a, b) => a.fret - b.fret);
+        return positions[0] || { string: -1, fret: -1 };
+    }
+
+    async function nbStartAudio(opts) {
+        if (nbAudioCtx) return;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error('Microphone access not available (use Chrome/Edge with HTTPS or localhost).');
+        }
+        const constraints = {
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+            },
+        };
+        if (opts && opts.deviceId) {
+            constraints.audio.deviceId = { exact: opts.deviceId };
+        } else {
+            // Reuse notedetect's persisted device choice if present, so the bus
+            // and notedetect's own scoring screen pick the same instrument
+            // input rather than landing on the default mic.
+            try {
+                const raw = localStorage.getItem('slopsmith_notedetect');
+                if (raw) {
+                    const s = JSON.parse(raw);
+                    if (s && s.deviceId) constraints.audio.deviceId = { exact: s.deviceId };
+                }
+            } catch (e) { /* malformed settings — fall through to default device */ }
+        }
+
+        nbStream = await navigator.mediaDevices.getUserMedia(constraints);
+        nbAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = nbAudioCtx.createMediaStreamSource(nbStream);
+
+        nbAnalyser = nbAudioCtx.createAnalyser();
+        nbAnalyser.fftSize = 512;
+        nbAnalyser.smoothingTimeConstant = 0.8;
+        source.connect(nbAnalyser);
+
+        nbProcessor = nbAudioCtx.createScriptProcessor(NB_FRAME_SIZE, 1, 1);
+        nbAccumBuffer = new Float32Array(0);
+        nbPendingBuffer = null;
+        nbProcessor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            const prev = nbAccumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= NB_MIN_YIN_SAMPLES) {
+                const start = combined.length - NB_MIN_YIN_SAMPLES;
+                nbPendingBuffer = combined.slice(start, start + NB_MIN_YIN_SAMPLES);
+                nbAccumBuffer = new Float32Array(0);
+            } else {
+                nbAccumBuffer = combined;
+            }
+        };
+        source.connect(nbProcessor);
+        nbProcessor.connect(nbAudioCtx.destination);
+
+        nbDetectInterval = setInterval(() => {
+            if (nbPendingBuffer) {
+                const buf = nbPendingBuffer;
+                nbPendingBuffer = null;
+                nbProcessFrame(buf);
+            }
+        }, 50);
+
+        const tickLevel = () => {
+            if (!nbAnalyser) return;
+            const buf = new Float32Array(nbAnalyser.fftSize);
+            nbAnalyser.getFloatTimeDomainData(buf);
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            nbPrevLevel = nbInputLevel;
+            nbInputLevel = Math.min(1, Math.sqrt(sum / buf.length) * 5);
+            nbLevelRaf = requestAnimationFrame(tickLevel);
+        };
+        nbLevelRaf = requestAnimationFrame(tickLevel);
+    }
+
+    function nbStopAudio() {
+        if (nbDetectInterval) { clearInterval(nbDetectInterval); nbDetectInterval = null; }
+        if (nbLevelRaf) { cancelAnimationFrame(nbLevelRaf); nbLevelRaf = null; }
+        nbPendingBuffer = null;
+        if (nbProcessor) {
+            try { nbProcessor.disconnect(); } catch (e) {}
+            nbProcessor = null;
+        }
+        nbAnalyser = null;
+        if (nbStream) {
+            nbStream.getTracks().forEach((t) => t.stop());
+            nbStream = null;
+        }
+        if (nbAudioCtx) {
+            try { nbAudioCtx.close(); } catch (e) {}
+            nbAudioCtx = null;
+        }
+        nbInputLevel = 0;
+        nbPrevLevel = 0;
+        nbAccumBuffer = new Float32Array(0);
+        nbRawMidiHistory = [];
+        nbStableMidi = -1;
+        nbPrevStableMidi = -1;
+        nbInSilence = false;
+    }
+
+    function nbProcessFrame(buffer) {
+        const sr = nbAudioCtx ? nbAudioCtx.sampleRate : 48000;
+        const result = nbYinDetect(buffer, sr);
+        const now = performance.now();
+        const level = nbInputLevel;
+
+        // Silence handling — emit once per silence span (after hold), reset
+        // stability so old votes don't reignite when sound returns.
+        if (level < NB_SILENCE_GATE) {
+            if (!nbInSilence) {
+                nbSilenceStartT = now;
+                nbInSilence = true;
+            }
+            const dur = now - nbSilenceStartT;
+            if (dur >= NB_SILENCE_HOLD_MS && nbLastSilenceAt < nbSilenceStartT) {
+                nbLastSilenceAt = now;
+                nbEmit('silence', { durationMs: dur, timeMs: now });
+            }
+            if (nbRawMidiHistory.length) { nbRawMidiHistory = []; nbStableMidi = -1; }
+            // Frame event with no detection
+            nbEmit('frame', { midi: -1, conf: 0, level, timeMs: now });
+            return;
+        }
+        if (nbInSilence) nbInSilence = false;
+
+        // Transient: spike from sub-gate to TRANSIENT_GATE with no fundamental
+        const noFund = result.freq <= 0
+            || result.confidence < NB_CONFIDENCE_THRESHOLD
+            || result.freq < NB_MIN_FREQ
+            || result.freq > NB_MAX_FREQ;
+        if (nbPrevLevel < NB_SILENCE_GATE
+            && level > NB_TRANSIENT_GATE
+            && noFund
+            && (now - nbLastTransientAt) > NB_TRANSIENT_DEBOUNCE_MS) {
+            nbLastTransientAt = now;
+            nbEmit('transient', { peakLevel: level, timeMs: now });
+        }
+
+        const detectedMidi = noFund ? -1 : nbFreqToMidi(result.freq);
+
+        // Stability voting
+        if (detectedMidi >= 0) {
+            const rounded = Math.round(detectedMidi);
+            nbRawMidiHistory.push(rounded);
+            if (nbRawMidiHistory.length > NB_STABILITY_WINDOW) nbRawMidiHistory.shift();
+            const votes = new Map();
+            for (const m of nbRawMidiHistory) votes.set(m, (votes.get(m) || 0) + 1);
+            let winner = -1;
+            let winnerCount = 0;
+            for (const [m, c] of votes) {
+                if (c > winnerCount) { winner = m; winnerCount = c; }
+            }
+            nbStableMidi = winnerCount >= NB_STABILITY_REQUIRED ? winner : -1;
+        } else {
+            nbStableMidi = -1;
+        }
+
+        nbEmit('frame', {
+            midi: detectedMidi >= 0 ? Math.round(detectedMidi) : -1,
+            conf: result.confidence,
+            level,
+            timeMs: now,
+        });
+
+        if (nbStableMidi >= 0 && nbStableMidi !== nbPrevStableMidi) {
+            const pos = nbMidiToFretboard(nbStableMidi);
+            const expectedFreq = 440 * Math.pow(2, (nbStableMidi - 69) / 12);
+            const cents = result.freq > 0 ? 1200 * Math.log2(result.freq / expectedFreq) : 0;
+            nbEmit('note', {
+                midi: nbStableMidi,
+                name: nbMidiToName(nbStableMidi),
+                octave: Math.floor(nbStableMidi / 12) - 1,
+                conf: result.confidence,
+                cents,
+                timeMs: now,
+                string: pos.string,
+                fret: pos.fret,
+            });
+            nbPrevStableMidi = nbStableMidi;
+        } else if (nbStableMidi < 0) {
+            nbPrevStableMidi = -1;
+        }
+    }
+
+    const api = {
+        async start(opts) {
+            nbStarters++;
+            if (nbStarters === 1) {
+                try {
+                    await nbStartAudio(opts || {});
+                } catch (e) {
+                    nbStarters = 0;
+                    throw e;
+                }
+            }
+        },
+        stop() {
+            if (nbStarters === 0) return;
+            nbStarters--;
+            if (nbStarters === 0) nbStopAudio();
+        },
+        isActive() { return nbStarters > 0 && !!nbAudioCtx; },
+        current() {
+            return {
+                stableMidi: nbStableMidi,
+                level: nbInputLevel,
+                lastSilenceAt: nbLastSilenceAt,
+                lastTransientAt: nbLastTransientAt,
+            };
+        },
+        on(eventName, cb) {
+            const handler = (e) => cb(e.detail);
+            nbTarget.addEventListener(eventName, handler);
+            return () => nbTarget.removeEventListener(eventName, handler);
+        },
+    };
+
+    window.slopsmith.notes = api;
+})();
 
 // ── Module-level shared state ──────────────────────────────────────────────
 

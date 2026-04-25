@@ -26,5 +26,8 @@ services:
     volumes:
       - ${PLUGIN_DIR:?set PLUGIN_DIR to this plugin repo root}:/opt/user-plugins/note_detect:ro
       - ${FLASHCARD_DIR:-/home/ahonnecke/src/slopsmith-plugin-flashcard}:/opt/user-plugins/note_flashcard:ro
+      - ${GAMEKIT_DIR:-/home/ahonnecke/src/slopsmith-plugin-gamekit}:/opt/user-plugins/gamekit:ro
+      - ${MUTE_TRAINER_DIR:-/home/ahonnecke/src/slopsmith-plugin-mute-trainer}:/opt/user-plugins/mute_trainer:ro
+      - ${SCALES_DIR:-/home/ahonnecke/src/slopsmith-plugin-scales}:/opt/user-plugins/scales:ro
     environment:
       - SLOPSMITH_PLUGINS_DIR=/opt/user-plugins
