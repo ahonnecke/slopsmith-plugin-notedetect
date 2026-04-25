@@ -160,19 +160,23 @@ function aggregate(plays) {
 
 function statsForRow(row) {
     const inScope = row.verdicts.filter(v => v.kind !== 'OUT_OF_SCOPE');
-    const hits = inScope.filter(v => v.kind === 'HIT').length;
+    const cleanHits = inScope.filter(v => v.kind === 'HIT').length;
+    const dirtyHits = inScope.filter(v => v.kind === 'DIRTY_HIT').length;
+    const hits = cleanHits + dirtyHits; // any-hit (right pitch was played)
     const wrongPitch = inScope.filter(v => v.kind === 'MISSED_WRONG_PITCH').length;
     const noDetection = inScope.filter(v => v.kind === 'MISSED_NO_DETECTION').length;
     const absent = inScope.filter(v => v.kind === 'ABSENT').length;
     return {
         nAttempts: inScope.length,
-        hits, wrongPitch, noDetection, absent,
+        hits, cleanHits, dirtyHits, wrongPitch, noDetection, absent,
         hitRate: inScope.length ? hits / inScope.length : 0,
+        cleanRate: inScope.length ? cleanHits / inScope.length : 0,
     };
 }
 
 function verdictGlyph(v) {
     if (v.kind === 'HIT') return '✓';
+    if (v.kind === 'DIRTY_HIT') return '⚠';            // right note, but string-hygiene leak
     if (v.kind === 'MISSED_WRONG_PITCH') return '✗';  // wrong pitch detected
     if (v.kind === 'MISSED_NO_DETECTION') return '∅'; // no detection
     if (v.kind === 'ABSENT') return '·';              // not in snapshot
@@ -295,23 +299,27 @@ function suggestLoops(rows, opts = {}) {
 function summarize(playMeta, rows) {
     const N = playMeta.length;
     const totalNotes = rows.length;
-    let bestOfN = 0;          // notes hit on ≥1 attempt
-    let perfectAcrossN = 0;   // notes hit on EVERY attempt
-    let neverHit = 0;         // notes hit on 0 attempts
-    const consistencyBins = new Map(); // hitRate (rounded to 0.1) → count
+    let bestOfN = 0;          // notes hit on ≥1 attempt (clean OR dirty)
+    let perfectAcrossN = 0;   // notes hit on EVERY attempt (clean OR dirty)
+    let cleanAcrossN = 0;     // notes hit CLEAN on every attempt
+    let neverHit = 0;
+    let totalDirtyHits = 0;
+    const consistencyBins = new Map();
     for (const row of rows) {
         const s = statsForRow(row);
         if (s.hits > 0) bestOfN++;
         if (s.hits === s.nAttempts && s.nAttempts === N) perfectAcrossN++;
+        if (s.cleanHits === s.nAttempts && s.nAttempts === N) cleanAcrossN++;
         if (s.hits === 0) neverHit++;
+        totalDirtyHits += s.dirtyHits;
         const bin = Math.round(s.hitRate * 10) / 10;
         consistencyBins.set(bin, (consistencyBins.get(bin) || 0) + 1);
     }
-    return { N, totalNotes, bestOfN, perfectAcrossN, neverHit, consistencyBins };
+    return { N, totalNotes, bestOfN, perfectAcrossN, cleanAcrossN, neverHit, totalDirtyHits, consistencyBins };
 }
 
 function renderTerminal(playMeta, rows) {
-    const { N, totalNotes, bestOfN, perfectAcrossN, neverHit, consistencyBins } = summarize(playMeta, rows);
+    const { N, totalNotes, bestOfN, perfectAcrossN, cleanAcrossN, neverHit, totalDirtyHits, consistencyBins } = summarize(playMeta, rows);
     console.log();
     console.log(`═══ Loop aggregate: ${playMeta.length} attempts, ${totalNotes} unique chart notes ═══`);
     for (const m of playMeta) {
@@ -320,9 +328,13 @@ function renderTerminal(playMeta, rows) {
     }
     console.log();
     console.log(`── Score across attempts ──`);
-    console.log(`  Best-of-${N}:        ${bestOfN}/${totalNotes} (${(bestOfN / totalNotes * 100).toFixed(1)}%) hit at least once`);
-    console.log(`  Perfect-across-${N}: ${perfectAcrossN}/${totalNotes} (${(perfectAcrossN / totalNotes * 100).toFixed(1)}%) hit on every attempt`);
-    console.log(`  Never-hit:        ${neverHit}/${totalNotes} (${(neverHit / totalNotes * 100).toFixed(1)}%) missed on every attempt`);
+    console.log(`  Best-of-${N}:         ${bestOfN}/${totalNotes} (${(bestOfN / totalNotes * 100).toFixed(1)}%) hit at least once (clean or dirty)`);
+    console.log(`  Perfect-across-${N}:  ${perfectAcrossN}/${totalNotes} (${(perfectAcrossN / totalNotes * 100).toFixed(1)}%) hit on every attempt`);
+    console.log(`  Clean-across-${N}:    ${cleanAcrossN}/${totalNotes} (${(cleanAcrossN / totalNotes * 100).toFixed(1)}%) clean every attempt (no dirty hits)`);
+    console.log(`  Never-hit:         ${neverHit}/${totalNotes} (${(neverHit / totalNotes * 100).toFixed(1)}%) missed on every attempt`);
+    if (totalDirtyHits > 0) {
+        console.log(`  Dirty hits total:  ${totalDirtyHits} (right pitch played, but ≥${(0.5 * 100).toFixed(0)}% off-target frames in window)`);
+    }
     console.log();
     console.log(`── Consistency histogram (notes by hit-rate) ──`);
     const sortedBins = [...consistencyBins.entries()].sort((a, b) => a[0] - b[0]);
@@ -345,7 +357,7 @@ function renderTerminal(playMeta, rows) {
         console.log(`  ${row.chartT.toFixed(2).padStart(7)}s  ${String(row.expectedMidi).padStart(3)}  ${row.stringFret.padEnd(5)} ${glyphs}   ${tag}`);
     }
     console.log();
-    console.log('  ✓ HIT  ✗ wrong pitch  ∅ no detection  · absent (snapshot may have closed early)  ⎵ out of scope');
+    console.log('  ✓ clean HIT  ⚠ dirty HIT (right note, string-hygiene leak)  ✗ wrong pitch  ∅ no detection  · absent  ⎵ out of scope');
     console.log();
 
     const offenders = rows
@@ -446,7 +458,7 @@ function renderMarkdown(songId, playMeta, rows) {
     lines.push('');
 
     lines.push(`## Per-note attempt matrix\n`);
-    lines.push(`Glyphs: \`✓\` HIT, \`✗\` wrong pitch, \`∅\` no detection, \`·\` absent (snapshot may have closed early), \`⎵\` out of scope.\n`);
+    lines.push(`Glyphs: \`✓\` clean HIT, \`⚠\` dirty HIT (right note, string-hygiene leak), \`✗\` wrong pitch, \`∅\` no detection, \`·\` absent (snapshot may have closed early), \`⎵\` out of scope.\n`);
     lines.push('```');
     lines.push('  chartT  exp  s/f    ' + Array.from({ length: N }, (_, i) => String(i + 1)).join('') + '   hits');
     for (const row of rows) {

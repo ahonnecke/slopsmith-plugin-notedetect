@@ -382,6 +382,14 @@
 // Settings
 let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
 let _ndPitchTolerance = 50;      // cents
+// Strictness: a single dial that bundles (pitchTol, timingTol, dirty-hit
+// policy) into three named presets. Off-target-frame ratio = fraction of
+// YIN frames in the hit window whose pitch didn't match expected. When
+// it crosses the dirty threshold, the HIT is downgraded to DIRTY_HIT
+// (e.g., open string ringing alongside the intended note). easy mode
+// disables the dirty check; strict mode trips on minor leakage.
+let _ndStrictness = 'default';     // 'easy' | 'default' | 'strict'
+let _ndDirtyHitMaxOffRatio = 0.5;  // off-target frames > this → DIRTY_HIT (default preset)
 let _ndInputGain = 1.0;
 let _ndSelectedDeviceId = '';
 let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
@@ -422,6 +430,7 @@ let _ndHits = 0;
 let _ndMisses = 0;
 let _ndPitchMisses = 0;      // detection in timing window but wrong cents
 let _ndTimingMisses = 0;     // chart note passed with NO detection in window
+let _ndDirtyHits = 0;        // hits downgraded to DIRTY_HIT due to off-target frame ratio
 let _ndStreak = 0;
 let _ndBestStreak = 0;
 let _ndSectionStats = [];    // [{name, hits, misses}]
@@ -480,6 +489,15 @@ function _ndSeverity(primary, timingError, pitchError) {
 // timing window. If a note gets marked miss, we use this to distinguish
 // "detection fired but wrong pitch" vs "nothing fired at all."
 let _ndNotePitchAttempts = new Map(); // key -> bestCentsErr
+
+// Per-chart-note hygiene ledger: counts on-target vs off-target YIN frames
+// observed while the note's hit window was active, plus a histogram of the
+// off-target detected MIDIs. Used to classify a HIT as CLEAN or DIRTY:
+// even when the dominant pitch matched, if a high fraction of frames
+// during the window read a different pitch (e.g., open E ringing
+// alongside the intended note), the note's hygiene is bad. Mirrors
+// Pass 2 of test/string-hygiene.js but runs live, frame by frame.
+let _ndNoteHygiene = new Map(); // key -> { onTargetFrames, offTargetFrames, contaminantMidis: Map<midi,count> }
 
 // Stability voting — suppresses YIN's attack-transient pitch jitter by
 // requiring N of the last M raw detections to agree on a rounded MIDI value
@@ -785,6 +803,7 @@ function _ndSnapshotPlay(reason) {
     _ndTroubleNotes = _ndBuildTroubleMap(noteResults);
     _ndNoteResults.clear();
     _ndNotePitchAttempts.clear();
+    _ndNoteHygiene.clear();
     _ndPlaysCacheSongId = null; // invalidate cache; next report fetch reloads
     return fetch('/api/plugins/note_detect/plays', {
         method: 'POST',
@@ -950,6 +969,8 @@ function _ndSaveSettings() {
             pitchOffset: _ndPitchOffset,
             autoDetectOnPlay: _ndAutoDetectOnPlay,
             autoRecordOnPlay: _ndAutoRecordOnPlay,
+            strictness: _ndStrictness,
+            dirtyHitMaxOffRatio: _ndDirtyHitMaxOffRatio,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -981,6 +1002,8 @@ function _ndLoadSettings() {
         }
         if (s.autoDetectOnPlay !== undefined) _ndAutoDetectOnPlay = !!s.autoDetectOnPlay;
         if (s.autoRecordOnPlay !== undefined) _ndAutoRecordOnPlay = !!s.autoRecordOnPlay;
+        if (s.strictness !== undefined) _ndStrictness = s.strictness;
+        if (s.dirtyHitMaxOffRatio !== undefined) _ndDirtyHitMaxOffRatio = s.dirtyHitMaxOffRatio;
     } catch (e) { /* ignore */ }
 }
 
@@ -1165,6 +1188,29 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
     }
     const fallback = _ndMidiToStringFret(detectedMidi, arrangement, stringCount, offsets, capo);
     return { string: fallback.string, fret: fallback.fret, displayMidi: detectedMidi };
+}
+
+// Strictness presets. Each level pins pitch + timing tolerance and the
+// dirty-hit threshold (max fraction of off-target frames before a hit
+// downgrades to DIRTY_HIT). easy = "Rocksmith leniency, no hygiene
+// penalty"; strict = "every leak counts." default sits between.
+const _ND_STRICTNESS_PRESETS = {
+    easy:    { pitchTolerance: 100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0 },
+    default: { pitchTolerance:  50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5 },
+    strict:  { pitchTolerance:  25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3 },
+};
+
+function _ndApplyStrictness(level) {
+    const preset = _ND_STRICTNESS_PRESETS[level];
+    if (!preset) return;
+    _ndStrictness = level;
+    _ndPitchTolerance = preset.pitchTolerance;
+    _ndTimingTolerance = preset.timingTolerance;
+    _ndDirtyHitMaxOffRatio = preset.dirtyHitMaxOffRatio;
+    _ndSaveSettings();
+    // Re-render the settings panel so the tolerance fields show the new values.
+    const panel = document.getElementById('nd-settings-panel');
+    if (panel) { panel.remove(); _ndShowSettings(); }
 }
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
@@ -2949,6 +2995,17 @@ async function _ndProcessFrame(buffer) {
     }
     _ndStableMidi = (winnerCount >= _ND_STABILITY_REQUIRED) ? winnerMidi : -1;
 
+    // Per-frame hygiene update: for each chart note whose hit window
+    // currently contains the playhead, count this frame as on-target or
+    // off-target relative to the expected pitch. Driven by raw _ndDetectedMidi
+    // (not stable) so we capture brief contaminating pitches that don't
+    // last long enough to satisfy the stability voter — the same signal the
+    // offline string-hygiene scanner uses.
+    if (highway.getTime) {
+        const playT = highway.getTime();
+        if (playT >= 0) _ndUpdateNoteHygiene(playT);
+    }
+
     // If the Calibration Wizard is armed on the mic step, this detection is
     // the response to the on-screen flash — record the sample and unarm.
     // Wizard uses the RAW detection timestamp so its latency measurement
@@ -3099,6 +3156,78 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement = 
 function _ndNoteKey(note, time) {
     // Unique key for a note event
     return `${time.toFixed(3)}_${note.s}_${note.f}`;
+}
+
+// Per-frame hygiene tracking. For each chart note whose [chartT - early,
+// chartT + late] window contains `t`, record whether the current YIN frame
+// (raw _ndDetectedMidi) matches the expected pitch within tolerance. The
+// tally is consumed at HIT or miss-deadline time to label the result as
+// CLEAN or DIRTY based on the strictness threshold.
+function _ndUpdateNoteHygiene(t) {
+    if (_ndDetectedMidi <= 0 || _ndDetectedConfidence < 0.7) return;
+    const earlyWindowSec = _ndTimingTolerance;
+    const lateWindowSec = _ndTimingTolerance * 2;
+    const lookback = t - lateWindowSec;
+    const lookahead = t + earlyWindowSec;
+    const visit = (note, midiBase) => {
+        if (note.t < lookback) return false;
+        if (note.t > lookahead) return true; // sorted; signal stop
+        const key = _ndNoteKey(note, note.t);
+        const expectedMidi = midiBase + _ndPitchOffset;
+        const rawCents = (_ndDetectedMidi - expectedMidi) * 100;
+        const octCents = rawCents - 1200;
+        const cents = Math.abs(octCents) < Math.abs(rawCents) ? octCents : rawCents;
+        const onTarget = Math.abs(cents) <= _ndPitchTolerance;
+        let h = _ndNoteHygiene.get(key);
+        if (!h) {
+            h = { onTargetFrames: 0, offTargetFrames: 0, contaminantMidis: new Map() };
+            _ndNoteHygiene.set(key, h);
+        }
+        if (onTarget) h.onTargetFrames++;
+        else {
+            h.offTargetFrames++;
+            const detected = Math.round(_ndDetectedMidi);
+            h.contaminantMidis.set(detected, (h.contaminantMidis.get(detected) || 0) + 1);
+        }
+        return false;
+    };
+    const notes = highway.getNotes ? highway.getNotes() : [];
+    const chords = highway.getChords ? highway.getChords() : [];
+    // Walk forward from a binary-searched start so we don't pay for the full
+    // chart on every YIN frame. Notes are sorted by t.
+    const noteStart = _ndBsearch(notes, lookback);
+    for (let i = noteStart; i < notes.length; i++) {
+        const n = notes[i];
+        if (visit(n, _ndMidiFromStringFret(n.s, n.f))) break;
+    }
+    const chordStart = _ndBsearch(chords, lookback);
+    for (let i = chordStart; i < chords.length; i++) {
+        const c = chords[i];
+        if (c.t > lookahead) break;
+        for (const cn of c.notes || []) {
+            if (visit({ s: cn.s, f: cn.f, t: c.t }, _ndMidiFromStringFret(cn.s, cn.f))) {
+                i = chords.length; break;
+            }
+        }
+    }
+}
+
+function _ndComputeHygieneSummary(key) {
+    const h = _ndNoteHygiene.get(key);
+    if (!h) return null;
+    const total = h.onTargetFrames + h.offTargetFrames;
+    if (total === 0) return null;
+    const onTargetRatio = h.onTargetFrames / total;
+    const contaminants = [...h.contaminantMidis.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([midi, count]) => ({ midi, count }));
+    return {
+        onTargetFrames: h.onTargetFrames,
+        offTargetFrames: h.offTargetFrames,
+        onTargetRatio,
+        contaminants,
+    };
 }
 
 // Binary search: find index of first element with .t >= target
@@ -4078,12 +4207,46 @@ function _ndCheckMisses() {
                 }
                 return;
             }
-            // Even within the chain, disable() can still bump
-            // sessionGen and set !enabled between our stop/start
-            // and our return. Tear down what startAudio just
-            // acquired in that case.
-            if (gen !== sessionGen || !enabled) {
-                stopAudio();
+        }
+    }
+
+    // Hygiene finalization: any chart note whose hit window has fully closed
+    // and whose result hasn't been hygiene-graded yet — read its frame ledger
+    // and attach the on-target ratio + top contaminants. If a HIT shows
+    // off-target frames over the dirty threshold, downgrade it to DIRTY_HIT.
+    // We do this here (not at HIT time) so the ratio reflects the entire
+    // window, not just the moment of detection.
+    for (const [key, result] of _ndNoteResults) {
+        if (result._hygieneFinalized) continue;
+        if (result.chartT == null) { result._hygieneFinalized = true; continue; }
+        if (result.chartT > missDeadline) continue; // window not closed
+        const summary = _ndComputeHygieneSummary(key);
+        if (summary) {
+            result.hygiene = summary;
+            if (result.primary === 'HIT'
+                    && (1 - summary.onTargetRatio) > _ndDirtyHitMaxOffRatio) {
+                result.primary = 'DIRTY_HIT';
+                _ndDirtyHits = (_ndDirtyHits || 0) + 1;
+            }
+        }
+        result._hygieneFinalized = true;
+        // Free per-note ledger entries — we've captured what we needed.
+        _ndNoteHygiene.delete(key);
+    }
+
+    // Track current section
+    const sections = highway.getSections();
+    if (sections) {
+        let current = null;
+        for (const sec of sections) {
+            if (sec.time <= t) current = sec.name;
+            else break;
+        }
+        if (current && current !== _ndCurrentSection) {
+            _ndCurrentSection = current;
+            // Ensure section stats entry exists
+            if (!_ndSectionStats.find(s => s.name === current)) {
+                _ndSectionStats.push({ name: current, hits: 0, misses: 0 });
             }
         }
     }
@@ -4128,6 +4291,27 @@ function _ndShowSettings() {
                    onchange="_ndAutoRecordOnPlay=this.checked;_ndSaveSettings()">
             <span>Also arm recording on Play (for offline analysis)</span>
         </label>
+
+        <label class="block text-gray-400 text-xs mb-1">Strictness</label>
+        <div class="flex gap-1 mb-1">
+            <button onclick="_ndApplyStrictness('easy')"
+                class="flex-1 px-2 py-1 text-xs rounded ${_ndStrictness === 'easy' ? 'bg-green-900/60 text-green-200' : 'bg-dark-600 text-gray-400 hover:bg-dark-500'}">
+                Easy
+            </button>
+            <button onclick="_ndApplyStrictness('default')"
+                class="flex-1 px-2 py-1 text-xs rounded ${_ndStrictness === 'default' ? 'bg-blue-900/60 text-blue-200' : 'bg-dark-600 text-gray-400 hover:bg-dark-500'}">
+                Default
+            </button>
+            <button onclick="_ndApplyStrictness('strict')"
+                class="flex-1 px-2 py-1 text-xs rounded ${_ndStrictness === 'strict' ? 'bg-red-900/60 text-red-200' : 'bg-dark-600 text-gray-400 hover:bg-dark-500'}">
+                Strict
+            </button>
+        </div>
+        <p class="text-gray-500 text-[10px] mb-3 leading-tight">
+            Easy: 100¢/300ms, ignores string-hygiene leaks.
+            Default: 50¢/150ms, flags hits with &gt;50% off-pitch frames as dirty.
+            Strict: 25¢/100ms, dirty if &gt;30% off-pitch.
+        </p>
 
         <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
         <select id="nd-device-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
@@ -4827,15 +5011,19 @@ highway.addDrawHook(function(ctx, W, H) {
                 ctx.save();
                 ctx.globalAlpha = fade;
 
-                if (primary === 'HIT') {
-                    // Green check mark
-                    ctx.fillStyle = 'rgba(0, 60, 20, 0.7)';
+                if (primary === 'HIT' || primary === 'DIRTY_HIT') {
+                    const dirty = primary === 'DIRTY_HIT';
+                    // Yellow for dirty hits (right note, but string-hygiene
+                    // contamination over the threshold), green for clean.
+                    const ringColor = dirty ? '#ffcc33' : '#00ff88';
+                    const fillColor = dirty ? 'rgba(60, 50, 0, 0.7)' : 'rgba(0, 60, 20, 0.7)';
+                    ctx.fillStyle = fillColor;
                     ctx.beginPath();
                     ctx.arc(x, y, sz, 0, Math.PI * 2);
                     ctx.fill();
 
-                    ctx.strokeStyle = '#00ff88';
-                    ctx.shadowColor = '#00ff88';
+                    ctx.strokeStyle = ringColor;
+                    ctx.shadowColor = ringColor;
                     ctx.shadowBlur = 16;
                     ctx.lineWidth = Math.max(4, 5 * p0.scale);
                     ctx.lineCap = 'round';
@@ -4846,14 +5034,17 @@ highway.addDrawHook(function(ctx, W, H) {
                     ctx.lineTo(x + sz * 0.5, y - sz * 0.4);
                     ctx.stroke();
 
-                    // Show labels for imperfect hits
-                    const labels = j.judgment?.labels || [];
+                    // Show labels for imperfect hits — append MUTE for dirty
+                    // hits so the player knows it was string-hygiene that
+                    // downgraded an otherwise-correct pluck.
+                    const labels = (j.judgment?.labels || []).slice();
+                    if (dirty) labels.push('MUTE');
                     if (labels.length > 0) {
                         ctx.shadowBlur = 0;
                         ctx.font = `bold ${fontSize}px sans-serif`;
                         ctx.textAlign = 'center';
                         ctx.textBaseline = 'top';
-                        ctx.fillStyle = '#ffaa33';
+                        ctx.fillStyle = dirty ? '#ffcc33' : '#ffaa33';
                         ctx.strokeStyle = '#000';
                         ctx.lineWidth = 3;
                         const labelText = labels.join(' ');
@@ -5119,6 +5310,7 @@ function _ndResetScoring() {
     _ndDetectedFret = -1;
     _ndEventLog = [];
     _ndNotePitchAttempts.clear();
+    _ndNoteHygiene.clear();
     _ndRawMidiHistory = [];
     _ndStableMidi = -1;
 }
