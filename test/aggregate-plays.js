@@ -180,6 +180,118 @@ function verdictGlyph(v) {
     return '?';
 }
 
+// Build a 1D miss-density timeline binned by chartT.
+//   missRate per bin = total misses / total attempts of all notes in the bin.
+// Bins with zero attempts are gaps in coverage (e.g., between iteration tail
+// and chart end) and rendered as blank rather than zero-density.
+function buildHeatmap(rows, binSec = 1) {
+    const bins = new Map();
+    let maxBin = -Infinity;
+    let minBin = Infinity;
+    for (const row of rows) {
+        const s = statsForRow(row);
+        if (s.nAttempts === 0) continue;
+        const bin = Math.floor(row.chartT / binSec) * binSec;
+        if (!bins.has(bin)) bins.set(bin, { misses: 0, attempts: 0, notes: 0 });
+        const b = bins.get(bin);
+        b.misses += s.nAttempts - s.hits;
+        b.attempts += s.nAttempts;
+        b.notes += 1;
+        if (bin > maxBin) maxBin = bin;
+        if (bin < minBin) minBin = bin;
+    }
+    return { bins, minBin, maxBin, binSec };
+}
+
+// Suggest practice-loop ranges by finding the densest sliding windows of
+// missed notes. Picks K non-overlapping 4-6 second windows, ranked by
+// miss-density (misses per second). This produces multiple short focused
+// loops rather than one big cluster — useful when the player's trouble is
+// spread across the passage.
+//
+// Algorithm:
+//   1. Build a list of (chartT, missCount, attemptCount) per chart note.
+//   2. Slide a windowSec window across the chart in slideSec increments.
+//   3. For each candidate, compute miss-density = misses / windowSec.
+//   4. Sort by density. Greedily pick non-overlapping windows up to maxLoops,
+//      requiring a minimum density and a minimum number of trouble notes.
+//   5. Pad each chosen window's [A, B] for fade-in / sustain tail.
+function suggestLoops(rows, opts = {}) {
+    const {
+        windowSec = 5,
+        slideSec = 0.5,
+        minMissesPerSec = 0.5,    // density floor — below this isn't a hot spot
+        minTroubleNotes = 2,      // need ≥2 different trouble notes inside
+        maxLoops = 5,
+        padHeadSec = 0.5,
+        padTailSec = 1.0,         // extra room for sustain tail
+    } = opts;
+
+    const noteList = rows
+        .map(r => ({ ...r, ...statsForRow(r) }))
+        .filter(r => r.nAttempts >= 2);
+
+    if (noteList.length === 0) return [];
+
+    const minT = Math.min(...noteList.map(n => n.chartT));
+    const maxT = Math.max(...noteList.map(n => n.chartT));
+
+    const candidates = [];
+    for (let start = minT - windowSec / 2; start <= maxT + windowSec / 2; start += slideSec) {
+        const end = start + windowSec;
+        let misses = 0;
+        let attempts = 0;
+        const inside = [];
+        for (const n of noteList) {
+            if (n.chartT >= start && n.chartT <= end) {
+                inside.push(n);
+                misses += n.nAttempts - n.hits;
+                attempts += n.nAttempts;
+            }
+        }
+        const trouble = inside.filter(n => n.hits < n.nAttempts).length;
+        const density = misses / windowSec;
+        if (density >= minMissesPerSec && trouble >= minTroubleNotes) {
+            candidates.push({ start, end, density, misses, attempts, trouble, notes: inside });
+        }
+    }
+
+    candidates.sort((a, b) => b.density - a.density);
+
+    // Greedy non-overlapping selection.
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxLoops) break;
+        if (selected.some(s => s.start < c.end && s.end > c.start)) continue;
+        selected.push(c);
+    }
+
+    selected.sort((a, b) => a.start - b.start);
+
+    return selected.map((c, i) => {
+        const a = Math.max(0, c.start - padHeadSec);
+        const b = c.end + padTailSec;
+        const troubleNotes = c.notes
+            .filter(n => n.hits < n.nAttempts)
+            .sort((x, y) => (1 - x.hitRate) - (1 - y.hitRate))
+            .reverse();
+        const positions = [...new Set(troubleNotes.map(n => n.stringFret))].slice(0, 4).join(',');
+        const avgMissRate = troubleNotes.reduce((s, n) => s + (1 - n.hitRate), 0) / troubleNotes.length;
+        return {
+            id: i + 1,
+            startSec: a,
+            endSec: b,
+            durationSec: b - a,
+            noteCount: troubleNotes.length,
+            avgMissRate,
+            positions,
+            notes: troubleNotes,
+            name: `loop-${i + 1}-${a.toFixed(1)}s-${b.toFixed(1)}s`,
+            density: c.density,
+        };
+    });
+}
+
 function summarize(playMeta, rows) {
     const N = playMeta.length;
     const totalNotes = rows.length;
@@ -248,6 +360,53 @@ function renderTerminal(playMeta, rows) {
         }
         console.log();
     }
+
+    // Heatmap + suggested loops
+    const heatmap = buildHeatmap(rows, 1);
+    const loops = suggestLoops(rows);
+    if (heatmap.maxBin >= heatmap.minBin) {
+        console.log(`── Miss-density timeline (per second of chart) ──`);
+        // Pre-compute which bin range each suggested loop covers so we can
+        // mark them inline on the timeline.
+        const loopBinTags = new Map(); // bin → [loopId, ...]
+        for (const lp of loops) {
+            const startBin = Math.floor(lp.startSec / heatmap.binSec) * heatmap.binSec;
+            const endBin = Math.floor(lp.endSec / heatmap.binSec) * heatmap.binSec;
+            for (let b = startBin; b <= endBin; b += heatmap.binSec) {
+                if (!loopBinTags.has(b)) loopBinTags.set(b, []);
+                loopBinTags.get(b).push(lp.id);
+            }
+        }
+        for (let t = heatmap.minBin; t <= heatmap.maxBin; t += heatmap.binSec) {
+            const b = heatmap.bins.get(t);
+            if (!b) {
+                console.log(`  ${t.toFixed(1).padStart(6)}s${' '.repeat(34)}—`);
+                continue;
+            }
+            const missRate = b.misses / b.attempts;
+            const bar = '█'.repeat(Math.round(missRate * 30));
+            const pct = `${(missRate * 100).toFixed(0).padStart(3)}% (${b.misses}/${b.attempts})`;
+            const loopMark = loopBinTags.has(t) ? ` [loop ${loopBinTags.get(t).join(',')}]` : '';
+            console.log(`  ${t.toFixed(1).padStart(6)}s  ${bar.padEnd(30)}  ${pct}${loopMark}`);
+        }
+        console.log();
+    }
+    if (loops.length > 0) {
+        console.log(`── Suggested practice loops (${loops.length}) ──`);
+        for (const lp of loops) {
+            console.log(`  Loop ${lp.id}: ${lp.startSec.toFixed(1)}s–${lp.endSec.toFixed(1)}s  (${lp.durationSec.toFixed(1)}s, ${lp.noteCount} trouble notes, ${(lp.avgMissRate * 100).toFixed(0)}% avg miss)`);
+            console.log(`    positions: ${lp.positions}`);
+            for (const n of lp.notes) {
+                const pct = ((1 - n.hitRate) * 100).toFixed(0);
+                console.log(`      ${n.chartT.toFixed(2).padStart(7)}s  MIDI ${String(n.expectedMidi).padStart(3)}  ${n.stringFret.padEnd(6)} missed ${n.nAttempts - n.hits}/${n.nAttempts} (${pct}%)`);
+            }
+        }
+        console.log();
+    } else {
+        console.log(`── Suggested practice loops ──`);
+        console.log(`  (none — no clusters of ≥2 trouble notes found)`);
+        console.log();
+    }
 }
 
 function renderMarkdown(songId, playMeta, rows) {
@@ -313,6 +472,52 @@ function renderMarkdown(songId, playMeta, rows) {
             lines.push(`| ${r.chartT.toFixed(2)}s | ${r.expectedMidi} | ${r.stringFret} | ${r.nAttempts - r.hits} | ${r.nAttempts} | ${((1 - r.hitRate) * 100).toFixed(0)}% |`);
         }
         lines.push('');
+    }
+
+    const heatmap = buildHeatmap(rows, 1);
+    const loops = suggestLoops(rows);
+    if (heatmap.maxBin >= heatmap.minBin) {
+        lines.push(`## Miss-density timeline (per second of chart)\n`);
+        const loopBinTags = new Map();
+        for (const lp of loops) {
+            const startBin = Math.floor(lp.startSec / heatmap.binSec) * heatmap.binSec;
+            const endBin = Math.floor(lp.endSec / heatmap.binSec) * heatmap.binSec;
+            for (let b = startBin; b <= endBin; b += heatmap.binSec) {
+                if (!loopBinTags.has(b)) loopBinTags.set(b, []);
+                loopBinTags.get(b).push(lp.id);
+            }
+        }
+        lines.push('```');
+        for (let t = heatmap.minBin; t <= heatmap.maxBin; t += heatmap.binSec) {
+            const b = heatmap.bins.get(t);
+            if (!b) { lines.push(`${t.toFixed(1).padStart(6)}s${' '.repeat(34)}—`); continue; }
+            const missRate = b.misses / b.attempts;
+            const bar = '█'.repeat(Math.round(missRate * 30));
+            const pct = `${(missRate * 100).toFixed(0).padStart(3)}% (${b.misses}/${b.attempts})`;
+            const loopMark = loopBinTags.has(t) ? ` [loop ${loopBinTags.get(t).join(',')}]` : '';
+            lines.push(`${t.toFixed(1).padStart(6)}s  ${bar.padEnd(30)}  ${pct}${loopMark}`);
+        }
+        lines.push('```');
+        lines.push('');
+    }
+    if (loops.length > 0) {
+        lines.push(`## Suggested practice loops\n`);
+        lines.push(`Each loop covers a cluster of ≥2 trouble notes within 4s of each other. Use as A/B markers in slopsmith, or save by name to the loops dropdown.\n`);
+        lines.push(`| # | A | B | Duration | Notes | Avg miss | Positions |`);
+        lines.push(`|---|---|---|---|---|---|---|`);
+        for (const lp of loops) {
+            lines.push(`| ${lp.id} | ${lp.startSec.toFixed(2)}s | ${lp.endSec.toFixed(2)}s | ${lp.durationSec.toFixed(1)}s | ${lp.noteCount} | ${(lp.avgMissRate * 100).toFixed(0)}% | ${lp.positions} |`);
+        }
+        lines.push('');
+        for (const lp of loops) {
+            lines.push(`### Loop ${lp.id}: ${lp.startSec.toFixed(1)}s–${lp.endSec.toFixed(1)}s\n`);
+            lines.push(`| chartT | MIDI | string/fret | missed | attempts | miss rate |`);
+            lines.push(`|---|---|---|---|---|---|`);
+            for (const n of lp.notes) {
+                lines.push(`| ${n.chartT.toFixed(2)}s | ${n.expectedMidi} | ${n.stringFret} | ${n.nAttempts - n.hits} | ${n.nAttempts} | ${((1 - n.hitRate) * 100).toFixed(0)}% |`);
+            }
+            lines.push('');
+        }
     }
     return lines.join('\n');
 }
