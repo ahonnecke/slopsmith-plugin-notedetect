@@ -7,5 +7,8 @@ baseline-events.json
 *.classification.json
 *.dump.json
 *.report.md
+*.aggregate.md
 latest.*
 take-*.json
+# Per-play snapshots pulled from the slopsmith container by `make loop-report`.
+plays/

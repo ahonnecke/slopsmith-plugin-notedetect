@@ -202,6 +202,24 @@ report-dump: ## Report on the current pipeline dump only (no WAV needed — for 
 	@docker cp slopsmith-web-1:/tmp/nd_diag_dump.json test/fixtures/latest.dump.json >/dev/null
 	@node test/session-report.js --dump test/fixtures/latest.dump.json
 
+# ── Loop-attempt aggregation ────────────────────────────────────────────────
+# When the player loops a passage with slopsmith's A/B markers, the plugin
+# snapshots one play per loop iteration to /tmp/nd_plays/<songId>/. This
+# target pulls all per-iteration snapshots for a song and produces a
+# best-of-N report — which notes hit consistently, which need practice.
+
+.PHONY: loop-songs
+loop-songs: ## List songs that have play snapshots in the container (newest first)
+	@docker exec slopsmith-web-1 sh -c 'ls -td /tmp/nd_plays/*/ 2>/dev/null | sed "s|/tmp/nd_plays/||;s|/$$||"' || echo "(no play snapshots found)"
+
+.PHONY: loop-report
+loop-report: ## Aggregate plays into a best-of-N report (SONG=<substring> optional, newest if unset)
+	@SONG_ARG=""; \
+	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
+	LAST_ARG=""; \
+	if [ -n "$(LAST)" ]; then LAST_ARG="--last $(LAST)"; fi; \
+	node test/aggregate-plays.js $$SONG_ARG $$LAST_ARG
+
 .PHONY: test-all
 test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency
 	$(MAKE) --no-print-directory test-pipeline
