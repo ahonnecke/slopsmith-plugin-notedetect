@@ -701,8 +701,17 @@ async function _ndRecordAlignedStart(seconds = 60) {
 // jumps backward) and periodically every 30s while playing.
 let _ndLastDumpTime = 0;           // performance.now() of last auto-dump
 let _ndLastSeenScoreTime = -1;     // track score time to detect loop restarts
+let _ndLastLoopRestart = 0;        // performance.now() of the last loop_restart snapshot
 const _ND_AUTO_DUMP_INTERVAL = 30; // seconds between periodic dumps
 const _ND_AUTO_DUMP_MIN_EVENTS = 3; // need at least this many events to be worth dumping
+// Refractory window after a loop_restart snapshot: ignore subsequent backward
+// chart-time jumps within this period. Audio engine seek can produce several
+// frames of stutter on loop wrap (chart time briefly oscillating), each of
+// which the raw "scoreT < prevScoreT - 1s" check would treat as a new
+// iteration — producing 4-6 spurious tiny snapshots per real iteration.
+// 1.5s is comfortably longer than observed stutter (~250ms) and shorter than
+// any reasonable looped passage.
+const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 
 function _ndAutoDumpPost() {
     const dumpData = {
@@ -794,8 +803,12 @@ function _ndCheckAutoDump() {
     const now = performance.now() / 1000;
     const scoreT = highway.getTime ? highway.getTime() : -1;
 
-    // Detect loop restart: score time jumped backward by >1s
-    if (_ndLastSeenScoreTime > 0 && scoreT >= 0 && scoreT < _ndLastSeenScoreTime - 1) {
+    // Detect loop restart: score time jumped backward by >1s. Gated behind
+    // a refractory so loop-wrap stutter (audio engine seek bouncing chart
+    // time) doesn't fire 4-6 snapshots per real iteration.
+    const sinceLastRestart = now - _ndLastLoopRestart;
+    if (_ndLastSeenScoreTime > 0 && scoreT >= 0 && scoreT < _ndLastSeenScoreTime - 1
+            && sinceLastRestart > _ND_LOOP_RESTART_REFRACTORY_SEC) {
         if (_ndEventLog.length >= _ND_AUTO_DUMP_MIN_EVENTS) {
             console.log('[note_detect] Loop restart detected, auto-dumping');
             _ndAutoDumpPost();
@@ -806,6 +819,7 @@ function _ndCheckAutoDump() {
         // _ndNoteResults.has(key) guard at the matching site would make the
         // first iteration's result stick across all subsequent loops).
         _ndSnapshotPlay('loop_restart');
+        _ndLastLoopRestart = now;
     }
     _ndLastSeenScoreTime = scoreT;
 

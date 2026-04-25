@@ -20,6 +20,18 @@
  * what was captured and lets you read the absent-from-N-of-M signal as
  * "inconsistently hit" rather than "definitely missed."
  *
+ * DEFERRED — spurious-snapshot filter: an earlier observation showed the
+ * plugin firing 4-6 snapshots per real loop iteration because the audio
+ * engine seek on loop wrap produces a few frames of chart-time stutter,
+ * each looking like a fresh backward-jump. Real iterations show as one
+ * snapshot with ~the full note count; spurious ones have 1-3 notes
+ * captured in the 30-230 ms gap between fires. Fixed at the source via a
+ * loop_restart refractory in screen.js (`_ND_LOOP_RESTART_REFRACTORY_SEC`).
+ * If that fix ever regresses or you need to read pre-fix data, add a
+ * `--min-notes <N>` flag here that drops play snapshots with fewer than N
+ * `noteResults` entries before aggregation. Defensive insurance only —
+ * the right behavior is a single snapshot per actual iteration.
+ *
  * Usage:
  *   node test/aggregate-plays.js [--song <songId>] [--from <dir>]
  *                                [--last <N>]
