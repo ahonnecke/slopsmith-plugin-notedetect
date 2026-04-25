@@ -1530,12 +1530,25 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 
 // Strictness presets. Each level pins pitch + timing tolerance and the
 // dirty-hit threshold (max fraction of off-target frames before a hit
-// downgrades to DIRTY_HIT). easy = "Rocksmith leniency, no hygiene
-// penalty"; strict = "every leak counts." default sits between.
+// downgrades to DIRTY_HIT).
+//
+//   rocksmith — almost any in-window pluck counts. Pitch tolerance is
+//               2400¢ (2 octaves) so even YIN's octave-down errors pass.
+//               Empirically lifts a Level session from 69% → ~90%
+//               by absorbing the ~13% PIPELINE_YIN_DISAGREES bucket
+//               without changing what the player did. Use when the
+//               pipeline is misreading clean playing.
+//   easy     — Rocksmith-ish but with real pitch matching at 100¢.
+//              Catches gross fretting errors (>1 semitone), accepts
+//              YIN minor-third confusion.
+//   default  — 50¢ pitch / 150ms timing, dirty trips at 50% off-target.
+//   strict   — 25¢ / 100ms, dirty trips at 30% off-target. Mastery
+//              validation, surfaces every hygiene leak.
 const _ND_STRICTNESS_PRESETS = {
-    easy:    { pitchTolerance: 100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0 },
-    default: { pitchTolerance:  50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5 },
-    strict:  { pitchTolerance:  25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3 },
+    rocksmith: { pitchTolerance: 2400, timingTolerance: 0.400, dirtyHitMaxOffRatio: 1.0 },
+    easy:      { pitchTolerance:  100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0 },
+    default:   { pitchTolerance:   50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5 },
+    strict:    { pitchTolerance:   25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3 },
 };
 
 function _ndApplyStrictness(level) {
@@ -4632,6 +4645,10 @@ function _ndShowSettings() {
 
         <label class="block text-gray-400 text-xs mb-1">Strictness</label>
         <div class="flex gap-1 mb-1">
+            <button onclick="_ndApplyStrictness('rocksmith')"
+                class="flex-1 px-2 py-1 text-xs rounded ${_ndStrictness === 'rocksmith' ? 'bg-purple-900/60 text-purple-200' : 'bg-dark-600 text-gray-400 hover:bg-dark-500'}">
+                Rocksmith
+            </button>
             <button onclick="_ndApplyStrictness('easy')"
                 class="flex-1 px-2 py-1 text-xs rounded ${_ndStrictness === 'easy' ? 'bg-green-900/60 text-green-200' : 'bg-dark-600 text-gray-400 hover:bg-dark-500'}">
                 Easy
@@ -4646,9 +4663,10 @@ function _ndShowSettings() {
             </button>
         </div>
         <p class="text-gray-500 text-[10px] mb-3 leading-tight">
-            Easy: 100¢/300ms, ignores string-hygiene leaks.
-            Default: 50¢/150ms, flags hits with &gt;50% off-pitch frames as dirty.
-            Strict: 25¢/100ms, dirty if &gt;30% off-pitch.
+            Rocksmith: any in-window pluck (2400¢/400ms) — masks YIN misreads.
+            Easy: 100¢/300ms, ignores hygiene.
+            Default: 50¢/150ms, flags &gt;50% off-pitch hits as dirty.
+            Strict: 25¢/100ms, dirty at &gt;30%.
         </p>
 
         <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
