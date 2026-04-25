@@ -220,6 +220,18 @@ loop-report: ## Aggregate plays into a best-of-N report (SONG=<substring> option
 	if [ -n "$(LAST)" ]; then LAST_ARG="--last $(LAST)"; fi; \
 	node test/aggregate-plays.js $$SONG_ARG $$LAST_ARG
 
+.PHONY: hygiene
+hygiene: ## Scan the newest session for string-hygiene issues (open strings ringing, off-pitch contamination)
+	@$(RESOLVE_SESSION); \
+	docker cp slopsmith-web-1:$$SRC test/fixtures/$$NAME.wav >/dev/null 2>&1 || true; \
+	docker cp slopsmith-web-1:/tmp/nd_recordings/$$NAME.json test/fixtures/$$NAME.json >/dev/null 2>&1 || true; \
+	docker cp slopsmith-web-1:/tmp/nd_recordings/$$NAME.dump.json test/fixtures/$$NAME.dump.json >/dev/null 2>&1 || true; \
+	if [ ! -f test/fixtures/$$NAME.dump.json ]; then \
+	    echo "error: no per-recording dump snapshot for $$NAME"; \
+	    exit 1; \
+	fi; \
+	node test/string-hygiene.js --wav test/fixtures/$$NAME.wav --dump test/fixtures/$$NAME.dump.json
+
 .PHONY: test-all
 test-all: check-slopsmith ## Everything: node suite + offline synth + browser replay + timing latency
 	$(MAKE) --no-print-directory test-pipeline
