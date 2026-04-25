@@ -405,6 +405,12 @@ let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensa
 // If localStorage has a non-zero value, it'll be loaded — use Quick Calibrate
 // or the settings slider to reset.
 let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable Detect
+// Off by default — recording produces files (POSTed to the server, then to
+// /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
+// alongside the per-iteration play snapshots, e.g. for offline classifier
+// runs to disambiguate "you fretted wrong" from "detector misread clean audio".
+let _ndAutoRecordOnPlay = false;
+const _ND_AUTO_RECORD_MAX_SEC = 900; // 15 min — long enough for full songs and loop sessions, auto-stop is the safety
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -918,6 +924,7 @@ function _ndSaveSettings() {
             silenceGate: _ndSilenceGate,
             pitchOffset: _ndPitchOffset,
             autoDetectOnPlay: _ndAutoDetectOnPlay,
+            autoRecordOnPlay: _ndAutoRecordOnPlay,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -948,6 +955,7 @@ function _ndLoadSettings() {
             _ndPitchOffset = Math.abs(s.pitchOffset) <= 1 ? s.pitchOffset : 0;
         }
         if (s.autoDetectOnPlay !== undefined) _ndAutoDetectOnPlay = !!s.autoDetectOnPlay;
+        if (s.autoRecordOnPlay !== undefined) _ndAutoRecordOnPlay = !!s.autoRecordOnPlay;
     } catch (e) { /* ignore */ }
 }
 
@@ -4084,10 +4092,16 @@ function _ndShowSettings() {
             <button onclick="document.getElementById('nd-settings-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
         </div>
 
-        <label class="flex items-center gap-2 text-gray-300 text-xs mb-3 cursor-pointer">
+        <label class="flex items-center gap-2 text-gray-300 text-xs mb-2 cursor-pointer">
             <input type="checkbox" id="nd-auto-detect-on-play" ${_ndAutoDetectOnPlay ? 'checked' : ''}
                    onchange="_ndAutoDetectOnPlay=this.checked;_ndSaveSettings()">
             <span>Auto-enable Detect when Play is pressed</span>
+        </label>
+
+        <label class="flex items-center gap-2 text-gray-300 text-xs mb-3 cursor-pointer">
+            <input type="checkbox" id="nd-auto-record-on-play" ${_ndAutoRecordOnPlay ? 'checked' : ''}
+                   onchange="_ndAutoRecordOnPlay=this.checked;_ndSaveSettings()">
+            <span>Also arm recording on Play (for offline analysis)</span>
         </label>
 
         <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
@@ -4840,6 +4854,14 @@ function _ndInjectButton() {
 // Auto-Detect-on-Play: hook the host's <audio id="audio"> 'play' event so
 // pressing Play in the host UI also flips Detect on. Idempotent — uses a
 // dataset flag so re-injection (multi-song sessions) doesn't stack listeners.
+//
+// Optionally also auto-arms recording (gated by _ndAutoRecordOnPlay) so a
+// looping session captures both per-iteration play snapshots AND a single
+// continuous WAV. The WAV is needed downstream to split player-error from
+// detector-error per attempt — pipeline-only verdicts can't tell those
+// apart. Filename uses the same song-slug+timestamp pattern as
+// _ndRecordAlignedStart so existing tooling (`make pull-session` etc.)
+// finds it without changes.
 function _ndAttachAutoDetectListener() {
     const audio = document.getElementById('audio');
     if (!audio || audio.dataset.ndAutoDetect === '1') return;
@@ -4848,6 +4870,17 @@ function _ndAttachAutoDetectListener() {
         if (_ndAutoDetectOnPlay && !_ndEnabled) {
             console.log('[note_detect] Auto-enabling Detect on play');
             _ndToggle();
+        }
+        if (_ndAutoRecordOnPlay && !_ndRecording) {
+            const info = highway.getSongInfo && highway.getSongInfo();
+            const slugSource = info?.filename || info?.title || '';
+            const songSlug = slugSource
+                ? slugSource.replace(/\.\w+$/, '').replace(/[^a-z0-9-]/gi, '_').toLowerCase()
+                : 'autorec';
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const filename = `${songSlug}-${stamp}.wav`;
+            console.log(`[note_detect] Auto-arming recording on play (${filename}, max ${_ND_AUTO_RECORD_MAX_SEC}s)`);
+            _ndRecordStart(_ND_AUTO_RECORD_MAX_SEC, filename);
         }
     });
 }
