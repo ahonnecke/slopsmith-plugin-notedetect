@@ -265,6 +265,62 @@ test('binning: zero-input returns all-zero bin counts of correct length', () => 
     assert.equal(bins.every(b => b === 0), true);
 });
 
+// ── Trouble map (last-play pre-arrival glow) ─────────────────────────────
+
+test('trouble map: includes only entries with non-zero severity', () => {
+    const noteResults = [
+        { s: 0, f: 0, chartT: 1.0, severity: 0,    primary: 'HIT' },                  // clean hit — excluded
+        { s: 1, f: 3, chartT: 2.0, severity: 0.5,  primary: 'HIT' },                  // imperfect hit
+        { s: 2, f: 5, chartT: 3.0, severity: 1.0,  primary: 'MISSED_NO_DETECTION' },
+        { s: 3, f: 7, chartT: 4.0, severity: 0.85, primary: 'MISSED_WRONG_PITCH' },
+    ];
+    const m = core.buildTroubleMap(noteResults);
+    assert.equal(m.size, 3);
+    const k1 = core.troubleKey(0, 0, 1.0);
+    assert.equal(m.has(k1), false, 'clean hit should not be in trouble map');
+});
+
+test('trouble map: preserves severity and primary for downstream rendering', () => {
+    const m = core.buildTroubleMap([
+        { s: 1, f: 3, chartT: 2.5, severity: 0.7, primary: 'MISSED_WRONG_PITCH' },
+    ]);
+    const entry = m.get(core.troubleKey(1, 3, 2.5));
+    assert.ok(entry);
+    assert.equal(entry.severity, 0.7);
+    assert.equal(entry.primary, 'MISSED_WRONG_PITCH');
+});
+
+test('trouble map: chartT bins to nearest 5ms (matches ranking key)', () => {
+    const m = core.buildTroubleMap([
+        { s: 0, f: 0, chartT: 1.0023, severity: 0.8, primary: 'HIT' },
+    ]);
+    // Original: 1.0023; Math.round(1.0023 * 200) / 200 = 1.0
+    assert.equal(m.has(core.troubleKey(0, 0, 1.0)), true);
+});
+
+test('trouble map: empty/missing input returns empty Map', () => {
+    assert.equal(core.buildTroubleMap([]).size, 0);
+    assert.equal(core.buildTroubleMap(null).size, 0);
+    assert.equal(core.buildTroubleMap(undefined).size, 0);
+});
+
+test('trouble map: ignores entries with non-numeric severity', () => {
+    const m = core.buildTroubleMap([
+        { s: 0, f: 0, chartT: 1.0, severity: 'bogus', primary: 'HIT' },
+        { s: 0, f: 0, chartT: 2.0, severity: undefined, primary: 'HIT' },
+        { s: 0, f: 0, chartT: 3.0, severity: 0.5, primary: 'HIT' },
+    ]);
+    assert.equal(m.size, 1);
+});
+
+test('trouble key: matches _ndRankPracticeNotes binning so report and glow align', () => {
+    // Both the practice list and the trouble glow key by (s, f, round(chartT*200)/200).
+    // If these drift, a note shown in the report wouldn't glow on the highway.
+    const pK = `${1}|${3}|${Math.round(2.5 * 200) / 200}`;
+    const tK = core.troubleKey(1, 3, 2.5);
+    assert.equal(pK, tK);
+});
+
 test('binning: timing-histogram defaults match what _ndRenderHistogram passes', () => {
     // 25ms bins from -300 to 300 → 24 bins
     const { bins } = core.binErrors([0, 100, -100, 250, -250], 25, -300, 300);

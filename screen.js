@@ -780,6 +780,9 @@ function _ndSnapshotPlay(reason) {
         startedAt: Date.now(),
         noteResults,
     };
+    // Build the trouble map from this just-completed play BEFORE clearing
+    // so the next loop iteration starts with up-to-date pre-arrival glow.
+    _ndTroubleNotes = _ndBuildTroubleMap(noteResults);
     _ndNoteResults.clear();
     _ndNotePitchAttempts.clear();
     _ndPlaysCacheSongId = null; // invalidate cache; next report fetch reloads
@@ -789,6 +792,28 @@ function _ndSnapshotPlay(reason) {
         body: JSON.stringify(snapshot),
     }).then(() => console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes)`))
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
+}
+
+// Pull the most-recent play snapshot off disk and seed the trouble map.
+// Used at detect-on so the player gets pre-arrival glow on the very first
+// note of a new session — without this they'd have to complete a full loop
+// before any glow appears.
+async function _ndLoadTroubleFromDisk() {
+    const songId = _ndCurrentSongId();
+    if (!songId) return;
+    try {
+        const plays = await _ndFetchPlays(songId);
+        if (!plays.length) {
+            _ndTroubleNotes = new Map();
+            return;
+        }
+        // plays[0] is newest by mtime
+        _ndTroubleNotes = _ndBuildTroubleMap(plays[0].noteResults || []);
+        console.log(`[note_detect] Trouble map loaded: ${_ndTroubleNotes.size} notes from last play`);
+    } catch (e) {
+        console.warn('[note_detect] Trouble map load failed:', e);
+        _ndTroubleNotes = new Map();
+    }
 }
 
 async function _ndFetchPlays(songId) {
@@ -4452,6 +4477,33 @@ const _ND_MISS_DISPLAY_SEC = 15.0;  // miss markers persist long enough to actua
 const _ND_MISS_LOOKBACK    = 15.0;  // seconds to look back for missed notes
 const _ND_DIAG_FONT_PX     = 18;    // diagnostic label base font size — must be readable
 
+// ── Trouble notes (pre-arrival glow from last play) ──────────────────────
+// Map of (s, f, chartT-rounded-to-5ms) → { severity, primary } from the most
+// recent completed play snapshot. Drives the upcoming-note glow so the player
+// can brace for notes they failed last loop iteration. Rebuilt on each
+// _ndSnapshotPlay (right before clearing _ndNoteResults) and on detect-on
+// (loaded from disk via _ndFetchPlays).
+let _ndTroubleNotes = new Map();
+
+function _ndTroubleKey(s, f, chartT) {
+    const binned = Math.round((chartT || 0) * 200) / 200;
+    return `${s}|${f}|${binned}`;
+}
+
+// Build a trouble map from one play's noteResults. Filters to entries with
+// non-zero severity (clean hits don't count as trouble). Returns a fresh Map
+// so callers can swap atomically without mid-render flicker.
+function _ndBuildTroubleMap(noteResults) {
+    const m = new Map();
+    if (!noteResults) return m;
+    for (const r of noteResults) {
+        if (!r || typeof r.severity !== 'number' || r.severity <= 0) continue;
+        const key = _ndTroubleKey(r.s, r.f, r.chartT);
+        m.set(key, { severity: r.severity, primary: r.primary });
+    }
+    return m;
+}
+
 // ── Now-line judgment queue ──────────────────────────────────────────────
 // Renders at project(0) which is KNOWN to work (the detection dot is there).
 // This is the primary visual feedback — the past-note markers are secondary.
@@ -4638,6 +4690,85 @@ highway.addDrawHook(function(ctx, W, H) {
         }
 
         ctx.restore();
+    }
+
+    // ── Trouble-note glow (upcoming notes the player failed last play) ───
+    // Renders BEFORE drawJudgment so the standard hit/miss marker overlays it
+    // once the player reaches the note (judgment registers and trouble glow
+    // is naturally superseded — same draw call, later timestamp wins).
+    const drawTroubleGlow = (s, f, noteTime, trouble) => {
+        const tOff = noteTime - t;
+        // Only glow notes that are upcoming or AT the now-line — past notes
+        // either have a current judgment (handled below) or aren't relevant.
+        if (tOff < -0.05) return;
+        const p = highway.project(tOff);
+        if (!p) return;
+        const x = highway.fretX(f, p.scale, W);
+        const y = p.y * H;
+        const sev = trouble.severity || 0.5;
+
+        // Distance-based intensity: faint when far away, full when reaching
+        // the now-line, so the warning ramps as the player approaches.
+        const proximity = Math.max(0, 1 - tOff / 2.5); // ramps over last 2.5s
+        const alpha = 0.25 + 0.55 * proximity * sev;
+
+        // Pulse rate also scales with proximity — slow shimmer far out,
+        // urgent flash near the now-line. nowSec lets the pulse animate.
+        const nowSec = performance.now() / 1000;
+        const pulseRate = 2 + 5 * proximity;
+        const pulse = 0.6 + 0.4 * Math.sin(nowSec * pulseRate);
+
+        // Color: orange → red as severity climbs. Same hue family as the
+        // miss-X marker so the player learns "these colors mean trouble"
+        // but distinct enough that it doesn't read as "you already missed it."
+        const r = 255;
+        const g = Math.round(180 - 140 * sev);
+        const b = 60;
+        const colour = `rgba(${r},${g},${b},${(alpha * pulse).toFixed(3)})`;
+
+        const sz = Math.max(22, 30 * p.scale);
+        ctx.save();
+        ctx.shadowColor = colour;
+        ctx.shadowBlur = 18 * p.scale;
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = Math.max(2, 3 * p.scale);
+        ctx.beginPath();
+        ctx.arc(x, y, sz, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+    };
+
+    if (_ndTroubleNotes.size > 0) {
+        if (notes) {
+            const start = _ndBsearch(notes, t - 0.1);
+            for (let i = start; i < notes.length; i++) {
+                const n = notes[i];
+                if (n.t > t + 3) break;
+                if (n.mt) continue;
+                const tk = _ndTroubleKey(n.s, n.f, n.t);
+                const trouble = _ndTroubleNotes.get(tk);
+                if (!trouble) continue;
+                // Skip if a current judgment already exists — the live marker
+                // takes precedence.
+                if (_ndNoteResults.has(_ndNoteKey(n, n.t))) continue;
+                drawTroubleGlow(n.s, n.f, n.t, trouble);
+            }
+        }
+        if (chords) {
+            const start = _ndBsearch(chords, t - 0.1);
+            for (let i = start; i < chords.length; i++) {
+                const c = chords[i];
+                if (c.t > t + 3) break;
+                for (const cn of (c.notes || [])) {
+                    if (cn.mt) continue;
+                    const tk = _ndTroubleKey(cn.s, cn.f, c.t);
+                    const trouble = _ndTroubleNotes.get(tk);
+                    if (!trouble) continue;
+                    if (_ndNoteResults.has(_ndNoteKey(cn, c.t))) continue;
+                    drawTroubleGlow(cn.s, cn.f, c.t, trouble);
+                }
+            }
+        }
     }
 
     // ── Iterate chart notes — look back far enough for persistent markers ─
@@ -4941,6 +5072,11 @@ async function _ndToggle() {
         _ndStartHUD();
 
         if (_ndDetectionMethod === 'crepe') _ndLoadCrepe();
+
+        // Seed the trouble map from the most recent prior play so notes the
+        // player missed last time glow as they approach. Fire-and-forget;
+        // glow renders only after the fetch resolves.
+        _ndLoadTroubleFromDisk();
     } else {
         _ndStopAudio();
         _ndStopHUD();
