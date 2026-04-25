@@ -1,3 +1,5 @@
 .env
 node_modules/
 /.agent-shell/
+__pycache__/
+*.pyc

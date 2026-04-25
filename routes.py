@@ -9,6 +9,30 @@ from fastapi.responses import FileResponse
 
 DUMP_FILE = Path("/tmp/nd_diag_dump.json")
 RECORDING_DIR = Path("/tmp/nd_recordings")
+PLAYS_DIR = Path("/tmp/nd_plays")
+PLAYS_KEEP_PER_SONG = 10
+
+
+def _safe_song_dir(song_id: str) -> Path:
+    # songId is filename__arrangement; keep it filesystem-safe.
+    # Reject pure-dot names (".", "..") which would resolve to PLAYS_DIR or
+    # PLAYS_DIR.parent. Verified: the per-char filter alone would let
+    # songId="../foo" through as ".._foo" (harmless) but songId=".." escapes.
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in song_id)[:200]
+    if not safe or safe.strip(".") == "":
+        safe = "unknown"
+    return PLAYS_DIR / safe
+
+
+def _prune_plays(song_dir: Path):
+    if not song_dir.exists():
+        return
+    files = sorted(song_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in files[PLAYS_KEEP_PER_SONG:]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
 
 
 def setup(app: FastAPI, context: dict):
@@ -64,3 +88,31 @@ def setup(app: FastAPI, context: dict):
             return {"recordings": []}
         files = sorted(RECORDING_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
         return {"recordings": [{"name": f.name, "size": f.stat().st_size} for f in files]}
+
+    @app.post("/api/plugins/note_detect/plays")
+    async def save_play(request: Request):
+        data = await request.json()
+        song_id = data.get("songId") or "unknown"
+        play_id = data.get("playId") or ""
+        song_dir = _safe_song_dir(song_id)
+        song_dir.mkdir(parents=True, exist_ok=True)
+        # playId is an ISO timestamp on the client; sanitize for fs use
+        safe_play = "".join(c if c.isalnum() or c in "-_." else "_" for c in play_id)[:64] or "play"
+        dest = song_dir / f"{safe_play}.json"
+        dest.write_text(json.dumps(data, indent=2))
+        _prune_plays(song_dir)
+        return {"ok": True, "path": str(dest)}
+
+    @app.get("/api/plugins/note_detect/plays")
+    async def list_plays(songId: str, limit: int = PLAYS_KEEP_PER_SONG):
+        song_dir = _safe_song_dir(songId)
+        if not song_dir.exists():
+            return {"plays": []}
+        files = sorted(song_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+        plays = []
+        for f in files:
+            try:
+                plays.append(json.loads(f.read_text()))
+            except Exception:
+                pass
+        return {"plays": plays}

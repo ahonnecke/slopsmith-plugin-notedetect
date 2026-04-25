@@ -455,6 +455,21 @@ const _ND_TRANSIENT_WINDOW = 0.15; // seconds — only filter within this window
 
 // Note tracking
 let _ndNoteResults = new Map(); // key -> 'hit'|'pitch_miss'|'timing_miss'
+
+// Severity scoring (0..1, higher = worse). Drives the post-session
+// "practice these" ranking: miss_count × avg_severity surfaces notes that
+// are missed often AND missed badly.
+function _ndSeverity(primary, timingError, pitchError) {
+    if (primary === 'MISSED_NO_DETECTION') return 1.0;
+    if (primary === 'MISSED_WRONG_PITCH') {
+        const cents = pitchError == null ? 200 : Math.abs(pitchError);
+        return Math.min(0.7 + cents / 200 * 0.3, 1.0);
+    }
+    // HIT — severity is how *imperfect* the hit was.
+    const tFrac = timingError == null ? 0 : Math.min(Math.abs(timingError) / 300, 1);
+    const pFrac = pitchError  == null ? 0 : Math.min(Math.abs(pitchError)  / 100, 1);
+    return Math.max(tFrac, pFrac);
+}
 // Per-chart-note: best pitch attempt (min |cents|) seen while note was in
 // timing window. If a note gets marked miss, we use this to distinguish
 // "detection fired but wrong pitch" vs "nothing fired at all."
@@ -717,6 +732,64 @@ function _ndAutoDumpPost() {
     _ndLastDumpTime = performance.now() / 1000;
 }
 
+// ── Per-play history (for cross-play "practice these" report) ─────────────
+// A "play" snapshot = one pass of the chart (or one loop iteration). Each
+// snapshot serializes the current _ndNoteResults Map and POSTs to
+// /api/plugins/note_detect/plays. After serialization, the Map is cleared
+// so the next iteration re-judges from scratch — but the running session
+// counters (_ndHits etc.) are preserved so the live HUD score still
+// accumulates across loops.
+
+let _ndPlaysCache = null;          // last fetched [{songId, playId, noteResults: [...]}, ...] for current song
+let _ndPlaysCacheSongId = null;
+
+function _ndCurrentSongId() {
+    const info = highway.getSongInfo && highway.getSongInfo();
+    if (!info) return null;
+    const fn = info.filename || info.title || 'unknown';
+    const ar = info.arrangement || 'default';
+    return `${fn}__${ar}`;
+}
+
+function _ndSnapshotPlay(reason) {
+    if (_ndNoteResults.size === 0) return Promise.resolve();
+    const songId = _ndCurrentSongId();
+    if (!songId) return Promise.resolve();
+    const playId = new Date().toISOString().replace(/[:.]/g, '-');
+    const noteResults = [];
+    _ndNoteResults.forEach((v, k) => noteResults.push({ key: k, ...v }));
+    const snapshot = {
+        songId,
+        playId,
+        reason,
+        startedAt: Date.now(),
+        noteResults,
+    };
+    _ndNoteResults.clear();
+    _ndNotePitchAttempts.clear();
+    _ndPlaysCacheSongId = null; // invalidate cache; next report fetch reloads
+    return fetch('/api/plugins/note_detect/plays', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(snapshot),
+    }).then(() => console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes)`))
+      .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
+}
+
+async function _ndFetchPlays(songId) {
+    if (_ndPlaysCacheSongId === songId && _ndPlaysCache) return _ndPlaysCache;
+    try {
+        const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=10`);
+        const data = await r.json();
+        _ndPlaysCache = data.plays || [];
+        _ndPlaysCacheSongId = songId;
+        return _ndPlaysCache;
+    } catch (e) {
+        console.warn('[note_detect] Plays fetch failed:', e);
+        return [];
+    }
+}
+
 function _ndCheckAutoDump() {
     const now = performance.now() / 1000;
     const scoreT = highway.getTime ? highway.getTime() : -1;
@@ -727,6 +800,12 @@ function _ndCheckAutoDump() {
             console.log('[note_detect] Loop restart detected, auto-dumping');
             _ndAutoDumpPost();
         }
+        // Per-play snapshot: each loop iteration is a discrete "play" for
+        // the cross-play heatmap. Clears _ndNoteResults so the next iteration
+        // re-judges from scratch (without this, the existing
+        // _ndNoteResults.has(key) guard at the matching site would make the
+        // first iteration's result stick across all subsequent loops).
+        _ndSnapshotPlay('loop_restart');
     }
     _ndLastSeenScoreTime = scoreT;
 
@@ -3156,6 +3235,10 @@ function _ndMatchNotes(tOverride) {
         pitchError,
         detectedMidi: scoreMidi,
         expectedMidi,
+        severity: _ndSeverity('HIT', timingError, pitchError),
+        s: cn.s,
+        f: cn.f,
+        chartT: cn.t,
     });
     _ndHits++;
     _ndStreak++;
@@ -3849,13 +3932,19 @@ function _ndCheckMisses() {
             // which category this note falls into.
             const bestPitchErr = _ndNotePitchAttempts.get(key);
             const hadDetection = bestPitchErr !== undefined;
+            const primary = hadDetection ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
+            const pitchErrForResult = hadDetection ? bestPitchErr : null;
             _ndNoteResults.set(key, {
-                primary: hadDetection ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION',
+                primary,
                 labels: [],
                 timingError: null,              // no meaningful timing for full miss
-                pitchError: hadDetection ? bestPitchErr : null,
+                pitchError: pitchErrForResult,
                 detectedMidi: null,
                 expectedMidi: _ndMidiFromStringFret(s, f) + _ndPitchOffset,
+                severity: _ndSeverity(primary, null, pitchErrForResult),
+                s,
+                f,
+                chartT: noteTime,
             });
             _ndMisses++;
             if (hadDetection) _ndPitchMisses++;
@@ -4034,6 +4123,9 @@ function _ndShowSettings() {
             <button onclick="_ndResetScoring()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-300"
                 title="Clear hit/miss counters and rolling stats so you can measure before/after cleanly">Reset stats</button>
+            <button onclick="_ndOpenReport()"
+                class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"
+                title="Show the post-session report: most-missed notes ranked across the last 10 plays of this song.">View Report</button>
         </div>
         <div class="text-[10px] text-gray-600 mb-3 leading-tight">
             <strong>Note:</strong> after the onset-gated matching change, the pipeline scores at the acoustic attack transient, not at the stable-MIDI vote. Latency-slider and Calibration Wizard are dead weight on that path — disabled until the dials are re-scoped. Pitch/timing tolerance sliders below still do what they always did.
@@ -4793,47 +4885,28 @@ async function _ndToggle() {
             _ndUpdateButton();
             return;
         }
-        // In-flight guard — if an IPC `getLevels()` round-trip takes
-        // longer than the 50 ms timer, queueing further calls would
-        // build up a backlog and process stale readings out-of-order.
-        // Same pattern as the pitch poll's `processingFrame` guard.
-        let levelsInFlight = false;
-        bridgeLevelTimer = setInterval(async () => {
-            if (!enabled || !usingDesktopBridge || levelsInFlight) return;
-            levelsInFlight = true;
-            try {
-                const levels = await desktop.audio.getLevels();
-                // Re-check after the await: disable()/destroy() can fire
-                // between the IPC round-trip and the resolve, and the
-                // bridge timer doesn't track sessionGen the way the
-                // pitch poller does. Without this we'd race-write
-                // inputLevel/inputPeak and touch the DOM on a torn-down
-                // instance.
-                if (!enabled || !usingDesktopBridge) return;
-                if (!levels) return;
-                // Engine reports peaks in 0..1 already; the Web-Audio
-                // branch scales RMS by 5 for headroom. Use the engine's
-                // value directly — overdriving the bar is a worse UX
-                // than a slightly conservative reading.
-                // Nullish-coalesce so a legitimate `0` reading (silence)
-                // isn't replaced by the fallback — `0 || x` falls through to
-                // x, which would inflate the bar during quiet moments.
-                const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
-                inputLevel = Math.min(1, Math.max(0, rawLevel));
-                const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
-                const peak = Math.min(1, Math.max(0, rawPeak));
-                if (peak > inputPeak) {
-                    inputPeak = peak;
-                    peakDecay = 30;
-                } else if (peakDecay > 0) {
-                    peakDecay--;
-                } else {
-                    inputPeak *= 0.95;
-                }
-                drawSettingsVU();
-            } catch (_) { /* one bad poll shouldn't stop the meter */ }
-            finally { levelsInFlight = false; }
-        }, 50);
+
+        // Start miss-check polling and HUD
+        _ndMissCheckInterval = setInterval(_ndCheckMisses, 100);
+        _ndStartHUD();
+
+        if (_ndDetectionMethod === 'crepe') _ndLoadCrepe();
+    } else {
+        _ndStopAudio();
+        _ndStopHUD();
+        if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
+
+        // Snapshot the final play before the summary reads from history —
+        // await so the latest play is on disk by the time _ndShowSummary's
+        // GET /plays request hits the server.
+        await _ndSnapshotPlay('detect_off');
+
+        // Show summary if we had results
+        _ndShowSummary();
+
+        // Close settings panel
+        const panel = document.getElementById('nd-settings-panel');
+        if (panel) panel.remove();
     }
 
     function stopBridgeLevelMeter() {
@@ -4864,66 +4937,197 @@ function _ndResetScoring() {
     _ndStableMidi = -1;
 }
 
-    function stopLevelMeter() {
-        if (levelRaf) {
-            cancelAnimationFrame(levelRaf);
-            levelRaf = null;
+// ── End-of-song Summary ────────────────────────────────────────────────────
+
+// Aggregate the last N play snapshots into a ranked "practice these" list.
+// Score = occurrence_count × avg_severity, surfacing notes that the user
+// misses often AND misses badly. Returns top `topN` entries.
+function _ndRankPracticeNotes(plays, topN = 10) {
+    const buckets = new Map(); // key -> { s, f, chartT, expectedMidi, count, sevSum, samples: [] }
+    for (const play of plays) {
+        for (const r of (play.noteResults || [])) {
+            if (!r || r.severity === undefined || r.severity === 0) continue;
+            // Round chartT to nearest 5ms — same chart note across loops/plays
+            // collapses into one bucket regardless of micro-jitter.
+            const chartTBin = Math.round((r.chartT || 0) * 200) / 200;
+            const k = `${r.s}|${r.f}|${chartTBin}`;
+            let b = buckets.get(k);
+            if (!b) {
+                b = { s: r.s, f: r.f, chartT: chartTBin, expectedMidi: r.expectedMidi,
+                      count: 0, sevSum: 0, samples: [] };
+                buckets.set(k, b);
+            }
+            b.count++;
+            b.sevSum += r.severity;
+            b.samples.push({
+                primary: r.primary,
+                timingError: r.timingError,
+                pitchError: r.pitchError,
+            });
+        }
+    }
+    const rows = [];
+    buckets.forEach(b => {
+        const avgSev = b.sevSum / b.count;
+        rows.push({ ...b, avgSev, score: b.count * avgSev });
+    });
+    rows.sort((a, b) => b.score - a.score);
+    return rows.slice(0, topN);
+}
+
+function _ndDescribeFailureMode(samples) {
+    // Pick the most common primary outcome and report a representative magnitude.
+    const counts = { HIT: 0, MISSED_WRONG_PITCH: 0, MISSED_NO_DETECTION: 0 };
+    let pitchErrSum = 0, pitchErrN = 0, timingErrSum = 0, timingErrN = 0;
+    for (const s of samples) {
+        counts[s.primary] = (counts[s.primary] || 0) + 1;
+        if (s.pitchError != null)  { pitchErrSum  += s.pitchError;  pitchErrN++;  }
+        if (s.timingError != null) { timingErrSum += s.timingError; timingErrN++; }
+    }
+    const dominant = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    if (dominant === 'MISSED_NO_DETECTION') return 'no input detected';
+    if (dominant === 'MISSED_WRONG_PITCH') {
+        if (pitchErrN === 0) return 'wrong pitch';
+        const avg = Math.round(pitchErrSum / pitchErrN);
+        return `wrong pitch (avg ${avg > 0 ? '+' : ''}${avg}¢)`;
+    }
+    // Imperfect hit — describe whichever error is bigger
+    const tAvg = timingErrN ? timingErrSum / timingErrN : 0;
+    const pAvg = pitchErrN  ? pitchErrSum  / pitchErrN  : 0;
+    const tFrac = Math.abs(tAvg) / 300;
+    const pFrac = Math.abs(pAvg) / 100;
+    if (tFrac > pFrac && timingErrN > 0) {
+        const ms = Math.round(tAvg);
+        return `${ms > 0 ? 'late' : 'early'} (avg ${ms > 0 ? '+' : ''}${ms}ms)`;
+    }
+    if (pitchErrN > 0) {
+        const c = Math.round(pAvg);
+        return `${c > 0 ? 'sharp' : 'flat'} (avg ${c > 0 ? '+' : ''}${c}¢)`;
+    }
+    return 'imperfect';
+}
+
+function _ndFormatChartTime(t) {
+    const mm = Math.floor(t / 60);
+    const ss = Math.floor(t % 60).toString().padStart(2, '0');
+    return `${mm}:${ss}`;
+}
+
+async function _ndPopulatePracticeList() {
+    const slot = document.getElementById('nd-practice-slot');
+    if (!slot) return;
+    const songId = _ndCurrentSongId();
+    if (!songId) {
+        slot.innerHTML = '<div class="text-gray-500 text-xs italic">No song loaded.</div>';
+        return;
+    }
+    const plays = await _ndFetchPlays(songId);
+    if (!plays.length) {
+        slot.innerHTML = '<div class="text-gray-500 text-xs italic">No play history yet — play through once to start collecting data.</div>';
+        return;
+    }
+    const ranked = _ndRankPracticeNotes(plays, 10);
+    if (!ranked.length) {
+        slot.innerHTML = `<div class="text-gray-500 text-xs italic">No imperfect notes across the last ${plays.length} play(s) — clean run.</div>`;
+        return;
+    }
+    let html = `<div class="text-gray-400 text-xs mb-1">Practice these (last ${plays.length} play${plays.length === 1 ? '' : 's'}):</div>`;
+    for (const r of ranked) {
+        const noteName = _fcMidiToNoteName(r.expectedMidi);
+        const stringLabel = `s${(r.s ?? 0) + 1} f${r.f ?? 0}`;
+        const failureDesc = _ndDescribeFailureMode(r.samples);
+        const sevPct = Math.round(r.avgSev * 100);
+        const barColor = r.avgSev >= 0.7 ? 'bg-red-500' : r.avgSev >= 0.4 ? 'bg-yellow-500' : 'bg-blue-500';
+        html += `
+            <div class="flex items-center gap-2 mb-1 text-xs">
+                <span class="w-12 text-gray-300 font-mono">${_ndFormatChartTime(r.chartT)}</span>
+                <span class="w-10 text-gray-200 font-semibold">${noteName}</span>
+                <span class="w-12 text-gray-500 font-mono text-[10px]">${stringLabel}</span>
+                <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                    <div class="${barColor} h-full rounded" style="width:${sevPct}%"></div>
+                </div>
+                <span class="w-8 text-right text-gray-400 font-mono">${r.count}×</span>
+                <span class="flex-shrink-0 w-32 text-right text-gray-500 text-[10px] truncate" title="${failureDesc}">${failureDesc}</span>
+            </div>
+        `;
+    }
+    slot.innerHTML = html;
+}
+
+function _ndOpenReport() {
+    _ndShowSummary(true);
+}
+
+function _ndShowSummary(manual = false) {
+    const total = _ndHits + _ndMisses;
+    if (!manual && total < 5) return; // not enough data for the auto-on-stop case
+
+    let overlay = document.getElementById('nd-summary-overlay');
+    if (overlay) overlay.remove();
+
+    const accuracy = Math.round((_ndHits / total) * 100);
+
+    let sectionHtml = '';
+    if (_ndSectionStats.length > 0) {
+        sectionHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Per Section:</div>';
+        for (const sec of _ndSectionStats) {
+            const secTotal = sec.hits + sec.misses;
+            const secAcc = secTotal > 0 ? Math.round((sec.hits / secTotal) * 100) : 0;
+            const barColor = secAcc >= 90 ? 'bg-green-500' : secAcc >= 70 ? 'bg-yellow-500' : 'bg-red-500';
+            sectionHtml += `
+                <div class="flex items-center gap-2 mb-1">
+                    <span class="w-24 truncate text-gray-300">${sec.name}</span>
+                    <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
+                        <div class="${barColor} h-full rounded" style="width:${secAcc}%"></div>
+                    </div>
+                    <span class="w-10 text-right text-gray-400">${secAcc}%</span>
+                </div>
+            `;
         }
     }
 
-    function drawSettingsVU() {
-        const bar = instanceRoot.querySelector('.nd-vu-bar');
-        const peak = instanceRoot.querySelector('.nd-vu-peak');
-        if (!bar) return;
-        const pct = Math.round(inputLevel * 100);
-        bar.style.width = pct + '%';
-        bar.className = pct > 85 ? 'nd-vu-bar h-full rounded transition-all duration-75 bg-red-500'
-            : pct > 60 ? 'nd-vu-bar h-full rounded transition-all duration-75 bg-yellow-500'
-            : 'nd-vu-bar h-full rounded transition-all duration-75 bg-green-500';
-        if (peak) {
-            const peakPct = Math.round(inputPeak * 100);
-            peak.style.left = Math.min(peakPct, 100) + '%';
-        }
-    }
+    overlay = document.createElement('div');
+    overlay.id = 'nd-summary-overlay';
+    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    overlay.innerHTML = `
+        <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-[480px] max-h-[85vh] overflow-y-auto shadow-2xl">
+            <div class="text-center mb-4">
+                <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
+                <div class="text-gray-400 text-sm">Accuracy</div>
+            </div>
+            <div class="grid grid-cols-3 gap-3 text-center text-sm mb-3">
+                <div>
+                    <div class="text-green-400 font-bold">${_ndHits}</div>
+                    <div class="text-gray-500 text-xs">Hits</div>
+                </div>
+                <div>
+                    <div class="text-red-400 font-bold">${_ndMisses}</div>
+                    <div class="text-gray-500 text-xs">Misses</div>
+                </div>
+                <div>
+                    <div class="text-blue-400 font-bold">${_ndBestStreak}</div>
+                    <div class="text-gray-500 text-xs">Best Streak</div>
+                </div>
+            </div>
+            ${sectionHtml}
+            <div id="nd-practice-slot" class="mt-3 border-t border-gray-700 pt-3">
+                <div class="text-gray-500 text-xs italic">Loading practice list…</div>
+            </div>
+            <button onclick="this.parentElement.parentElement.remove()"
+                    class="mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                Close
+            </button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
 
-    // ── Frame processing ──────────────────────────────────────────────
-    async function processFrame(buffer) {
-        let result;
-        let detectorUsed;
-        // Capture the session generation at frame start. disable()
-        // increments sessionGen, so any frame that was already running
-        // past an `await` sees a changed generation and bails rather
-        // than apply stale hits / fire stale events. Without this
-        // guard a CREPE inference in flight during song switch would
-        // score against the old session's chart.
-        const gen = sessionGen;
-        // On the desktop bridge there is no audioCtx; use the engine
-        // sample rate cached at startAudio() time instead. Browser
-        // path keeps reading audioCtx.sampleRate.
-        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        switch (detectionMethod) {
-            case 'crepe':
-                if (_ndShared.model) {
-                    result = await _ndCrepeDetect(buffer);
-                    detectorUsed = 'crepe';
-                    if (result.freq <= 0 || result.confidence < detectionConfidenceMin) {
-                        result = _ndYinDetect(buffer, sr);
-                        detectorUsed = 'yin';
-                    }
-                    break;
-                }
-                result = _ndYinDetect(buffer, sr);
-                detectorUsed = 'yin';
-                break;
-            case 'hps':
-                result = _ndHpsDetect(buffer, sr);
-                detectorUsed = 'hps';
-                break;
-            case 'yin':
-            default:
-                result = _ndYinDetect(buffer, sr);
-                detectorUsed = 'yin';
-        }
+    // Async-fill the practice list from the per-play history
+    _ndPopulatePracticeList();
+
+    // Publish to Practice Journal if installed
+    _ndPublishToJournal(accuracy);
+}
 
         // If the instance was disabled (or re-enabled into a new
         // session) while CREPE was awaiting, drop this result on the
@@ -9254,16 +9458,16 @@ setInterval(() => {
 
 (function() {
     const origPlaySong = window.playSong;
-    if (typeof origPlaySong !== 'function') {
-        // playSong may not exist yet. Common on HMR or unusual load
-        // orders where the plugin runs before slopsmith's app.js
-        // defines it. Retry a bounded number of times on the next
-        // task — cap prevents an infinite loop in host environments
-        // that never define playSong (e.g. the node:test vm harness).
-        // Retry counter lives on `_ndShared` so a second evaluation
-        // doesn't get a fresh 20-attempt budget on top of the first.
-        if (_ndShared.playSongRetries++ < _ND_PLAY_SONG_MAX_RETRIES) {
-            setTimeout(_ndInstallPlaySongHook, 50);
+    window.playSong = async function(filename, arrangement) {
+        // Snapshot the in-flight play (if any) BEFORE resetting — songId is
+        // still the previous song's at this point, which is what we want.
+        _ndSnapshotPlay('song_change');
+        // Reset state on new song
+        if (_ndEnabled) {
+            _ndStopAudio();
+            _ndStopHUD();
+            if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
+            _ndEnabled = false;
         }
         _ndResetScoring();
         await origPlaySong(filename, arrangement);
