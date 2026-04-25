@@ -5030,23 +5030,107 @@ function _ndFormatChartTime(t) {
     return `${mm}:${ss}`;
 }
 
-async function _ndPopulatePracticeList() {
-    const slot = document.getElementById('nd-practice-slot');
-    if (!slot) return;
-    const songId = _ndCurrentSongId();
-    if (!songId) {
-        slot.innerHTML = '<div class="text-gray-500 text-xs italic">No song loaded.</div>';
-        return;
+// Pull every signed timing/pitch error from the last-N plays.
+//   - timing: HIT records only (NO_DETECTION + WRONG_PITCH have null timing)
+//   - pitch: HIT + WRONG_PITCH (NO_DETECTION has null pitch)
+// Returns plain Number[] arrays so the binning helper can chew through them.
+function _ndAggregatePlayErrors(plays) {
+    const timing = [];
+    const pitch = [];
+    for (const play of plays) {
+        for (const r of (play.noteResults || [])) {
+            if (!r) continue;
+            // typeof NaN === 'number', so an isFinite gate is required to
+            // keep accidental NaNs out of downstream binning.
+            if (typeof r.timingError === 'number' && isFinite(r.timingError)) timing.push(r.timingError);
+            if (typeof r.pitchError  === 'number' && isFinite(r.pitchError))  pitch.push(r.pitchError);
+        }
     }
-    const plays = await _ndFetchPlays(songId);
-    if (!plays.length) {
-        slot.innerHTML = '<div class="text-gray-500 text-xs italic">No play history yet — play through once to start collecting data.</div>';
-        return;
+    return { timing, pitch };
+}
+
+// Equal-width binning with edge clamping. Out-of-range values land in the
+// nearest edge bin so outliers stay visible instead of being dropped silently.
+// Returns { bins: number[], binWidth, lo, hi } where bins[i] covers
+// [lo + i*binWidth, lo + (i+1)*binWidth).
+function _ndBinErrors(values, binWidth, lo, hi) {
+    const numBins = Math.max(1, Math.ceil((hi - lo) / binWidth));
+    const bins = new Array(numBins).fill(0);
+    for (const v of values) {
+        if (typeof v !== 'number' || !isFinite(v)) continue;
+        const clamped = Math.max(lo, Math.min(hi - 1e-9, v));
+        const idx = Math.max(0, Math.min(numBins - 1, Math.floor((clamped - lo) / binWidth)));
+        bins[idx]++;
     }
+    return { bins, binWidth, lo, hi };
+}
+
+// Inline-SVG histogram. Returns an HTML string suitable for innerHTML.
+// Bars are colored by distance from zero (green at center, red at edges) so
+// the eye can spot tail-heavy distributions. Zero-line marker drawn as a
+// vertical white tick.
+function _ndRenderHistogram(title, values, opts) {
+    const { binWidth, lo, hi, unit, ticks } = opts;
+    if (!values.length) {
+        return `<div class="text-[10px] text-gray-600 italic mb-2">${title}: no data</div>`;
+    }
+    const { bins } = _ndBinErrors(values, binWidth, lo, hi);
+    const maxCount = Math.max(1, ...bins);
+    const W = 432, H = 80;                    // matches modal w-[480px] minus padding
+    const PAD_L = 8, PAD_R = 8, PAD_T = 6, PAD_B = 18;
+    const plotW = W - PAD_L - PAD_R;
+    const plotH = H - PAD_T - PAD_B;
+    const barW = plotW / bins.length;
+    const range = hi - lo;
+    const xForVal = (v) => PAD_L + ((v - lo) / range) * plotW;
+
+    let bars = '';
+    for (let i = 0; i < bins.length; i++) {
+        const c = bins[i];
+        if (c === 0) continue;
+        const h = (c / maxCount) * plotH;
+        const x = PAD_L + i * barW;
+        const y = PAD_T + (plotH - h);
+        // Color: distance-from-zero fraction → green (0) to red (1)
+        const binCenter = lo + (i + 0.5) * binWidth;
+        const distFrac = Math.min(1, Math.abs(binCenter) / Math.max(Math.abs(lo), Math.abs(hi)));
+        const r = Math.round(80 + 175 * distFrac);
+        const g = Math.round(200 - 150 * distFrac);
+        bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(barW - 0.5).toFixed(1)}" height="${h.toFixed(1)}" fill="rgb(${r},${g},80)"/>`;
+    }
+
+    // Zero-line marker
+    const zeroX = xForVal(0);
+    const zeroLine = `<line x1="${zeroX.toFixed(1)}" y1="${PAD_T}" x2="${zeroX.toFixed(1)}" y2="${PAD_T + plotH}" stroke="white" stroke-width="1" stroke-dasharray="2,2" opacity="0.6"/>`;
+
+    // Axis labels
+    let axis = '';
+    for (const tickVal of ticks) {
+        const tx = xForVal(tickVal);
+        const sign = tickVal > 0 ? '+' : '';
+        axis += `<text x="${tx.toFixed(1)}" y="${H - 4}" fill="#888" font-size="9" font-family="monospace" text-anchor="middle">${sign}${tickVal}${unit}</text>`;
+        axis += `<line x1="${tx.toFixed(1)}" y1="${PAD_T + plotH}" x2="${tx.toFixed(1)}" y2="${PAD_T + plotH + 2}" stroke="#666"/>`;
+    }
+
+    return `
+        <div class="mt-2">
+            <div class="flex justify-between items-center text-[10px] text-gray-500 mb-1">
+                <span>${title}</span>
+                <span>${values.length} sample${values.length === 1 ? '' : 's'}</span>
+            </div>
+            <svg viewBox="0 0 ${W} ${H}" class="w-full" style="background:#1a1a1a;border-radius:4px;">
+                ${bars}
+                ${zeroLine}
+                ${axis}
+            </svg>
+        </div>
+    `;
+}
+
+function _ndRenderPracticeList(plays) {
     const ranked = _ndRankPracticeNotes(plays, 10);
     if (!ranked.length) {
-        slot.innerHTML = `<div class="text-gray-500 text-xs italic">No imperfect notes across the last ${plays.length} play(s) — clean run.</div>`;
-        return;
+        return `<div class="text-gray-500 text-xs italic">No imperfect notes across the last ${plays.length} play(s) — clean run.</div>`;
     }
     let html = `<div class="text-gray-400 text-xs mb-1">Practice these (last ${plays.length} play${plays.length === 1 ? '' : 's'}):</div>`;
     for (const r of ranked) {
@@ -5068,7 +5152,39 @@ async function _ndPopulatePracticeList() {
             </div>
         `;
     }
-    slot.innerHTML = html;
+    return html;
+}
+
+async function _ndPopulateReport() {
+    const practiceSlot = document.getElementById('nd-practice-slot');
+    const histSlot     = document.getElementById('nd-hist-slot');
+    if (!practiceSlot && !histSlot) return;
+
+    const songId = _ndCurrentSongId();
+    if (!songId) {
+        if (practiceSlot) practiceSlot.innerHTML = '<div class="text-gray-500 text-xs italic">No song loaded.</div>';
+        if (histSlot) histSlot.innerHTML = '';
+        return;
+    }
+    const plays = await _ndFetchPlays(songId);
+    if (!plays.length) {
+        if (practiceSlot) practiceSlot.innerHTML = '<div class="text-gray-500 text-xs italic">No play history yet — play through once to start collecting data.</div>';
+        if (histSlot) histSlot.innerHTML = '';
+        return;
+    }
+    if (practiceSlot) practiceSlot.innerHTML = _ndRenderPracticeList(plays);
+    if (histSlot) {
+        const { timing, pitch } = _ndAggregatePlayErrors(plays);
+        histSlot.innerHTML =
+            _ndRenderHistogram('Timing error', timing, {
+                binWidth: 25, lo: -300, hi: 300, unit: 'ms',
+                ticks: [-300, -150, 0, 150, 300],
+            }) +
+            _ndRenderHistogram('Pitch error', pitch, {
+                binWidth: 10, lo: -200, hi: 200, unit: '¢',
+                ticks: [-200, -100, 0, 100, 200],
+            });
+    }
 }
 
 function _ndOpenReport() {
@@ -5131,6 +5247,7 @@ function _ndShowSummary(manual = false) {
             <div id="nd-practice-slot" class="mt-3 border-t border-gray-700 pt-3">
                 <div class="text-gray-500 text-xs italic">Loading practice list…</div>
             </div>
+            <div id="nd-hist-slot" class="mt-3 border-t border-gray-700 pt-3"></div>
             <button onclick="this.parentElement.parentElement.remove()"
                     class="mt-4 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
                 Close
@@ -5139,8 +5256,8 @@ function _ndShowSummary(manual = false) {
     `;
     document.body.appendChild(overlay);
 
-    // Async-fill the practice list from the per-play history
-    _ndPopulatePracticeList();
+    // Async-fill the practice list and histograms from the per-play history
+    _ndPopulateReport();
 
     // Publish to Practice Journal if installed
     _ndPublishToJournal(accuracy);

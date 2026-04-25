@@ -192,3 +192,85 @@ test('failure-mode: early/flat sign reporting', () => {
     assert.match(desc2, /flat/i);
     assert.match(desc2, /-55¢/);
 });
+
+// ── Aggregate play errors ─────────────────────────────────────────────────
+
+test('aggregate: pulls signed timing/pitch errors out of last-N plays', () => {
+    const plays = [
+        { noteResults: [
+            { primary: 'HIT', timingError: 30,  pitchError: 10 },
+            { primary: 'HIT', timingError: -50, pitchError: -20 },
+            { primary: 'MISSED_WRONG_PITCH', timingError: null, pitchError: 80 },
+            { primary: 'MISSED_NO_DETECTION', timingError: null, pitchError: null },
+        ]},
+        { noteResults: [
+            { primary: 'HIT', timingError: 0, pitchError: 0 },
+        ]},
+    ];
+    const { timing, pitch } = core.aggregatePlayErrors(plays);
+    // Timing collected from HITs only (3 entries)
+    assert.equal(timing.length, 3);
+    assert.deepEqual([...timing].sort((a,b) => a-b), [-50, 0, 30]);
+    // Pitch collected from HITs + WRONG_PITCH (4 entries)
+    assert.equal(pitch.length, 4);
+    assert.deepEqual([...pitch].sort((a,b) => a-b), [-20, 0, 10, 80]);
+});
+
+test('aggregate: ignores null/undefined error fields', () => {
+    const plays = [{ noteResults: [
+        { primary: 'HIT', timingError: undefined, pitchError: 5 },
+        { primary: 'HIT', timingError: 10, pitchError: undefined },
+        { primary: 'HIT', timingError: 'bogus', pitchError: NaN },
+    ]}];
+    const { timing, pitch } = core.aggregatePlayErrors(plays);
+    assert.equal(timing.length, 1);
+    assert.equal(pitch.length, 1);
+});
+
+test('aggregate: empty plays returns empty arrays', () => {
+    const { timing, pitch } = core.aggregatePlayErrors([]);
+    assert.equal(timing.length, 0);
+    assert.equal(pitch.length, 0);
+});
+
+// ── Bin errors ────────────────────────────────────────────────────────────
+
+test('binning: equal-width buckets, count per bin', () => {
+    // lo=-100, hi=100, width=50 → 4 bins: [-100,-50), [-50,0), [0,50), [50,100)
+    // Values: -90 -60 → bin 0 (count 2); -10 → bin 1 (count 1);
+    //          5  49 → bin 2 (count 2);  75 → bin 3 (count 1).
+    const { bins } = core.binErrors([-90, -60, -10, 5, 49, 75], 50, -100, 100);
+    assert.equal(bins.length, 4);
+    assert.deepEqual([...bins], [2, 1, 2, 1]);
+});
+
+test('binning: out-of-range values clamp to edge bins (visible, not dropped)', () => {
+    const { bins } = core.binErrors([-500, 500, 0], 50, -100, 100);
+    // -500 → leftmost bin, 500 → rightmost bin, 0 → middle (bin 2)
+    assert.equal(bins.length, 4);
+    assert.equal(bins[0], 1, 'left outlier into leftmost bin');
+    assert.equal(bins[3], 1, 'right outlier into rightmost bin');
+    assert.equal(bins[2], 1, '0 lands in [0,50)');
+});
+
+test('binning: ignores non-numeric / non-finite values', () => {
+    const { bins } = core.binErrors([10, NaN, Infinity, -Infinity, null, undefined, 'x', 30], 50, -100, 100);
+    assert.equal(bins.reduce((a,b) => a+b, 0), 2, 'only the two finite numbers count');
+});
+
+test('binning: zero-input returns all-zero bin counts of correct length', () => {
+    const { bins } = core.binErrors([], 25, -300, 300);
+    // (300 - -300) / 25 = 24 bins
+    assert.equal(bins.length, 24);
+    assert.equal(bins.every(b => b === 0), true);
+});
+
+test('binning: timing-histogram defaults match what _ndRenderHistogram passes', () => {
+    // 25ms bins from -300 to 300 → 24 bins
+    const { bins } = core.binErrors([0, 100, -100, 250, -250], 25, -300, 300);
+    assert.equal(bins.length, 24);
+    // Index of 0ms: floor((0 - -300) / 25) = 12
+    assert.equal(bins[12], 1, '0ms in bin 12');
+    // Index of 100ms: floor(400/25) = 16
+    assert.equal(bins[16], 1);
+});
