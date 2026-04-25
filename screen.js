@@ -2076,15 +2076,18 @@ function _ndProcessAudioChunk(input) {
         _ndLastOnsetPerfNow = nowPerfSec;
         _ndReattackArmed = false; // disarm until next release
         _ndOnsetCount++;
-        // Flush the YIN buffers so the next frame reads 100% post-onset audio.
-        // Without this, the first couple of post-onset YIN runs read a 4096-
-        // sample (~86 ms) buffer whose leading half still contains the
-        // previous note's sustain; the stability voter then locks onto that
-        // stale pitch. Confirmed on Level session: 9/18 YIN_DISAGREES returned
-        // a preceding chart note's pitch. Costs one extra ScriptProcessor
-        // chunk (~43 ms) of latency before the first valid stable reading.
+        // Flush the YIN buffers AND drop this trigger chunk. The trigger
+        // chunk itself is half pre-attack (previous note's sustain) and half
+        // post-attack — when previous sustain is louder than the new attack
+        // (soft pluck after a held note), keeping it in the accumulator lets
+        // YIN lock onto the stale pitch. Post-flush Level run still saw 8/16
+        // YIN_DISAGREES returning the preceding pitch when only buffers were
+        // cleared. Returning here drops the trigger chunk so the next 4096-
+        // sample YIN buffer is built entirely from post-onset chunks. Costs
+        // one extra ScriptProcessor chunk (~43 ms) of latency.
         _ndAccumBuffer = new Float32Array(0);
         _ndPendingBuffer = null;
+        return;
     }
 
     // Accumulate samples for low-frequency detection (need 4096 at 48 kHz
