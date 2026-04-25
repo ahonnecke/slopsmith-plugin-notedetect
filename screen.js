@@ -801,6 +801,9 @@ function _ndSnapshotPlay(reason) {
     // Build the trouble map from this just-completed play BEFORE clearing
     // so the next loop iteration starts with up-to-date pre-arrival glow.
     _ndTroubleNotes = _ndBuildTroubleMap(noteResults);
+    // Per-iteration banner — quick in-page summary of just-finished pass so
+    // the user gets immediate feedback without running `make loop-report`.
+    if (reason === 'loop_restart') _ndShowIterationBanner(noteResults);
     _ndNoteResults.clear();
     _ndNotePitchAttempts.clear();
     _ndNoteHygiene.clear();
@@ -847,6 +850,285 @@ async function _ndFetchPlays(songId) {
         console.warn('[note_detect] Plays fetch failed:', e);
         return [];
     }
+}
+
+// ── In-page Practice Report (browser port of test/aggregate-plays.js) ────
+// Mirrors the Node aggregator's algorithm so the user gets the same shape
+// of report inside the page — the offline `make loop-report` is now for
+// cross-session debugging, not the practice flow.
+
+function _ndAggregatePlays(plays) {
+    // Per-play metadata + per-note attempt verdicts joined across plays.
+    plays = (plays || []).slice().sort((a, b) => {
+        const ax = a.startedAt || 0, bx = b.startedAt || 0;
+        return ax - bx;
+    });
+    const playMeta = plays.map((p, i) => {
+        const ts = (p.noteResults || []).map(r => r.chartT).filter(t => Number.isFinite(t));
+        return {
+            idx: i, playId: p.playId, startedAt: p.startedAt, reason: p.reason,
+            chartTMin: ts.length ? Math.min(...ts) : null,
+            chartTMax: ts.length ? Math.max(...ts) : null,
+            count: (p.noteResults || []).length,
+        };
+    });
+    const noteIndex = new Map();
+    for (let i = 0; i < plays.length; i++) {
+        for (const r of plays[i].noteResults || []) {
+            if (!noteIndex.has(r.key)) {
+                noteIndex.set(r.key, {
+                    key: r.key, chartT: r.chartT, expectedMidi: r.expectedMidi,
+                    stringFret: `s${r.s}/f${r.f}`, attempts: new Map(),
+                });
+            }
+            noteIndex.get(r.key).attempts.set(i, { primary: r.primary });
+        }
+    }
+    const rows = [];
+    for (const note of noteIndex.values()) {
+        const verdicts = [];
+        for (const meta of playMeta) {
+            const a = note.attempts.get(meta.idx);
+            if (a) verdicts.push({ kind: a.primary });
+            else if (meta.chartTMin != null && note.chartT >= meta.chartTMin && note.chartT <= meta.chartTMax) {
+                verdicts.push({ kind: 'ABSENT' });
+            } else verdicts.push({ kind: 'OUT_OF_SCOPE' });
+        }
+        rows.push({ ...note, verdicts });
+    }
+    rows.sort((a, b) => a.chartT - b.chartT);
+    return { playMeta, rows };
+}
+
+function _ndStatsForRow(row) {
+    const inScope = row.verdicts.filter(v => v.kind !== 'OUT_OF_SCOPE');
+    const cleanHits = inScope.filter(v => v.kind === 'HIT').length;
+    const dirtyHits = inScope.filter(v => v.kind === 'DIRTY_HIT').length;
+    const hits = cleanHits + dirtyHits;
+    const wrongPitch = inScope.filter(v => v.kind === 'MISSED_WRONG_PITCH').length;
+    const noDetection = inScope.filter(v => v.kind === 'MISSED_NO_DETECTION').length;
+    return {
+        nAttempts: inScope.length,
+        hits, cleanHits, dirtyHits, wrongPitch, noDetection,
+        hitRate: inScope.length ? hits / inScope.length : 0,
+    };
+}
+
+function _ndSuggestLoops(rows, opts = {}) {
+    // Sliding-window hotspot finder — same as test/aggregate-plays.js.
+    const { windowSec = 5, slideSec = 0.5, minMissesPerSec = 0.5,
+            minTroubleNotes = 2, maxLoops = 5, padHeadSec = 0.5, padTailSec = 1.0 } = opts;
+    const noteList = rows.map(r => ({ ...r, ...(_ndStatsForRow(r)) })).filter(r => r.nAttempts >= 2);
+    if (noteList.length === 0) return [];
+    const minT = Math.min(...noteList.map(n => n.chartT));
+    const maxT = Math.max(...noteList.map(n => n.chartT));
+    const candidates = [];
+    for (let start = minT - windowSec / 2; start <= maxT + windowSec / 2; start += slideSec) {
+        const end = start + windowSec;
+        let misses = 0, attempts = 0;
+        const inside = [];
+        for (const n of noteList) {
+            if (n.chartT >= start && n.chartT <= end) {
+                inside.push(n);
+                misses += n.nAttempts - n.hits;
+                attempts += n.nAttempts;
+            }
+        }
+        const trouble = inside.filter(n => n.hits < n.nAttempts).length;
+        const density = misses / windowSec;
+        if (density >= minMissesPerSec && trouble >= minTroubleNotes) {
+            candidates.push({ start, end, density, misses, attempts, trouble, notes: inside });
+        }
+    }
+    candidates.sort((a, b) => b.density - a.density);
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxLoops) break;
+        if (selected.some(s => s.start < c.end && s.end > c.start)) continue;
+        selected.push(c);
+    }
+    selected.sort((a, b) => a.start - b.start);
+    return selected.map((c, i) => {
+        const a = Math.max(0, c.start - padHeadSec);
+        const b = c.end + padTailSec;
+        const trouble = c.notes.filter(n => n.hits < n.nAttempts);
+        return {
+            id: i + 1, startSec: a, endSec: b, durationSec: b - a,
+            noteCount: trouble.length,
+            avgMissRate: trouble.length
+                ? trouble.reduce((s, n) => s + (1 - n.hitRate), 0) / trouble.length : 0,
+            positions: [...new Set(trouble.map(n => n.stringFret))].slice(0, 4).join(','),
+            notes: trouble,
+        };
+    });
+}
+
+function _ndVerdictGlyph(kind) {
+    if (kind === 'HIT') return { glyph: '✓', color: '#4ade80' };           // green
+    if (kind === 'DIRTY_HIT') return { glyph: '⚠', color: '#facc15' };     // yellow
+    if (kind === 'MISSED_WRONG_PITCH') return { glyph: '✗', color: '#fb923c' };  // orange
+    if (kind === 'MISSED_NO_DETECTION') return { glyph: '∅', color: '#f87171' }; // red
+    if (kind === 'ABSENT') return { glyph: '·', color: '#6b7280' };
+    return { glyph: '', color: '#6b7280' };
+}
+
+// POST a suggested loop into slopsmith's persisted loops table so it shows
+// up in the saved-loops dropdown next page-load. Slopsmith's /api/loops
+// endpoint expects { filename, name, start, end }; auto-names if name
+// is empty. Inline button click handler — `btn` is the button itself
+// so we can flip it to "Saved" without a re-render.
+async function _ndSaveSuggestedLoop(filename, start, end, btn) {
+    if (!filename) {
+        if (btn) { btn.textContent = 'No song'; btn.disabled = true; }
+        return;
+    }
+    try {
+        const r = await fetch('/api/loops', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, name: '', start, end }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+            if (btn) {
+                btn.textContent = `Saved: ${data.name}`;
+                btn.disabled = true;
+                btn.className = 'px-2 py-0.5 bg-green-900/40 rounded text-green-200 text-[11px]';
+            }
+        } else {
+            if (btn) { btn.textContent = data.error || 'Failed'; }
+        }
+    } catch (e) {
+        console.warn('[note_detect] Save loop failed:', e);
+        if (btn) btn.textContent = 'Failed';
+    }
+}
+
+async function _ndShowReport() {
+    let panel = document.getElementById('nd-report-panel');
+    if (panel) { panel.remove(); return; }
+
+    const songId = _ndCurrentSongId();
+    if (!songId) { alert('No song loaded'); return; }
+    const plays = await _ndFetchPlays(songId);
+
+    panel = document.createElement('div');
+    panel.id = 'nd-report-panel';
+    panel.className = 'fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 shadow-2xl text-sm overflow-auto';
+    panel.style.width = '720px';
+    panel.style.maxHeight = '80vh';
+
+    if (plays.length === 0) {
+        panel.innerHTML = `
+            <div class="flex justify-between items-center mb-2">
+                <span class="text-gray-200 font-semibold">Practice Report — ${songId}</span>
+                <button onclick="document.getElementById('nd-report-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
+            </div>
+            <p class="text-gray-400 text-xs">No plays recorded yet for this song. Play through the chart (or set an A/B loop and play several iterations) to populate the report.</p>
+        `;
+        document.body.appendChild(panel);
+        return;
+    }
+
+    const { playMeta, rows } = _ndAggregatePlays(plays);
+    const N = playMeta.length;
+    let bestOfN = 0, perfectAcrossN = 0, cleanAcrossN = 0, neverHit = 0, dirtyTotal = 0;
+    for (const row of rows) {
+        const s = _ndStatsForRow(row);
+        if (s.hits > 0) bestOfN++;
+        if (s.hits === s.nAttempts && s.nAttempts === N) perfectAcrossN++;
+        if (s.cleanHits === s.nAttempts && s.nAttempts === N) cleanAcrossN++;
+        if (s.hits === 0) neverHit++;
+        dirtyTotal += s.dirtyHits;
+    }
+    const total = rows.length;
+    const loops = _ndSuggestLoops(rows);
+
+    // Build the matrix HTML row by row.
+    const matrixRows = rows.map(row => {
+        const s = _ndStatsForRow(row);
+        const cells = row.verdicts.map(v => {
+            const g = _ndVerdictGlyph(v.kind);
+            return `<span style="color:${g.color}; display:inline-block; width:14px; text-align:center; font-family:monospace;">${g.glyph}</span>`;
+        }).join('');
+        const tag = s.hits === s.nAttempts ? 'all'
+            : s.hits === 0 ? 'none' : `${s.hits}/${s.nAttempts}`;
+        return `
+            <tr class="border-b border-gray-700/50 hover:bg-dark-600">
+                <td class="text-gray-400 px-2 py-0.5 font-mono text-[11px]">${row.chartT.toFixed(2)}s</td>
+                <td class="text-gray-300 px-1 py-0.5 font-mono text-[11px]">${row.expectedMidi}</td>
+                <td class="text-gray-400 px-1 py-0.5 font-mono text-[11px]">${row.stringFret}</td>
+                <td class="px-2 py-0.5">${cells}</td>
+                <td class="text-gray-400 px-2 py-0.5 font-mono text-[11px]">${tag}</td>
+            </tr>
+        `;
+    }).join('');
+
+    // Suggested loops with embedded Save buttons.
+    const songInfo = highway.getSongInfo && highway.getSongInfo();
+    const songFilename = songInfo?.filename || '';
+    const loopsHtml = loops.length === 0
+        ? '<p class="text-gray-500 text-xs">No suggested loops — no clusters of ≥2 trouble notes found.</p>'
+        : loops.map(lp => {
+            const noteListHtml = lp.notes.slice(0, 5).map(n => {
+                const pct = ((1 - n.hitRate) * 100).toFixed(0);
+                return `<li class="text-[11px] text-gray-400 font-mono">${n.chartT.toFixed(2)}s &nbsp;MIDI ${n.expectedMidi} &nbsp;${n.stringFret} &nbsp;${n.nAttempts - n.hits}/${n.nAttempts} (${pct}%)</li>`;
+            }).join('');
+            const safeFn = (songFilename || '').replace(/'/g, "\\'");
+            return `
+                <div class="bg-dark-800 border border-gray-700 rounded p-2 mb-2">
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-gray-200 text-xs font-semibold">Loop ${lp.id}: ${lp.startSec.toFixed(1)}s–${lp.endSec.toFixed(1)}s
+                            <span class="text-gray-500 font-normal">(${lp.durationSec.toFixed(1)}s, ${lp.noteCount} trouble notes, ${(lp.avgMissRate * 100).toFixed(0)}% avg miss)</span></span>
+                        <button onclick="_ndSaveSuggestedLoop('${safeFn}', ${lp.startSec.toFixed(2)}, ${lp.endSec.toFixed(2)}, this)"
+                            class="px-2 py-0.5 bg-blue-900/40 hover:bg-blue-900/70 rounded text-blue-200 text-[11px]">
+                            Save loop
+                        </button>
+                    </div>
+                    <div class="text-[11px] text-gray-500 mb-1">positions: ${lp.positions || '—'}</div>
+                    <ul class="ml-4 list-disc">${noteListHtml}</ul>
+                </div>
+            `;
+        }).join('');
+
+    panel.innerHTML = `
+        <div class="flex justify-between items-center mb-3">
+            <span class="text-gray-200 font-semibold">Practice Report — ${songId}</span>
+            <button onclick="document.getElementById('nd-report-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+        <div class="text-xs text-gray-400 mb-3">${playMeta.length} attempts · ${rows.length} unique notes</div>
+        <div class="grid grid-cols-4 gap-2 mb-3 text-xs">
+            <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Best-of-${N}</div><div class="text-green-400 font-semibold">${bestOfN}/${total} (${total ? (bestOfN/total*100).toFixed(0) : '0'}%)</div></div>
+            <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Perfect</div><div class="text-blue-300 font-semibold">${perfectAcrossN}/${total} (${total ? (perfectAcrossN/total*100).toFixed(0) : '0'}%)</div></div>
+            <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Clean every time</div><div class="text-emerald-300 font-semibold">${cleanAcrossN}/${total} (${total ? (cleanAcrossN/total*100).toFixed(0) : '0'}%)</div></div>
+            <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Dirty hits</div><div class="text-yellow-300 font-semibold">${dirtyTotal}</div></div>
+        </div>
+
+        <div class="text-gray-400 text-xs mb-1">Per-note attempt matrix (chronological)</div>
+        <div class="bg-dark-800 rounded p-1 mb-3 max-h-72 overflow-auto">
+            <table class="w-full text-[11px]">
+                <thead><tr class="text-gray-500 border-b border-gray-700">
+                    <th class="text-left px-2 py-0.5">chartT</th>
+                    <th class="text-left px-1 py-0.5">midi</th>
+                    <th class="text-left px-1 py-0.5">s/f</th>
+                    <th class="text-left px-2 py-0.5">attempts (oldest → newest)</th>
+                    <th class="text-left px-2 py-0.5">hits</th>
+                </tr></thead>
+                <tbody>${matrixRows}</tbody>
+            </table>
+        </div>
+        <div class="text-[10px] text-gray-500 mb-3">
+            <span style="color:#4ade80">✓</span> clean HIT &nbsp;
+            <span style="color:#facc15">⚠</span> dirty HIT &nbsp;
+            <span style="color:#fb923c">✗</span> wrong pitch &nbsp;
+            <span style="color:#f87171">∅</span> no detection &nbsp;
+            <span style="color:#6b7280">·</span> absent
+        </div>
+
+        <div class="text-gray-400 text-xs mb-1">Suggested practice loops (densest miss clusters)</div>
+        ${loopsHtml}
+    `;
+    document.body.appendChild(panel);
 }
 
 function _ndCheckAutoDump() {
@@ -4688,6 +4970,52 @@ function _ndBuildTroubleMap(noteResults) {
     return m;
 }
 
+// Per-iteration banner toast — fixed-position summary that fades after a
+// few seconds. Replaces (or supplements) the post-play `make loop-report`
+// step for the basic per-iteration feedback case. Counts the four primary
+// states from the just-completed iteration's noteResults so the player
+// knows immediately whether a pass got cleaner or worse.
+let _ndIterationBannerCount = 0;
+function _ndShowIterationBanner(noteResults) {
+    let clean = 0, dirty = 0, missWrong = 0, missNone = 0;
+    for (const r of noteResults || []) {
+        if (r.primary === 'HIT') clean++;
+        else if (r.primary === 'DIRTY_HIT') dirty++;
+        else if (r.primary === 'MISSED_WRONG_PITCH') missWrong++;
+        else if (r.primary === 'MISSED_NO_DETECTION') missNone++;
+    }
+    const total = clean + dirty + missWrong + missNone;
+    if (total === 0) return;
+    _ndIterationBannerCount++;
+    const id = `nd-iteration-toast-${_ndIterationBannerCount}`;
+
+    const existing = document.querySelectorAll('.nd-iteration-toast');
+    // Stack: shift older toasts down so consecutive iterations are visible briefly.
+    existing.forEach((el, i) => { el.style.top = `${20 + (i + 1) * 70}px`; });
+
+    const toast = document.createElement('div');
+    toast.id = id;
+    toast.className = 'nd-iteration-toast fixed right-4 z-[200] bg-dark-800 border border-gray-600 rounded-lg px-4 py-2 text-sm shadow-2xl';
+    toast.style.top = '20px';
+    toast.style.transition = 'opacity 0.3s, transform 0.3s';
+    const cleanPct = total > 0 ? ((clean / total) * 100).toFixed(0) : '0';
+    toast.innerHTML = `
+        <div class="text-gray-400 text-[10px] mb-0.5">Iteration ${_ndIterationBannerCount} — ${total} notes, ${cleanPct}% clean</div>
+        <div class="flex gap-3 items-center">
+            <span class="text-green-400">✓ ${clean}</span>
+            ${dirty > 0    ? `<span class="text-yellow-400">⚠ ${dirty}</span>`     : ''}
+            ${missWrong > 0 ? `<span class="text-orange-400">✗ ${missWrong}</span>` : ''}
+            ${missNone > 0  ? `<span class="text-red-400">∅ ${missNone}</span>`     : ''}
+        </div>
+    `;
+    document.body.appendChild(toast);
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(20px)';
+        setTimeout(() => toast.remove(), 350);
+    }, 4000);
+}
+
 // ── Now-line judgment queue ──────────────────────────────────────────────
 // Renders at project(0) which is KNOWN to work (the detection dot is there).
 // This is the primary visual feedback — the past-note markers are secondary.
@@ -5171,6 +5499,17 @@ function _ndInjectButton() {
     diag.title = 'Detection diagnostics';
     diag.onclick = _ndToggleDiag;
     controls.insertBefore(diag, closeBtn);
+
+    // Report button \u2014 opens the in-page Practice Report panel (per-attempt
+    // matrix + suggested loops). Replaces `make loop-report` for the
+    // common practice flow; offline tooling stays for cross-session debug.
+    const report = document.createElement('button');
+    report.id = 'btn-notedetect-report';
+    report.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+    report.textContent = '\u2630'; // \u2630 \u2014 list/menu glyph
+    report.title = 'Practice report (last N loop attempts)';
+    report.onclick = _ndShowReport;
+    controls.insertBefore(report, closeBtn);
 }
 
 // Auto-Detect-on-Play: hook the host's <audio id="audio"> 'play' event so
@@ -5221,6 +5560,8 @@ function _ndUpdateButton() {
     if (gear) gear.classList.toggle('hidden', !_ndEnabled);
     const diag = document.getElementById('btn-notedetect-diag');
     if (diag) diag.classList.toggle('hidden', !_ndEnabled);
+    const report = document.getElementById('btn-notedetect-report');
+    if (report) report.classList.toggle('hidden', !_ndEnabled);
 }
 
 async function _ndToggle() {
