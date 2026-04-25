@@ -1044,6 +1044,34 @@ async function _ndShowReport() {
     const total = rows.length;
     const loops = _ndSuggestLoops(rows);
 
+    // Latency stack — break the HIT timing distribution down into the
+    // structural pieces so the user knows which part of "lateness" is
+    // theirs vs. the pipeline. Onset capture compensates the audio-buffer
+    // half-chunk via _ND_ONSET_BUFFER_COMP_SEC; av_offset is slopsmith's
+    // visual/audio sync setting; residual = the player's actual reaction
+    // time relative to the audio.
+    const hitTimings = [];
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
+                    && typeof r.timingError === 'number') {
+                hitTimings.push(r.timingError);
+            }
+        }
+    }
+    hitTimings.sort((a, b) => a - b);
+    const p50Timing = hitTimings.length
+        ? hitTimings[Math.floor((hitTimings.length - 1) * 0.5)]
+        : null;
+    const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
+    // _ND_ONSET_BUFFER_COMP_SEC is 20 ms — onset chart-time is captured at
+    // the midpoint of the trigger chunk to undo half the ScriptProcessor
+    // buffer delay. timingError = player_offset + avOffset - 20.
+    const onsetCompMs = _ND_ONSET_BUFFER_COMP_SEC * 1000;
+    const playerOffsetMs = p50Timing != null
+        ? Math.round(p50Timing - avOffsetMs + onsetCompMs)
+        : null;
+
     // Build the matrix HTML row by row.
     const matrixRows = rows.map(row => {
         const s = _ndStatsForRow(row);
@@ -1103,6 +1131,34 @@ async function _ndShowReport() {
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Clean every time</div><div class="text-emerald-300 font-semibold">${cleanAcrossN}/${total} (${total ? (cleanAcrossN/total*100).toFixed(0) : '0'}%)</div></div>
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Dirty hits</div><div class="text-yellow-300 font-semibold">${dirtyTotal}</div></div>
         </div>
+
+        ${p50Timing != null ? `
+        <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
+            <div class="text-gray-400 mb-2">Where your "lateness" comes from</div>
+            <div class="grid grid-cols-3 gap-2">
+                <div>
+                    <div class="text-gray-500 text-[10px]">HIT timing (p50)</div>
+                    <div class="text-gray-200 font-mono ${p50Timing > 100 ? 'text-orange-300' : p50Timing > 50 ? 'text-yellow-300' : 'text-green-400'}">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 text-[10px]">AV offset (slopsmith)</div>
+                    <div class="text-gray-300 font-mono">${avOffsetMs > 0 ? '+' : ''}${Math.round(avOffsetMs)} ms</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 text-[10px]">Your reaction-time residual</div>
+                    <div class="font-mono ${playerOffsetMs > 150 ? 'text-orange-300' : playerOffsetMs > 75 ? 'text-yellow-300' : 'text-green-400'}">${playerOffsetMs > 0 ? '+' : ''}${playerOffsetMs} ms</div>
+                </div>
+            </div>
+            <div class="text-gray-500 text-[10px] mt-2 leading-tight">
+                Onset capture already removes ${Math.round(onsetCompMs)} ms of audio-buffer delay. Anything left over is either slopsmith's AV offset (configurable in player settings) or your visual reaction time.
+                ${playerOffsetMs > 150
+                    ? '<span class="text-orange-300"> &gt;150 ms residual usually means you&#39;re reacting to the now-line. Try anticipating from the upcoming notes instead.</span>'
+                    : playerOffsetMs < -50
+                    ? '<span class="text-blue-300"> Negative residual: you&#39;re hitting before the chart. Check AV offset.</span>'
+                    : ''}
+            </div>
+        </div>
+        ` : ''}
 
         <div class="text-gray-400 text-xs mb-1">Per-note attempt matrix (chronological)</div>
         <div class="bg-dark-800 rounded p-1 mb-3 max-h-72 overflow-auto">
