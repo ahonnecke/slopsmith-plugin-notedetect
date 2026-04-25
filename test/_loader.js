@@ -63,6 +63,14 @@ function makeSandbox() {
         cancelAnimationFrame: noop,
         Float32Array, Int16Array, Uint8Array, Array, Map, Set, Date, Math, JSON, Error,
         Promise,
+        // EventTarget / CustomEvent are needed by the NotesBus IIFE at the top
+        // of screen.js; vm contexts don't inherit these globals. Without them
+        // the script aborts at line ~76 and downstream let/const declarations
+        // stay in the TDZ, breaking every test that touches them.
+        EventTarget, CustomEvent,
+        // fetch is called by the auto-dump and play-snapshot paths; the IIFEs
+        // don't invoke it at top level, but defensive stubbing avoids surprises.
+        fetch: () => Promise.resolve({ json: () => Promise.resolve({}) }),
         // Highway API stub — plugin's IIFE at bottom reads window.playSong
         highway: { getTime: () => 0, getNotes: () => [], getSongInfo: () => ({}) },
     };
@@ -85,6 +93,7 @@ function loadDetectionCore() {
         '_ndYinDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering',
+        '_ndSeverity', '_ndRankPracticeNotes', '_ndDescribeFailureMode',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -109,6 +118,9 @@ function loadDetectionCore() {
         midiFromStringFret: sandbox._ndMidiFromStringFret,
         midiToStringFret: rewrapSf(sandbox._ndMidiToStringFret),
         resolveDisplayFingering: rewrapSf(sandbox._ndResolveDisplayFingering),
+        severity: sandbox._ndSeverity,
+        rankPracticeNotes: sandbox._ndRankPracticeNotes,
+        describeFailureMode: sandbox._ndDescribeFailureMode,
     };
 }
 

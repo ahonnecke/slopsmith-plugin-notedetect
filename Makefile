@@ -59,6 +59,10 @@ TEST_FILES := $(if $(FILE),test/$(FILE:.test.js=).test.js,test/*.test.js)
 test: ## Run node:test suite (FILE=<name> scopes to test/<name>.test.js)
 	node --test $(TEST_FILES)
 
+.PHONY: test-plays-roundtrip
+test-plays-roundtrip: ## Server-side round-trip harness for the per-play history routes
+	python3 test/plays-roundtrip.py
+
 # Default fixture matches the "4/127" baseline (commit 2e99ab0). Override with
 # WAV=<path> for other takes. Companion .json in test/fixtures/ supplies
 # chartStartTime automatically, so --wav-offset is not required.
