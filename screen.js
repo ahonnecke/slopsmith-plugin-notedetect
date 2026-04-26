@@ -448,6 +448,37 @@ let _ndEarly = 0, _ndLate = 0, _ndSharp = 0, _ndFlat = 0;
 const _ND_PERFECT_TIMING_MS  = 50;
 const _ND_PERFECT_PITCH_CENT = 20;
 
+// Adaptive drift estimate. Real-world recordings (especially CDLC and
+// charts of live human performances) have rubato — the audio's note
+// timing wanders relative to the chart's BPM-derived note positions.
+// Without compensation, a +230 ms drift makes every clean hit look LATE
+// in the live HUD and pushes some hits outside the timing window
+// entirely.
+//
+// We maintain a rolling median of recent HIT timingError values. The
+// median is treated as the current chart-vs-audio offset and added to
+// each chart note's chartT before window/label checks — equivalent to
+// shifting the hit window center forward by the drift amount. Median is
+// robust to a few outliers (a single late note doesn't move the
+// estimate much). Window size of 8 picks up tempo wobble within ~10 s
+// without locking onto a single bad hit.
+let _ndDriftBuffer = [];          // last N HIT timingError values (ms)
+let _ndDriftEstimateMs = 0;       // current rolling median
+const _ND_DRIFT_WINDOW = 8;       // sample count
+const _ND_DRIFT_MIN_SAMPLES = 4;  // need this many before estimate becomes non-zero
+
+function _ndUpdateDriftEstimate(timingError) {
+    _ndDriftBuffer.push(timingError);
+    if (_ndDriftBuffer.length > _ND_DRIFT_WINDOW) _ndDriftBuffer.shift();
+    if (_ndDriftBuffer.length >= _ND_DRIFT_MIN_SAMPLES) {
+        const sorted = _ndDriftBuffer.slice().sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        _ndDriftEstimateMs = sorted.length % 2 === 0
+            ? (sorted[mid - 1] + sorted[mid]) / 2
+            : sorted[mid];
+    }
+}
+
 // Rolling diagnostic stats — each entry is the closest-chart-note-match for a
 // detection event. Used for the HUD readout.
 //   dtMs:   plugin_now - chart_note_time (ms). Positive = detection late.
@@ -1135,7 +1166,7 @@ async function _ndShowReport() {
         ${p50Timing != null ? `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
             <div class="text-gray-400 mb-2">Where your "lateness" comes from</div>
-            <div class="grid grid-cols-3 gap-2">
+            <div class="grid grid-cols-4 gap-2">
                 <div>
                     <div class="text-gray-500 text-[10px]">HIT timing (p50)</div>
                     <div class="text-gray-200 font-mono ${p50Timing > 100 ? 'text-orange-300' : p50Timing > 50 ? 'text-yellow-300' : 'text-green-400'}">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
@@ -1145,16 +1176,18 @@ async function _ndShowReport() {
                     <div class="text-gray-300 font-mono">${avOffsetMs > 0 ? '+' : ''}${Math.round(avOffsetMs)} ms</div>
                 </div>
                 <div>
-                    <div class="text-gray-500 text-[10px]">Your reaction-time residual</div>
+                    <div class="text-gray-500 text-[10px]">Live drift estimate</div>
+                    <div class="text-purple-300 font-mono">${_ndDriftEstimateMs > 0 ? '+' : ''}${Math.round(_ndDriftEstimateMs)} ms</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 text-[10px]">Reaction residual</div>
                     <div class="font-mono ${playerOffsetMs > 150 ? 'text-orange-300' : playerOffsetMs > 75 ? 'text-yellow-300' : 'text-green-400'}">${playerOffsetMs > 0 ? '+' : ''}${playerOffsetMs} ms</div>
                 </div>
             </div>
             <div class="text-gray-500 text-[10px] mt-2 leading-tight">
-                Onset capture already removes ${Math.round(onsetCompMs)} ms of audio-buffer delay. Anything left over is either slopsmith's AV offset (configurable in player settings) or your visual reaction time.
-                ${playerOffsetMs > 150
-                    ? '<span class="text-orange-300"> &gt;150 ms residual usually means you&#39;re reacting to the now-line. Try anticipating from the upcoming notes instead.</span>'
-                    : playerOffsetMs < -50
-                    ? '<span class="text-blue-300"> Negative residual: you&#39;re hitting before the chart. Check AV offset.</span>'
+                Onset capture removes ${Math.round(onsetCompMs)} ms of audio-buffer delay. The drift estimate is a rolling median of recent HIT timings — it adapts as the chart wanders relative to the audio, and the matcher shifts the hit window to compensate. LATE/EARLY labels are computed against drift-adjusted timing.
+                ${Math.abs(_ndDriftEstimateMs) > 150
+                    ? '<span class="text-purple-300"> Large drift detected — chart-vs-audio sync is significant for this song.</span>'
                     : ''}
             </div>
         </div>
@@ -3626,25 +3659,32 @@ function _ndMatchNotes(tOverride) {
     const earlyWindowSec = _ndTimingTolerance;
     const lateWindowSec = _ndTimingTolerance * 2;
     const centsTolerance = _ndPitchTolerance;
+    // Shift the search center forward by the rolling drift estimate.
+    // Equivalent to shifting each chart note's effective .t backward
+    // by the same amount — i.e., "the chart says this note is at C,
+    // but the audio is consistently arriving D ms later, so search as
+    // if the chart said C+D".
+    const driftSec = _ndDriftEstimateMs / 1000;
+    const tCenter = t - driftSec;
 
     const candidateNotes = [];
 
-    // Candidate notes sit within [t - lateWindow, t + earlyWindow] around the
-    // detection-adjusted chart time `t`.
+    // Candidate notes sit within [tCenter - lateWindow, tCenter + earlyWindow]
+    // around the detection-adjusted, drift-compensated chart time.
     if (notes && notes.length > 0) {
-        const start = _ndBsearch(notes, t - lateWindowSec);
+        const start = _ndBsearch(notes, tCenter - lateWindowSec);
         for (let i = start; i < notes.length; i++) {
             const n = notes[i];
-            if (n.t > t + earlyWindowSec) break;
+            if (n.t > tCenter + earlyWindowSec) break;
             if (n.mt) continue; // skip muted notes
             candidateNotes.push({ s: n.s, f: n.f, t: n.t });
         }
     }
     if (chords && chords.length > 0) {
-        const start = _ndBsearch(chords, t - lateWindowSec);
+        const start = _ndBsearch(chords, tCenter - lateWindowSec);
         for (let i = start; i < chords.length; i++) {
             const c = chords[i];
-            if (c.t > t + earlyWindowSec) break;
+            if (c.t > tCenter + earlyWindowSec) break;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
@@ -3748,15 +3788,27 @@ function _ndMatchNotes(tOverride) {
     const EXACT_PITCH_CENTS = 25;
     const exactPitch = pitchPassing.filter(p => Math.abs(p.pitchError) < EXACT_PITCH_CENTS);
     const pool = exactPitch.length > 0 ? exactPitch : pitchPassing;
-    pool.sort((a, b) => Math.abs(a.timingError) - Math.abs(b.timingError));
+    // Pool sort uses drift-adjusted timing error so the nearest-in-time
+    // selection picks the chart note that the player actually targeted,
+    // not the one closest to the un-compensated chart-time clock.
+    pool.sort((a, b) =>
+        Math.abs(a.timingError - _ndDriftEstimateMs) - Math.abs(b.timingError - _ndDriftEstimateMs));
     const winner = pool[0];
     const { cn, key, expectedMidi, pitchError, timingError } = winner;
+    // Adjust timing for LATE/EARLY labels: if the song is drifting +200 ms,
+    // a HIT at +200 ms is "on time" within the drift, not LATE. Raw
+    // timingError still goes into the snapshot so analytics show the
+    // actual chart-vs-audio offset.
+    const adjustedTimingError = timingError - _ndDriftEstimateMs;
 
     const labels = [];
-    if (timingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
-    else if (timingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
+    if (adjustedTimingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
+    else if (adjustedTimingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
     if (pitchError > _ND_PERFECT_PITCH_CENT)       { labels.push('SHARP'); _ndSharp++; }
     else if (pitchError < -_ND_PERFECT_PITCH_CENT) { labels.push('FLAT');  _ndFlat++; }
+    // Feed the drift estimator with the raw observed timing so future
+    // matches benefit from the rolling-median.
+    _ndUpdateDriftEstimate(timingError);
 
     _ndNoteResults.set(key, {
         primary: 'HIT',
@@ -5728,6 +5780,8 @@ function _ndResetScoring() {
     _ndNoteHygiene.clear();
     _ndRawMidiHistory = [];
     _ndStableMidi = -1;
+    _ndDriftBuffer = [];
+    _ndDriftEstimateMs = 0;
 }
 
 // ── End-of-song Summary ────────────────────────────────────────────────────
