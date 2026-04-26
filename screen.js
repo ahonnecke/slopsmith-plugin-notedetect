@@ -445,8 +445,14 @@ let _ndEarly = 0, _ndLate = 0, _ndSharp = 0, _ndFlat = 0;
 // Sub-tolerance "perfect" thresholds: beyond these we attach a label even
 // if the note still counts as a hit within the user's tolerance sliders.
 // Values from the spec.
-const _ND_PERFECT_TIMING_MS  = 50;
-const _ND_PERFECT_PITCH_CENT = 20;
+// Perfect-window thresholds — used for LATE/EARLY/SHARP/FLAT label decisions
+// (HIT remains a HIT in either case; labels just signal precision). These
+// are tracked as `let` rather than const so the strictness preset can rebind
+// them — a 50 ms perfect window inside a 300 ms Easy hit window meant
+// almost every clean hit got tagged LATE, even when comfortably in window.
+// Set initially to default-preset values; _ndApplyStrictness rebinds them.
+let _ndPerfectTimingMs  = 50;
+let _ndPerfectPitchCent = 20;
 
 // Adaptive drift estimate. Real-world recordings (especially CDLC and
 // charts of live human performances) have rubato — the audio's note
@@ -1577,11 +1583,16 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 //   default  — 50¢ pitch / 150ms timing, dirty trips at 50% off-target.
 //   strict   — 25¢ / 100ms, dirty trips at 30% off-target. Mastery
 //              validation, surfaces every hygiene leak.
+// Each preset also pins the LATE/EARLY/SHARP/FLAT label thresholds so the
+// "perfect" zone scales with how lenient the hit window is. Otherwise the
+// hard-coded 50 ms perfect threshold fires LATE on hits comfortably inside a
+// 300 ms Easy window, making the highway feel angry even when the score is
+// fine. perfectTimingMs is roughly window/3 — the "core" of each window.
 const _ND_STRICTNESS_PRESETS = {
-    rocksmith: { pitchTolerance: 2400, timingTolerance: 0.400, dirtyHitMaxOffRatio: 1.0 },
-    easy:      { pitchTolerance:  100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0 },
-    default:   { pitchTolerance:   50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5 },
-    strict:    { pitchTolerance:   25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3 },
+    rocksmith: { pitchTolerance: 2400, timingTolerance: 0.400, dirtyHitMaxOffRatio: 1.0, perfectTimingMs: 200, perfectPitchCent: 100 },
+    easy:      { pitchTolerance:  100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0, perfectTimingMs: 100, perfectPitchCent:  50 },
+    default:   { pitchTolerance:   50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5, perfectTimingMs:  50, perfectPitchCent:  20 },
+    strict:    { pitchTolerance:   25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3, perfectTimingMs:  25, perfectPitchCent:  10 },
 };
 
 function _ndApplyStrictness(level) {
@@ -1591,11 +1602,23 @@ function _ndApplyStrictness(level) {
     _ndPitchTolerance = preset.pitchTolerance;
     _ndTimingTolerance = preset.timingTolerance;
     _ndDirtyHitMaxOffRatio = preset.dirtyHitMaxOffRatio;
+    _ndPerfectTimingMs = preset.perfectTimingMs;
+    _ndPerfectPitchCent = preset.perfectPitchCent;
     _ndSaveSettings();
     // Re-render the settings panel so the tolerance fields show the new values.
     const panel = document.getElementById('nd-settings-panel');
     if (panel) { panel.remove(); _ndShowSettings(); }
 }
+
+// Initial sync — load may have set _ndStrictness; apply that preset's perfect
+// thresholds so the labels match it from the start.
+(function () {
+    const preset = _ND_STRICTNESS_PRESETS[_ndStrictness];
+    if (preset) {
+        _ndPerfectTimingMs = preset.perfectTimingMs;
+        _ndPerfectPitchCent = preset.perfectPitchCent;
+    }
+})();
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
@@ -3802,10 +3825,10 @@ function _ndMatchNotes(tOverride) {
     const adjustedTimingError = timingError - _ndDriftEstimateMs;
 
     const labels = [];
-    if (adjustedTimingError > _ND_PERFECT_TIMING_MS)       { labels.push('LATE');  _ndLate++; }
-    else if (adjustedTimingError < -_ND_PERFECT_TIMING_MS) { labels.push('EARLY'); _ndEarly++; }
-    if (pitchError > _ND_PERFECT_PITCH_CENT)       { labels.push('SHARP'); _ndSharp++; }
-    else if (pitchError < -_ND_PERFECT_PITCH_CENT) { labels.push('FLAT');  _ndFlat++; }
+    if (adjustedTimingError > _ndPerfectTimingMs)       { labels.push('LATE');  _ndLate++; }
+    else if (adjustedTimingError < -_ndPerfectTimingMs) { labels.push('EARLY'); _ndEarly++; }
+    if (pitchError > _ndPerfectPitchCent)       { labels.push('SHARP'); _ndSharp++; }
+    else if (pitchError < -_ndPerfectPitchCent) { labels.push('FLAT');  _ndFlat++; }
     // Feed the drift estimator with the raw observed timing so future
     // matches benefit from the rolling-median.
     _ndUpdateDriftEstimate(timingError);
@@ -4514,22 +4537,40 @@ function _ndCheckMisses() {
             // which category this note falls into.
             const bestPitchErr = _ndNotePitchAttempts.get(key);
             const hadDetection = bestPitchErr !== undefined;
-            const primary = hadDetection ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
-            const pitchErrForResult = hadDetection ? bestPitchErr : null;
+            const expectedMidi = _ndMidiFromStringFret(s, f) + _ndPitchOffset;
+            // Sibling-loser demotion: if a NEARBY chart note with the SAME
+            // expected MIDI was already matched to a HIT, the pitch attempt
+            // recorded here came from the sibling's pluck — the user only
+            // plucked once for the pair. Mark as NO_DETECTION so the report
+            // doesn't double-count the same pluck as both a HIT and a
+            // wrong-pitch miss.
+            let siblingClaimed = false;
+            if (hadDetection) {
+                const siblingWindow = _ndTimingTolerance * 2;
+                for (const v of _ndNoteResults.values()) {
+                    if (v.primary !== 'HIT' && v.primary !== 'DIRTY_HIT') continue;
+                    if (v.expectedMidi !== expectedMidi) continue;
+                    if (Math.abs(v.chartT - noteTime) > siblingWindow) continue;
+                    siblingClaimed = true; break;
+                }
+            }
+            const primary = hadDetection && !siblingClaimed
+                ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
+            const pitchErrForResult = (primary === 'MISSED_WRONG_PITCH') ? bestPitchErr : null;
             _ndNoteResults.set(key, {
                 primary,
                 labels: [],
                 timingError: null,              // no meaningful timing for full miss
                 pitchError: pitchErrForResult,
                 detectedMidi: null,
-                expectedMidi: _ndMidiFromStringFret(s, f) + _ndPitchOffset,
+                expectedMidi,
                 severity: _ndSeverity(primary, null, pitchErrForResult),
                 s,
                 f,
                 chartT: noteTime,
             });
             _ndMisses++;
-            if (hadDetection) _ndPitchMisses++;
+            if (primary === 'MISSED_WRONG_PITCH') _ndPitchMisses++;
             else _ndTimingMisses++;
             _ndStreak = 0;
             _ndUpdateSectionStat('miss');
@@ -5307,7 +5348,7 @@ highway.addDrawHook(function(ctx, W, H) {
         // Timing error (for hits and pitch-misses that had timing data)
         if (judgment.timingError !== null && judgment.timingError !== undefined) {
             const ms = Math.round(judgment.timingError);
-            if (Math.abs(ms) > _ND_PERFECT_TIMING_MS) {
+            if (Math.abs(ms) > _ndPerfectTimingMs) {
                 ctx.fillStyle = '#ffaa33';
                 const arrow = ms > 0 ? '\u2193' : '\u2191';
                 const sign = ms > 0 ? '+' : '';
@@ -5319,7 +5360,7 @@ highway.addDrawHook(function(ctx, W, H) {
         // Pitch error on imperfect hits
         if (primary === 'HIT' && judgment.pitchError !== null && judgment.pitchError !== undefined) {
             const cents = Math.round(judgment.pitchError);
-            if (Math.abs(cents) > _ND_PERFECT_PITCH_CENT) {
+            if (Math.abs(cents) > _ndPerfectPitchCent) {
                 ctx.fillStyle = '#44aaff';
                 const sym = cents > 0 ? '\u266f' : '\u266d';
                 const sign = cents > 0 ? '+' : '';
