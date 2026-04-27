@@ -236,6 +236,12 @@ synth-restore: ## Restore the original audio for a song (SONG=<query>)
 	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
 	node test/synth-track.js $$SONG_ARG --restore
 
+.PHONY: song-ceiling
+song-ceiling: ## Pipeline ceiling for a song — feeds its OWN audio through classifier (SONG=<query>)
+	@SONG_ARG=""; \
+	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
+	node test/song-ceiling.js $$SONG_ARG
+
 .PHONY: hygiene
 hygiene: ## Scan the newest session for string-hygiene issues (open strings ringing, off-pitch contamination)
 	@$(RESOLVE_SESSION); \
