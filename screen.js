@@ -420,10 +420,23 @@ let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable 
 let _ndAutoRecordOnPlay = false;
 const _ND_AUTO_RECORD_MAX_SEC = 900; // 15 min — long enough for full songs and loop sessions, auto-stop is the safety
 
-// (The playSong wrapper's idempotency guard lives on the wrapper
-// function object itself — see `_ndInstallPlaySongHook()` below —
-// so it persists across HMR / double-<script>-load where a
-// module-level flag would be reset.)
+// Click-track-only playback. Mutes the song's <audio> element and
+// schedules WebAudio clicks at every chart beat so the player can
+// practice anticipating note positions from rhythm alone — no bass
+// tones, no harmonic context. Forces musical / rhythmic reading
+// instead of visual reaction; the +300 ms HIT-timing residual we see
+// with audio + click should drop substantially when the player has to
+// READ the chart and feel the bar instead of REACTING to a cue.
+let _ndClickTrackOnly = false;
+let _ndClickTrackInterval = null;
+let _ndClickTrackScheduled = new Set();   // chart-time keys of beats already scheduled
+const _ND_CLICK_LOOKAHEAD_SEC = 0.4;
+
+// Audio level metering
+let _ndInputLevel = 0;       // current RMS level 0-1
+let _ndInputPeak = 0;        // peak hold level
+let _ndPeakDecay = 0;        // decay timer for peak hold
+let _ndLevelAnalyser = null;  // AnalyserNode for VU meter
 
 // Scoring
 let _ndHits = 0;
@@ -1400,6 +1413,7 @@ function _ndSaveSettings() {
             autoRecordOnPlay: _ndAutoRecordOnPlay,
             strictness: _ndStrictness,
             dirtyHitMaxOffRatio: _ndDirtyHitMaxOffRatio,
+            clickTrackOnly: _ndClickTrackOnly,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -1433,6 +1447,9 @@ function _ndLoadSettings() {
         if (s.autoRecordOnPlay !== undefined) _ndAutoRecordOnPlay = !!s.autoRecordOnPlay;
         if (s.strictness !== undefined) _ndStrictness = s.strictness;
         if (s.dirtyHitMaxOffRatio !== undefined) _ndDirtyHitMaxOffRatio = s.dirtyHitMaxOffRatio;
+        // clickTrackOnly intentionally NOT loaded — it's a per-session
+        // training toggle, not a persistent default. Reload starts with
+        // song audio enabled.
     } catch (e) { /* ignore */ }
 }
 
@@ -4814,6 +4831,12 @@ function _ndShowSettings() {
             Strict: 25¢/100ms, dirty at &gt;30%.
         </p>
 
+        <label class="flex items-center gap-2 text-gray-300 text-xs mb-3 cursor-pointer">
+            <input type="checkbox" id="nd-click-track-only" ${_ndClickTrackOnly ? 'checked' : ''}
+                   onchange="_ndApplyClickTrackOnly(this.checked); _ndSaveSettings();">
+            <span>Click track only — mute song, click on every beat (training mode)</span>
+        </label>
+
         <label class="block text-gray-400 text-xs mb-1">Audio Input Device</label>
         <select id="nd-device-select" class="w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-2"
                 onchange="_ndOnDeviceChange(this.value)">
@@ -5790,6 +5813,72 @@ function _ndAttachAutoDetectListener() {
             _ndRecordStart(_ND_AUTO_RECORD_MAX_SEC, filename);
         }
     });
+    // Seek / pause invalidates scheduled clicks: they're already queued in
+    // the WebAudio graph at fixed times. Easiest fix is just to clear the
+    // "already scheduled" set so any rescheduling can recover after the seek
+    // finishes. The few seconds of stale clicks already in flight will play
+    // out on the old timeline but the schedule will heal within a beat.
+    audio.addEventListener('seeking', () => { _ndClickTrackScheduled.clear(); });
+    audio.addEventListener('pause', ()    => { _ndClickTrackScheduled.clear(); });
+}
+
+// ── Click-track-only playback ────────────────────────────────────────────
+// A wood-block click on every chart beat, scheduled into the existing
+// audio context. Uses the beats array already exposed by highway.
+
+function _ndScheduleClick(audioCtx, atCtxTime, freqHz = 1500, amp = 0.25, durationSec = 0.06) {
+    // Two-frequency mix for percussive bite — same character as the
+    // pre-rendered synth-track click, just scheduled live instead of
+    // baked into a WAV.
+    const gain = audioCtx.createGain();
+    gain.connect(audioCtx.destination);
+    gain.gain.setValueAtTime(0, atCtxTime);
+    gain.gain.linearRampToValueAtTime(amp, atCtxTime + 0.002);
+    gain.gain.exponentialRampToValueAtTime(0.001, atCtxTime + durationSec);
+    for (const [f, w] of [[freqHz, 0.7], [freqHz * 2.5, 0.3]]) {
+        const osc = audioCtx.createOscillator();
+        osc.frequency.value = f;
+        const oscGain = audioCtx.createGain();
+        oscGain.gain.value = w;
+        osc.connect(oscGain);
+        oscGain.connect(gain);
+        osc.start(atCtxTime);
+        osc.stop(atCtxTime + durationSec);
+    }
+}
+
+function _ndScheduleUpcomingClicks() {
+    if (!_ndClickTrackOnly || !_ndAudioCtx) return;
+    const audio = document.getElementById('audio');
+    if (!audio || audio.paused) return;
+    const audioT = audio.currentTime;
+    const ctxT = _ndAudioCtx.currentTime;
+    const beats = (highway.getBeats && highway.getBeats()) || [];
+    for (const b of beats) {
+        const dt = b.time - audioT;
+        if (dt < 0 || dt > _ND_CLICK_LOOKAHEAD_SEC) continue;
+        const key = b.time.toFixed(4);
+        if (_ndClickTrackScheduled.has(key)) continue;
+        const downbeat = b.measure != null && b.measure !== -1;
+        _ndScheduleClick(_ndAudioCtx, ctxT + dt,
+            downbeat ? 2200 : 1500, downbeat ? 0.35 : 0.25);
+        _ndClickTrackScheduled.add(key);
+    }
+}
+
+function _ndApplyClickTrackOnly(enabled) {
+    _ndClickTrackOnly = !!enabled;
+    const audio = document.getElementById('audio');
+    if (audio) audio.muted = _ndClickTrackOnly;
+    if (_ndClickTrackInterval) { clearInterval(_ndClickTrackInterval); _ndClickTrackInterval = null; }
+    _ndClickTrackScheduled.clear();
+    if (_ndClickTrackOnly) {
+        // Poll faster than the lookahead so every beat gets scheduled in time.
+        _ndClickTrackInterval = setInterval(_ndScheduleUpcomingClicks, 100);
+        console.log('[note_detect] Click-track-only mode ON (song muted, clicks on every beat)');
+    } else {
+        console.log('[note_detect] Click-track-only mode OFF (song audio restored)');
+    }
 }
 
 function _ndUpdateButton() {
