@@ -60,7 +60,19 @@ async function fetchSongAndChart() {
             return r.json();
         }, SONG_QUERY);
         if (!library.songs?.length) throw new Error(`No songs match "${SONG_QUERY}"`);
-        const song = library.songs[0];
+        // Prefer a song whose filename / artist / title contains the literal
+        // query (slopsmith's library search is single-term and can rank
+        // unrelated covers above the user's intended song). Falls back to
+        // the first hit when no substring match exists.
+        const FILENAME_HINT = getArg('filename-hint', SONG_QUERY).toLowerCase();
+        const slug = FILENAME_HINT.replace(/[^a-z0-9]+/g, '');
+        const song = library.songs.find(s => {
+            const blob = `${s.filename} ${s.artist || ''} ${s.title || ''}`.toLowerCase().replace(/[^a-z0-9]+/g, '');
+            return slug && blob.includes(slug);
+        }) || library.songs[0];
+        if (library.songs.length > 1) {
+            console.log(`  resolved "${SONG_QUERY}" → ${song.filename} (${library.songs.length} candidates)`);
+        }
         let arrIdx = ARRANGEMENT !== null ? parseInt(ARRANGEMENT, 10) : null;
         if (arrIdx === null) {
             const bassArr = song.arrangements.find(a => /bass/i.test(a.name));

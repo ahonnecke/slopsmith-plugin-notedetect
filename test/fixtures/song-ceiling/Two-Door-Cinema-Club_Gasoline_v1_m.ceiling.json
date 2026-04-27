@@ -1,0 +1,35 @@
+{
+  "stem": "Two-Door-Cinema-Club_Gasoline_v1_m",
+  "song": "Two-Door-Cinema-Club_Gasoline_v1_m.psarc",
+  "arrangement": "Bass",
+  "variant": "baseline",
+  "chartNoteCount": 305,
+  "durationSec": 226.772,
+  "score": 264,
+  "total": 305,
+  "ceilingPct": 86.55737704918033,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 305
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 264,
+      "total": 305
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 305
+    },
+    "USER_WRONG_PITCH": {
+      "count": 17,
+      "total": 305
+    },
+    "USER_SILENT": {
+      "count": 24,
+      "total": 305
+    }
+  },
+  "measuredAt": "2026-04-27T21:04:41.954Z",
+  "pipelineCommit": "0243b84"
+}

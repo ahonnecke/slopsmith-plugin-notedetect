@@ -115,8 +115,9 @@ fix that lifts Stand by Me from 57% → 70% while dragging Mexico from
 
 | Song | Tuning | Stresses |
 | --- | --- | --- |
+| Gasoline (Two Door Cinema Club) | E | Modern indie-pop with prominent clean DI bass — **band-pass ceiling 99.7%, cleanest fixture, primary user-vs-pipeline reference** |
 | Mexico (Cake) | E | Wide pitch range, moderate density — moderate-difficulty reference |
-| Stand by Me (Ben E. King) | E | Low-frequency dominant (E2/F#2), sustain bleed, same-pitch repeats — architectural-limit reference |
+| Stand by Me (Ben E. King) | E | Low-frequency dominant — chart pitches are authored half-step low (file bug), so user score is suppressed by ~17% chart-bug noise; do not use as user reference |
 | Bulls on Parade (RATM) | Eb | Heavily-mastered mid-frequency, dense syncopation, polyphonic extraction stress |
 | All About That Bass (Trainor) | E | Sparse pop bass, generous rests — should sit near monophonic ceiling |
 | Another One Bites the Dust (Queen) | E | Iconic single-note motif, clear mute gaps — sparse-clean reference |
@@ -183,6 +184,7 @@ Butterworth, 30 Hz HP × 2, 250 Hz LP × 2 cascaded) lifts every song:
 
 | Song | Baseline | Band-pass | Δ |
 | --- | --- | --- | --- |
+| Gasoline (Two Door Cinema Club) | 86.6% | **99.7%** | +13.1pp |
 | Stand by Me | 57.3% | **94.0%** | +36.7pp |
 | Mexico | 62.2% | **93.7%** | +31.5pp |
 | Another One Bites the Dust | 53.2% | **89.2%** | +36.0pp |

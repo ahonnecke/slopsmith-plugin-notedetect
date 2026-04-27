@@ -26,8 +26,14 @@ const { execSync, spawnSync } = require('child_process');
 
 // Default roster — picked to span the pipeline's stress vectors.
 const DEFAULT_ROSTER = [
+    // Cleanest fixture — band-pass ceiling 99.7%. Use as the primary
+    // user-vs-pipeline reference: any user-side score on Gasoline reflects
+    // playing accuracy almost directly because the ceiling is essentially
+    // perfect. Two-Door specifically (the search returns Audioslave first;
+    // pass --filename-hint or use the full title to disambiguate).
+    { query: 'Gasoline',               filenameHint: 'Two-Door', stresses: 'modern indie pop with prominent clean DI bass — band-pass ceiling 99.7%, cleanest fixture' },
     { query: 'Mexico',                 stresses: 'wide pitch range, moderate density (Cake — moderate-difficulty reference)' },
-    { query: 'Stand by Me',            stresses: 'low-frequency dominant (E2/F#2), sustain bleed, same-pitch repeats — architectural-limit reference' },
+    { query: 'Stand by Me',            stresses: 'low-frequency dominant (E2/F#2), sustain bleed — but chart pitches are authored half-step low, so user score is suppressed by ~17% chart-bug noise' },
     { query: 'Bulls on Parade',        stresses: 'heavily-mastered mid-frequency, dense syncopation, polyphonic extraction (RATM, Eb)' },
     { query: 'All About That Bass',    stresses: 'sparse pop bass, generous rests — should sit near monophonic ceiling (Trainor)' },
     { query: 'Another One Bites',      stresses: 'iconic single-note motif, clear mute gaps, A2/E2/G2 (Queen — sparse-clean reference)' },
@@ -125,8 +131,9 @@ function shouldReuse(cached) {
     return cached.pipelineCommit === currentCommit;
 }
 
-function runSongCeiling(query) {
+function runSongCeiling(query, filenameHint) {
     const cmd = [path.join(__dirname, 'song-ceiling.js'), '--song', query];
+    if (filenameHint) cmd.push('--filename-hint', filenameHint);
     if (BAND_PASS) cmd.push('--band-pass');
     const r = spawnSync('node', cmd, { encoding: 'utf8' });
     process.stdout.write(r.stdout || '');
@@ -155,7 +162,7 @@ function fmtPct(n) { return `${n.toFixed(1)}%`; }
     fs.mkdirSync(FIXTURE_DIR, { recursive: true });
     const rows = [];
     for (let i = 0; i < roster.length; i++) {
-        const { query, stresses } = roster[i];
+        const { query, stresses, filenameHint } = roster[i];
         console.log(`\n[${i + 1}/${roster.length}] ${query}`);
         console.log(`  stress: ${stresses}`);
         const cached = findCachedFor(query);
@@ -164,7 +171,7 @@ function fmtPct(n) { return `${n.toFixed(1)}%`; }
             console.log(`  reuse: ${cached.stem} @ ${cached.pipelineCommit} (${cached.measuredAt})`);
             result = cached;
         } else {
-            try { result = runSongCeiling(query); }
+            try { result = runSongCeiling(query, filenameHint); }
             catch (e) {
                 console.error(`  FAILED: ${e.message}`);
                 rows.push({ query, stresses, error: e.message });
