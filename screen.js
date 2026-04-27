@@ -1497,6 +1497,80 @@ let _ndAccumBuffer = new Float32Array(0);  // accumulates samples across frames
 const _ndMinYinSamples = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
 const _ndFrameSize = 2048;  // ScriptProcessor buffer size
 
+// 30–250 Hz band-pass before YIN. Offline test/song-ceiling-roster.js
+// found this lifts the audio-truth ceiling 26–58pp on every fixture
+// (Stand by Me 57→94, Take On Me 23→80, Bulls on Parade 32→71). Raw
+// YIN gets ~0 confidence on heavily-mastered or distorted-band mixes
+// because guitar/drum overtones overwhelm the bass fundamental;
+// band-passing isolates the bass band before YIN. See
+// docs/SONG_PIPELINE_CEILING.md "Band-pass pre-filter".
+//
+// Applied incrementally per audio chunk with persistent filter state
+// (cascading two 2nd-order Butterworth biquads each direction = 24 dB/oct
+// rolloff). State must NOT reset across chunks — discontinuities ring at
+// 30 Hz and YIN locks onto the filter transient. Only reset on audio
+// context restart.
+//
+// Onset detection, silence gate, and recording all consume the RAW input.
+// Only the YIN accumulator gets the filtered version.
+const _ND_BP_LOW_HZ = 30;
+const _ND_BP_HIGH_HZ = 250;
+let _ndBpEnabled = true;
+let _ndBpCoefsHp = null;
+let _ndBpCoefsLp = null;
+const _ndBpHp1 = { x1: 0, x2: 0, y1: 0, y2: 0 };
+const _ndBpHp2 = { x1: 0, x2: 0, y1: 0, y2: 0 };
+const _ndBpLp1 = { x1: 0, x2: 0, y1: 0, y2: 0 };
+const _ndBpLp2 = { x1: 0, x2: 0, y1: 0, y2: 0 };
+
+function _ndBiquadCoefs(type, fc, sampleRate) {
+    const w0 = 2 * Math.PI * fc / sampleRate;
+    const cs = Math.cos(w0), sn = Math.sin(w0);
+    const Q = Math.SQRT1_2;
+    const alpha = sn / (2 * Q);
+    let b0, b1, b2, a0, a1, a2;
+    if (type === 'highpass') {
+        b0 = (1 + cs) / 2;  b1 = -(1 + cs);  b2 = (1 + cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    } else {
+        b0 = (1 - cs) / 2;  b1 = 1 - cs;     b2 = (1 - cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    }
+    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+}
+
+function _ndApplyBiquadSample(state, coefs, x) {
+    const [b0, b1, b2, a1, a2] = coefs;
+    const y = b0*x + b1*state.x1 + b2*state.x2 - a1*state.y1 - a2*state.y2;
+    state.x2 = state.x1; state.x1 = x;
+    state.y2 = state.y1; state.y1 = y;
+    return y;
+}
+
+function _ndResetBpFilter(sampleRate) {
+    _ndBpCoefsHp = _ndBiquadCoefs('highpass', _ND_BP_LOW_HZ, sampleRate);
+    _ndBpCoefsLp = _ndBiquadCoefs('lowpass', _ND_BP_HIGH_HZ, sampleRate);
+    for (const s of [_ndBpHp1, _ndBpHp2, _ndBpLp1, _ndBpLp2]) {
+        s.x1 = 0; s.x2 = 0; s.y1 = 0; s.y2 = 0;
+    }
+    if (_ndBpEnabled) {
+        console.log(`[note_detect] YIN pre-filter: ${_ND_BP_LOW_HZ}-${_ND_BP_HIGH_HZ} Hz band-pass @ ${sampleRate} Hz (4th-order Butterworth)`);
+    }
+}
+
+function _ndApplyBpToChunk(input) {
+    if (!_ndBpEnabled || !_ndBpCoefsHp) return input;
+    const out = new Float32Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        let y = _ndApplyBiquadSample(_ndBpHp1, _ndBpCoefsHp, input[i]);
+        y = _ndApplyBiquadSample(_ndBpHp2, _ndBpCoefsHp, y);
+        y = _ndApplyBiquadSample(_ndBpLp1, _ndBpCoefsLp, y);
+        y = _ndApplyBiquadSample(_ndBpLp2, _ndBpCoefsLp, y);
+        out[i] = y;
+    }
+    return out;
+}
+
 // Onset detection — flush buffer when a new pluck is detected
 // Without this, the 4096-sample buffer contains ~85ms of audio. On sustained
 // bass notes, when you pluck a new note the buffer is still 90%+ old sustain
@@ -2818,18 +2892,34 @@ function _ndProcessAudioChunk(input) {
         return;
     }
 
-    // Accumulate samples for low-frequency detection (need 4096 at 48 kHz
-    // for low E). Detection runs off-thread via setInterval in the caller.
-    const prev = _ndAccumBuffer;
-    const combined = new Float32Array(prev.length + input.length);
-    combined.set(prev);
-    combined.set(input, prev.length);
-    if (combined.length >= _ndMinYinSamples) {
-        const start = combined.length - _ndMinYinSamples;
-        _ndPendingBuffer = combined.slice(start, start + _ndMinYinSamples);
-        _ndAccumBuffer = new Float32Array(0);
+    // Band-pass the chunk (persistent filter state) for YIN's accumulator.
+    // Onset, RMS, and recording above this point all see the RAW input —
+    // band-pass attenuates transient energy that onset detection relies on.
+    const filteredInput = _ndApplyBpToChunk(input);
+
+    // Sliding 4096-sample window: shift left by input.length, append the new
+    // chunk, and publish a pending buffer every chunk (~43 ms hop) instead of
+    // every two chunks (~85 ms hop). Halves the YIN poll interval, so the
+    // 2-of-3 stability voter sees twice as many post-onset frames per chart
+    // note. Per docs/SUSTAIN_BLEED_WALL.md phase 1: probe sweep across 9
+    // fixtures (test/probe-interventions.js) shows 0 regressions and 4
+    // sustain-bleed notes flip from fail → win on Level recordings.
+    if (_ndAccumBuffer.length < _ndMinYinSamples) {
+        // Warmup: grow buffer until we have a full YIN window.
+        const combined = new Float32Array(_ndAccumBuffer.length + filteredInput.length);
+        combined.set(_ndAccumBuffer);
+        combined.set(filteredInput, _ndAccumBuffer.length);
+        _ndAccumBuffer = combined.length >= _ndMinYinSamples
+            ? combined.slice(combined.length - _ndMinYinSamples)
+            : combined;
     } else {
-        _ndAccumBuffer = combined;
+        _ndAccumBuffer.copyWithin(0, filteredInput.length, _ndMinYinSamples);
+        _ndAccumBuffer.set(filteredInput, _ndMinYinSamples - filteredInput.length);
+    }
+    if (_ndAccumBuffer.length >= _ndMinYinSamples) {
+        // Hand the detector its own copy so subsequent slides don't mutate
+        // the buffer YIN is still reading.
+        _ndPendingBuffer = _ndAccumBuffer.slice();
     }
 }
 
@@ -3266,7 +3356,11 @@ async function _ndStartAudio() {
             const existing = (typeof h.getNoteStateProvider === 'function') ? h.getNoteStateProvider() : null;
             if (existing == null || existing === noteStateFor) h.setNoteStateProvider(noteStateFor);
         }
-    }
+        _ndStream = await navigator.mediaDevices.getUserMedia(constraints);
+        // Use native sample rate — browsers often ignore non-standard rates,
+        // and we need reliable timing for pitch detection
+        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        _ndResetBpFilter(_ndAudioCtx.sampleRate);
 
     // ── Settings persistence (only the default singleton writes) ──────
     function saveSettings() {
@@ -3389,35 +3483,17 @@ async function _ndStartAudio() {
             _ndProcessAudioChunk(e.inputBuffer.getChannelData(0));
         };
 
-            // Acquire the context independently — a caller can supply
-            // just one of {stream, context} and we create the other.
-            // `latencyHint: 'interactive'` asks the browser for the
-            // lowest-latency input/output config the platform supports —
-            // Chromium otherwise picks platform-defaults that can add
-            // 10-30 ms of buffer for no reason. Real-time pitch-detect
-            // is exactly the case the hint exists for. Falls back
-            // gracefully if a host hands us an externalAudioCtx that's
-            // already constructed.
-            audioCtx = externalAudioCtx || new (window.AudioContext || window.webkitAudioContext)({
-                latencyHint: 'interactive',
-            });
-
-            sourceNode = audioCtx.createMediaStreamSource(stream);
-            const streamChannels = sourceNode.channelCount;
-
-            gainNode = audioCtx.createGain();
-            gainNode.gain.value = inputGain;
-
-            if (streamChannels >= 2 && selectedChannel !== 'mono') {
-                splitterNode = audioCtx.createChannelSplitter(2);
-                sourceNode.connect(splitterNode);
-                mergerNode = audioCtx.createChannelMerger(1);
-                const chIdx = selectedChannel === 'left' ? 0 : 1;
-                splitterNode.connect(mergerNode, chIdx, 0);
-                mergerNode.connect(gainNode);
-            } else {
-                sourceNode.connect(gainNode);
+        // Detection runs on a timer, not in the audio callback. Poll period
+        // must be ≤ chunk period (~43 ms at 48 kHz / 2048-frame buffer) so
+        // every sliding-window pending buffer gets consumed; 50 ms dropped
+        // ~3 frames/sec, blunting the bleed-fix benefit.
+        _ndDetectInterval = setInterval(() => {
+            if (_ndPendingBuffer) {
+                const buf = _ndPendingBuffer;
+                _ndPendingBuffer = null;
+                _ndProcessFrame(buf);
             }
+        }, 25);
 
             levelAnalyser = audioCtx.createAnalyser();
             levelAnalyser.fftSize = 512;
@@ -11392,6 +11468,7 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
     // Create AudioContext if not already running
     if (!_ndAudioCtx) {
         _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        _ndResetBpFilter(_ndAudioCtx.sampleRate);
     }
     if (_ndAudioCtx.state === 'suspended') {
         await _ndAudioCtx.resume();
@@ -11421,7 +11498,7 @@ async function _ndInjectTestAudio(noteSequence, options = {}) {
                     _ndPendingBuffer = null;
                     _ndProcessFrame(buf);
                 }
-            }, 50);
+            }, 25);
         }
 
         // Start level meter for silence gate
@@ -11586,6 +11663,7 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
 
     if (!_ndAudioCtx) {
         _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        _ndResetBpFilter(_ndAudioCtx.sampleRate);
     }
     if (_ndAudioCtx.state === 'suspended') await _ndAudioCtx.resume();
 
@@ -11610,7 +11688,7 @@ async function _ndInjectTestWav(wavUrl, durationSec) {
                     _ndPendingBuffer = null;
                     _ndProcessFrame(buf);
                 }
-            }, 50);
+            }, 25);
         }
         if (!_ndLevelAnalyser) {
             _ndLevelAnalyser = _ndAudioCtx.createAnalyser();
