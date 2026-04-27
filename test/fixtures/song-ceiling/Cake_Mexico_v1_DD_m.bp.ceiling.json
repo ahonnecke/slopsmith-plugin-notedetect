@@ -1,0 +1,35 @@
+{
+  "stem": "Cake_Mexico_v1_DD_m",
+  "song": "Cake_Mexico_v1_DD_m.psarc",
+  "arrangement": "Bass",
+  "variant": "band-pass-30-250",
+  "chartNoteCount": 127,
+  "durationSec": 216.43,
+  "score": 119,
+  "total": 127,
+  "ceilingPct": 93.7007874015748,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 127
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 119,
+      "total": 127
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 127
+    },
+    "USER_WRONG_PITCH": {
+      "count": 8,
+      "total": 127
+    },
+    "USER_SILENT": {
+      "count": 0,
+      "total": 127
+    }
+  },
+  "measuredAt": "2026-04-27T17:23:55.771Z",
+  "pipelineCommit": "c70a309"
+}

@@ -1,0 +1,166 @@
+{
+  "classification": "Cake_Mexico_v1_DD_m.classification.json",
+  "wav": "/home/ahonnecke/src/slopsmith-plugin-notedetect/test/fixtures/song-ceiling/Cake_Mexico_v1_DD_m.wav",
+  "bandLowHz": 30,
+  "bandHighHz": 250,
+  "silentTotal": 12,
+  "causeCounts": {
+    "rms-gated": 0,
+    "yin-rejected-bp-recovers": 9,
+    "yin-rejected-bp-wrong-pitch": 3,
+    "spectrum-missing": 0
+  },
+  "causes": {
+    "rms-gated": [],
+    "yin-rejected-bp-recovers": [
+      {
+        "chartT": 79.7,
+        "expectedMidi": 31,
+        "rawRmsMax": 1.5717202133853583,
+        "bpRmsMax": 1.1724123458121058,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9928427352569997,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 27,
+        "bpExpectedFrames": 21,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 89.32,
+        "expectedMidi": 43,
+        "rawRmsMax": 1.5617743530401051,
+        "bpRmsMax": 1.257703225520173,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9937264518812299,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 22,
+        "bpExpectedFrames": 5,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 127.25,
+        "expectedMidi": 43,
+        "rawRmsMax": 1.6540866615654584,
+        "bpRmsMax": 1.1805312781776929,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9862907212227583,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 23,
+        "bpExpectedFrames": 12,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 141.297,
+        "expectedMidi": 35,
+        "rawRmsMax": 1.5548898105925677,
+        "bpRmsMax": 1.1932275813345166,
+        "rawConfMax": 0.85432930290699,
+        "bpConfMax": 0.9555164612829685,
+        "rawPitchedFrames": 1,
+        "bpPitchedFrames": 14,
+        "bpExpectedFrames": 6,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 141.713,
+        "expectedMidi": 36,
+        "rawRmsMax": 1.5830035794803403,
+        "bpRmsMax": 1.2113698503644668,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9828039817512035,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 23,
+        "bpExpectedFrames": 23,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 151.43,
+        "expectedMidi": 36,
+        "rawRmsMax": 1.5201543152516663,
+        "bpRmsMax": 1.1205424903827494,
+        "rawConfMax": 0.8610505610704422,
+        "bpConfMax": 0.9931450746953487,
+        "rawPitchedFrames": 1,
+        "bpPitchedFrames": 27,
+        "bpExpectedFrames": 22,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 173.07,
+        "expectedMidi": 40,
+        "rawRmsMax": 1.524141743400107,
+        "bpRmsMax": 1.1410869035819962,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9918946018442512,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 23,
+        "bpExpectedFrames": 19,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 174.3,
+        "expectedMidi": 43,
+        "rawRmsMax": 1.861693396307469,
+        "bpRmsMax": 1.1578274255228058,
+        "rawConfMax": 0.8593620806932449,
+        "bpConfMax": 0.9858028581365943,
+        "rawPitchedFrames": 1,
+        "bpPitchedFrames": 26,
+        "bpExpectedFrames": 24,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 208.69,
+        "expectedMidi": 35,
+        "rawRmsMax": 1.3435362223144331,
+        "bpRmsMax": 1.0155873792991879,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9671414531767368,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 20,
+        "bpExpectedFrames": 11,
+        "totalFrames": 33
+      }
+    ],
+    "yin-rejected-bp-wrong-pitch": [
+      {
+        "chartT": 84.6,
+        "expectedMidi": 29,
+        "rawRmsMax": 1.6042376495071151,
+        "bpRmsMax": 1.2702994174401974,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9437002874910831,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 15,
+        "bpExpectedFrames": 0,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 85,
+        "expectedMidi": 31,
+        "rawRmsMax": 1.0406065924388461,
+        "bpRmsMax": 0.5401327156252467,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9782838132232428,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 17,
+        "bpExpectedFrames": 0,
+        "totalFrames": 33
+      },
+      {
+        "chartT": 88.15,
+        "expectedMidi": 40,
+        "rawRmsMax": 1.3848000388834611,
+        "bpRmsMax": 1.1190604276175182,
+        "rawConfMax": 0,
+        "bpConfMax": 0.9929708605632186,
+        "rawPitchedFrames": 0,
+        "bpPitchedFrames": 26,
+        "bpExpectedFrames": 0,
+        "totalFrames": 33
+      }
+    ],
+    "spectrum-missing": []
+  },
+  "measuredAt": "2026-04-27T17:08:31.827Z"
+}

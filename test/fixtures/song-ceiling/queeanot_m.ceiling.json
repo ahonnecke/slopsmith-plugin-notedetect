@@ -1,0 +1,34 @@
+{
+  "stem": "queeanot_m",
+  "song": "queeanot_m.psarc",
+  "arrangement": "Bass",
+  "chartNoteCount": 378,
+  "durationSec": 226.275,
+  "score": 201,
+  "total": 378,
+  "ceilingPct": 53.17460317460318,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 378
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 201,
+      "total": 378
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 378
+    },
+    "USER_WRONG_PITCH": {
+      "count": 66,
+      "total": 378
+    },
+    "USER_SILENT": {
+      "count": 111,
+      "total": 378
+    }
+  },
+  "measuredAt": "2026-04-27T16:38:13.018Z",
+  "pipelineCommit": "c70a309"
+}

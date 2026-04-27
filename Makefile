@@ -242,6 +242,25 @@ song-ceiling: ## Pipeline ceiling for a song — feeds its OWN audio through cla
 	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
 	node test/song-ceiling.js $$SONG_ARG
 
+.PHONY: silent-probe
+silent-probe: ## Root-cause split for the USER_SILENT bucket on a song (STEM=<ceiling-stem>)
+	@if [ -z "$(STEM)" ]; then \
+	    echo "usage: make silent-probe STEM=<ceiling-stem>"; \
+	    echo "       (stem is the basename in test/fixtures/song-ceiling/, e.g. ragebulls_m)"; \
+	    exit 1; \
+	fi; \
+	node test/silent-probe.js --stem $(STEM)
+
+.PHONY: song-ceiling-roster
+song-ceiling-roster: ## Run ceiling test across the curated roster (FORCE=1, EXTENDED=1, BANDPASS=1, SONGS="a,b,c")
+	@FLAGS=""; \
+	if [ -n "$(FORCE)" ]; then FLAGS="$$FLAGS --force"; fi; \
+	if [ -n "$(REUSE)" ]; then FLAGS="$$FLAGS --reuse"; fi; \
+	if [ -n "$(EXTENDED)" ]; then FLAGS="$$FLAGS --extended"; fi; \
+	if [ -n "$(BANDPASS)" ]; then FLAGS="$$FLAGS --band-pass"; fi; \
+	if [ -n "$(SONGS)" ]; then FLAGS="$$FLAGS --songs \"$(SONGS)\""; fi; \
+	eval "node test/song-ceiling-roster.js $$FLAGS"
+
 .PHONY: hygiene
 hygiene: ## Scan the newest session for string-hygiene issues (open strings ringing, off-pitch contamination)
 	@$(RESOLVE_SESSION); \

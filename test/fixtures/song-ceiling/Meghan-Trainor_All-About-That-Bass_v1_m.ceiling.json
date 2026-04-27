@@ -1,0 +1,34 @@
+{
+  "stem": "Meghan-Trainor_All-About-That-Bass_v1_m",
+  "song": "Meghan-Trainor_All-About-That-Bass_v1_m.psarc",
+  "arrangement": "Bass",
+  "chartNoteCount": 436,
+  "durationSec": 191.723,
+  "score": 209,
+  "total": 436,
+  "ceilingPct": 47.935779816513765,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 436
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 209,
+      "total": 436
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 436
+    },
+    "USER_WRONG_PITCH": {
+      "count": 116,
+      "total": 436
+    },
+    "USER_SILENT": {
+      "count": 111,
+      "total": 436
+    }
+  },
+  "measuredAt": "2026-04-27T16:35:41.150Z",
+  "pipelineCommit": "c70a309"
+}

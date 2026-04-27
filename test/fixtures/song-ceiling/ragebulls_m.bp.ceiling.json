@@ -1,0 +1,35 @@
+{
+  "stem": "ragebulls_m",
+  "song": "ragebulls_m.psarc",
+  "arrangement": "Bass",
+  "variant": "band-pass-30-250",
+  "chartNoteCount": 594,
+  "durationSec": 241.663,
+  "score": 421,
+  "total": 594,
+  "ceilingPct": 70.87542087542089,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 594
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 421,
+      "total": 594
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 594
+    },
+    "USER_WRONG_PITCH": {
+      "count": 117,
+      "total": 594
+    },
+    "USER_SILENT": {
+      "count": 56,
+      "total": 594
+    }
+  },
+  "measuredAt": "2026-04-27T17:21:55.698Z",
+  "pipelineCommit": "c70a309"
+}

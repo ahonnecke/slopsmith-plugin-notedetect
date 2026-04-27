@@ -1,0 +1,34 @@
+{
+  "stem": "ahatake_m",
+  "song": "ahatake_m.psarc",
+  "arrangement": "Bass",
+  "chartNoteCount": 594,
+  "durationSec": 228.562,
+  "score": 134,
+  "total": 594,
+  "ceilingPct": 22.55892255892256,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 594
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 134,
+      "total": 594
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 594
+    },
+    "USER_WRONG_PITCH": {
+      "count": 74,
+      "total": 594
+    },
+    "USER_SILENT": {
+      "count": 386,
+      "total": 594
+    }
+  },
+  "measuredAt": "2026-04-27T17:05:26.140Z",
+  "pipelineCommit": "c70a309"
+}

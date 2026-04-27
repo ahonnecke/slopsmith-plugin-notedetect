@@ -1,0 +1,35 @@
+{
+  "stem": "Ben_E_King_-_Stand_by_Me_m",
+  "song": "Ben_E_King_-_Stand_by_Me_m.psarc",
+  "arrangement": "Bass",
+  "variant": "band-pass-30-250",
+  "chartNoteCount": 335,
+  "durationSec": 181.467,
+  "score": 315,
+  "total": 335,
+  "ceilingPct": 94.02985074626866,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 335
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 315,
+      "total": 335
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 335
+    },
+    "USER_WRONG_PITCH": {
+      "count": 17,
+      "total": 335
+    },
+    "USER_SILENT": {
+      "count": 3,
+      "total": 335
+    }
+  },
+  "measuredAt": "2026-04-27T17:26:10.408Z",
+  "pipelineCommit": "c70a309"
+}

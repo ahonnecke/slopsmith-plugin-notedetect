@@ -87,6 +87,16 @@ let WINDOW_AFTER_MS = parseFloat(getArg('window-after-ms', '600'));
 const SILENCE_LEVEL = 0.01;       // same as pipeline silence gate
 const MIN_CONFIDENCE = 0.7;       // same as pipeline
 const MIN_EXPECTED_FRAMES = 2;    // need at least this many frames of expected pitch to call it "in the audio"
+
+// 30–250 Hz band-pass pre-filter. The silent-bucket probe found that
+// 33–75% of "USER_SILENT" notes recover when YIN sees a band-passed
+// signal — raw YIN gets 0.00 confidence on heavily-mastered or
+// distorted-band mixes because guitar/drum overtones overwhelm the
+// bass fundamental. Band-passing isolates the bass band before YIN.
+// Off by default so the harness can A/B against the un-filtered ceiling.
+const BAND_PASS_ENABLED = args.includes('--band-pass');
+const BAND_LOW_HZ = parseFloat(getArg('band-low-hz', '30'));
+const BAND_HIGH_HZ = parseFloat(getArg('band-high-hz', '250'));
 // Cents tolerance for "audio contains the expected pitch" — overridden by
 // the dump's pitchTolerance when a dump is provided. Default matches the
 // pipeline default of 50¢.
@@ -112,6 +122,48 @@ function readWav(p) {
 function readSidecar(wavPath) {
     const j = wavPath.replace(/\.wav$/, '.json');
     return fs.existsSync(j) ? JSON.parse(fs.readFileSync(j, 'utf8')) : { chartStartTime: 0 };
+}
+
+// 4th-order Butterworth band-pass via two cascaded RBJ biquads
+// (highpass × 2, lowpass × 2). 24 dB/octave on each side.
+function biquadCoefs(type, fc, sampleRate) {
+    const w0 = 2 * Math.PI * fc / sampleRate;
+    const cs = Math.cos(w0), sn = Math.sin(w0);
+    const Q = Math.SQRT1_2;
+    const alpha = sn / (2 * Q);
+    let b0, b1, b2, a0, a1, a2;
+    if (type === 'highpass') {
+        b0 = (1 + cs) / 2;  b1 = -(1 + cs);  b2 = (1 + cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    } else {
+        b0 = (1 - cs) / 2;  b1 = 1 - cs;     b2 = (1 - cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    }
+    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+}
+
+function applyBiquad(input, [b0, b1, b2, a1, a2]) {
+    const out = new Float32Array(input.length);
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < input.length; i++) {
+        const x = input[i];
+        const y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        out[i] = y;
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+    }
+    return out;
+}
+
+function applyBandPass(samples, sampleRate, lowHz, highHz) {
+    const hp = biquadCoefs('highpass', lowHz, sampleRate);
+    const lp = biquadCoefs('lowpass', highHz, sampleRate);
+    let s = samples;
+    s = applyBiquad(s, hp);
+    s = applyBiquad(s, hp);
+    s = applyBiquad(s, lp);
+    s = applyBiquad(s, lp);
+    return s;
 }
 
 function rms(samples, start, n) {
@@ -322,6 +374,9 @@ function main() {
     const meta = readSidecar(WAV_PATH);
     const wavDur = wav.samples.length / wav.sampleRate;
     const hasDump = DUMP_PATH != null;
+    if (BAND_PASS_ENABLED) {
+        wav.samples = applyBandPass(wav.samples, wav.sampleRate, BAND_LOW_HZ, BAND_HIGH_HZ);
+    }
 
     // Chart source: dump when available (captures this session's actual
     // chart), fallback to stored JSON file. Override with --no-chart-from-dump.
@@ -367,7 +422,7 @@ function main() {
     console.log(`chartStartTime: ${chartStart.toFixed(3)}s  ${shouldAutoAlign ? '(auto-aligned)' : '(from sidecar)'}`);
     console.log(`Dump:         ${hasDump ? DUMP_PATH : '(none — audio-truth mode; pipeline verdict assumed MISS)'}`);
     console.log(`Cents tol:    ±${centsTolerance}¢  ${hasDump ? '(from dump settings.pitchTolerance)' : '(default)'}`);
-    console.log(`Params: yin=${YIN_BUF}, hop=${HOP_MS}ms, window=${-WINDOW_BEFORE_MS}..+${WINDOW_AFTER_MS}ms`);
+    console.log(`Params: yin=${YIN_BUF}, hop=${HOP_MS}ms, window=${-WINDOW_BEFORE_MS}..+${WINDOW_AFTER_MS}ms${BAND_PASS_ENABLED ? `, band-pass=${BAND_LOW_HZ}-${BAND_HIGH_HZ}Hz` : ''}`);
     console.log();
 
     const classifications = [];

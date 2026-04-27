@@ -1,0 +1,245 @@
+{
+  "measuredAt": "2026-04-27T17:41:55.431Z",
+  "pipelineCommit": "c70a309",
+  "rows": [
+    {
+      "query": "Stand by Me",
+      "stresses": "low-frequency dominant (E2/F#2), sustain bleed, same-pitch repeats — architectural-limit reference",
+      "stem": "Ben_E_King_-_Stand_by_Me_m",
+      "score": 315,
+      "total": 335,
+      "ceilingPct": 94.02985074626866,
+      "durationSec": 181.467,
+      "chartNoteCount": 335,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:26:10.408Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 335
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 315,
+          "total": 335
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 335
+        },
+        "USER_WRONG_PITCH": {
+          "count": 17,
+          "total": 335
+        },
+        "USER_SILENT": {
+          "count": 3,
+          "total": 335
+        }
+      }
+    },
+    {
+      "query": "Mexico",
+      "stresses": "wide pitch range, moderate density (Cake — moderate-difficulty reference)",
+      "stem": "Cake_Mexico_v1_DD_m",
+      "score": 119,
+      "total": 127,
+      "ceilingPct": 93.7007874015748,
+      "durationSec": 216.43,
+      "chartNoteCount": 127,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:23:55.771Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 127
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 119,
+          "total": 127
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 127
+        },
+        "USER_WRONG_PITCH": {
+          "count": 8,
+          "total": 127
+        },
+        "USER_SILENT": {
+          "count": 0,
+          "total": 127
+        }
+      }
+    },
+    {
+      "query": "Another One Bites",
+      "stresses": "iconic single-note motif, clear mute gaps, A2/E2/G2 (Queen — sparse-clean reference)",
+      "stem": "queeanot_m",
+      "score": 337,
+      "total": 378,
+      "ceilingPct": 89.15343915343915,
+      "durationSec": 226.275,
+      "chartNoteCount": 378,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:31:27.420Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 378
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 337,
+          "total": 378
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 378
+        },
+        "USER_WRONG_PITCH": {
+          "count": 34,
+          "total": 378
+        },
+        "USER_SILENT": {
+          "count": 7,
+          "total": 378
+        }
+      }
+    },
+    {
+      "query": "All About That Bass",
+      "stresses": "sparse pop bass, generous rests — should sit near monophonic ceiling (Trainor)",
+      "stem": "Meghan-Trainor_All-About-That-Bass_v1_m",
+      "score": 368,
+      "total": 436,
+      "ceilingPct": 84.40366972477065,
+      "durationSec": 191.723,
+      "chartNoteCount": 436,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:29:02.249Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 436
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 368,
+          "total": 436
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 436
+        },
+        "USER_WRONG_PITCH": {
+          "count": 65,
+          "total": 436
+        },
+        "USER_SILENT": {
+          "count": 3,
+          "total": 436
+        }
+      }
+    },
+    {
+      "query": "a-ha",
+      "stresses": "a-ha \"Take On Me\" — drum-machine + synth bass, zero rubato — chart-vs-audio alignment baseline",
+      "stem": "ahatake_m",
+      "score": 477,
+      "total": 594,
+      "ceilingPct": 80.3030303030303,
+      "durationSec": 228.562,
+      "chartNoteCount": 594,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:35:21.335Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 594
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 477,
+          "total": 594
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 594
+        },
+        "USER_WRONG_PITCH": {
+          "count": 69,
+          "total": 594
+        },
+        "USER_SILENT": {
+          "count": 48,
+          "total": 594
+        }
+      }
+    },
+    {
+      "query": "Bulls on Parade",
+      "stresses": "heavily-mastered mid-frequency, dense syncopation, polyphonic extraction (RATM, Eb)",
+      "stem": "ragebulls_m",
+      "score": 421,
+      "total": 594,
+      "ceilingPct": 70.87542087542089,
+      "durationSec": 241.663,
+      "chartNoteCount": 594,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:21:55.698Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 594
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 421,
+          "total": 594
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 594
+        },
+        "USER_WRONG_PITCH": {
+          "count": 117,
+          "total": 594
+        },
+        "USER_SILENT": {
+          "count": 56,
+          "total": 594
+        }
+      }
+    },
+    {
+      "query": "Billie Jean",
+      "stresses": "LinnDrum-locked tempo, sparse F#2 motif, zero rubato — second drum-machine reference",
+      "stem": "Michael-Jackson_Billie-Jean_v2_0_DD_m",
+      "score": 700,
+      "total": 1012,
+      "ceilingPct": 69.1699604743083,
+      "durationSec": 294.478,
+      "chartNoteCount": 1012,
+      "pipelineCommit": "c70a309",
+      "measuredAt": "2026-04-27T17:41:55.394Z",
+      "buckets": {
+        "PIPELINE_HIT": {
+          "count": 0,
+          "total": 1012
+        },
+        "PIPELINE_MISSED_REAL_PLAY": {
+          "count": 700,
+          "total": 1012
+        },
+        "PIPELINE_YIN_DISAGREES": {
+          "count": 0,
+          "total": 1012
+        },
+        "USER_WRONG_PITCH": {
+          "count": 310,
+          "total": 1012
+        },
+        "USER_SILENT": {
+          "count": 2,
+          "total": 1012
+        }
+      }
+    }
+  ],
+  "failed": []
+}

@@ -100,19 +100,105 @@ Properties that raise the ceiling (Mexico cluster):
 Re-run when the chart changes (re-extracted PSARC, re-tuned arrangement)
 or when pipeline detection logic changes — the ceiling shifts with both.
 
-## Songs to add to the test set
+## The fixture roster
 
-Architectural work on the pipeline needs more than one failing fixture
-to avoid over-fitting. Candidates with diverse chart shapes:
+`make song-ceiling-roster` (added by `test/song-ceiling-roster.js`) runs
+the ceiling test across a curated list and prints a comparison table.
+Reuse policy: results are cached per stem; if a cached result is at the
+current pipeline commit, it's reused. `FORCE=1` re-runs everything,
+`SONGS="a,b"` overrides the list, `EXTENDED=1` adds the bench list.
 
-- **Stand by Me** (current — easy melodic bass, low frequencies)
-- **Bulls on Parade** (Rage Against the Machine — heavily mastered, dense
-  syncopation, mid-frequency bass content)
-- **All About That Bass** (sparse pop bass, room for the pipeline to
-  resolve cleanly between notes)
-- A drum-machine track (no rubato, maximum chart-vs-audio alignment)
+The default roster is picked to cover non-overlapping stress vectors so
+a code change can be regressed against multiple chart shapes at once. A
+fix that lifts Stand by Me from 57% → 70% while dragging Mexico from
+62% → 50% is not a fix.
 
-Each of these stresses a different part of the pipeline. A change that
-moves Stand by Me from 55% → 70% but breaks Mexico down to 80% isn't a
-win. The fixture set lets us regress against multiple chart shapes at
-once.
+| Song | Tuning | Stresses |
+| --- | --- | --- |
+| Mexico (Cake) | E | Wide pitch range, moderate density — moderate-difficulty reference |
+| Stand by Me (Ben E. King) | E | Low-frequency dominant (E2/F#2), sustain bleed, same-pitch repeats — architectural-limit reference |
+| Bulls on Parade (RATM) | Eb | Heavily-mastered mid-frequency, dense syncopation, polyphonic extraction stress |
+| All About That Bass (Trainor) | E | Sparse pop bass, generous rests — should sit near monophonic ceiling |
+| Another One Bites the Dust (Queen) | E | Iconic single-note motif, clear mute gaps — sparse-clean reference |
+| Billie Jean (Michael Jackson) | E | LinnDrum-locked tempo, sparse F#2 motif — zero-rubato chart-vs-audio alignment baseline |
+| Take On Me (a-ha) | E | Programmed-drums + sawtooth synth bass — overtone-rich spectrum stress |
+
+`EXTENDED=1` adds songs that stress narrower failure modes:
+
+| Song | Tuning | Stresses |
+| --- | --- | --- |
+| Around the World (RHCP) | E | Fast same-pitch sibling-repeat stress (sixteenth-note runs) |
+| Hysteria (Muse) | E | Distorted/effected bass, heavy harmonics, polyphonic muddle |
+| Schism (Tool) | Drop D | Sustained dense passages, sustain bleed in heavy context |
+| Killing in the Name (RATM) | Drop D | Heavy mix, busy-band YIN extraction |
+
+**Drop-D / Eb-tuned songs are still useful as pipeline fixtures** even
+if the user doesn't physically play them — the audio-truth ceiling is a
+property of the recording + chart + pipeline, not the player.
+
+### Why these songs (and not others)
+
+The pipeline has known stress points; the roster maps one song per point:
+
+- **Low-frequency YIN stability** → Stand by Me. 4096-sample window at
+  48 kHz is ~4 cycles at 41 Hz. Charts with E2/F#2 fundamentals expose
+  the limit.
+- **Sustain bleed across rapid passages** → Stand by Me, Schism. Notes
+  arriving before the previous one decays leave residual ringing in the
+  next analysis window.
+- **Same-pitch sibling repeats** → Around the World, Stand by Me. The
+  matcher claims one onset per chart note, demoting subsequent same-pitch
+  hits to MISSED on rapid passages.
+- **Polyphonic mix extraction** → Bulls on Parade, Hysteria, Killing in
+  the Name. Drums + distorted guitar + vocals overlap the bass spectrum.
+- **Sparse-clean baseline** → All About That Bass, Another One Bites.
+  Should score near monophonic ceiling. If they don't, something is
+  broken at the basics.
+- **Zero-rubato baseline** → Take On Me. Chart-vs-audio drift is the
+  hidden failure mode for live-recorded songs; a drum-machine track
+  removes that variable so the residual is pure detection error.
+- **Drop-tuning generalisation** → Schism, Killing in the Name, Bulls
+  on Parade. Frets refer to different absolute frequencies; the chart
+  expresses MIDI directly so the detector should not care, but stress
+  tests confirm.
+
+## Band-pass pre-filter — the silent-bucket fix
+
+The `USER_SILENT` bucket dominated the worst songs (57.6% on Bulls on
+Parade, 65% on Take On Me) and was treated as an audio-content limit.
+It isn't. `test/silent-probe.js` runs each silent note through a
+30–250 Hz band-pass and asks whether YIN can find the bass when guitar
+and percussion overtones are suppressed. Across all six fixture songs:
+
+- **0% rms-gated** — the silence gate is fine; the bass-band signal is present.
+- **33–75% recover under band-pass** — raw YIN gets ~0.00 confidence
+  but band-passed YIN finds the bass at ~0.95 confidence. These notes
+  are *fully recoverable* with a pre-filter, no matter what the live
+  pipeline detector decides downstream.
+- **0–20% truly spectrum-missing** — even after band-pass, no clear
+  pitch in the bass band. This is the actual mix-quality ceiling.
+
+A re-run of the full classifier with `--band-pass` (4th-order
+Butterworth, 30 Hz HP × 2, 250 Hz LP × 2 cascaded) lifts every song:
+
+| Song | Baseline | Band-pass | Δ |
+| --- | --- | --- | --- |
+| Stand by Me | 57.3% | **94.0%** | +36.7pp |
+| Mexico | 62.2% | **93.7%** | +31.5pp |
+| Another One Bites the Dust | 53.2% | **89.2%** | +36.0pp |
+| All About That Bass | 47.9% | **84.4%** | +36.5pp |
+| Take On Me (a-ha) | 22.6% | **80.3%** | +57.7pp |
+| Bulls on Parade | 32.5% | **70.9%** | +38.4pp |
+| Billie Jean | 43.2% | **69.2%** | +26.0pp |
+
+This invalidates the original "Stand by Me is at the architectural
+wall at 57%" reading. The wall was a YIN-confusion artifact, not an
+audio-content limit. With the band-pass in place, Stand by Me is a
+"friendly" chart at 94% ceiling — meaning the user's 53% live score
+has ~40pp of real headroom.
+
+**Status**: enabled in the offline classifier
+(`classify-session.js --band-pass`) and in the roster runner
+(`make song-ceiling-roster BANDPASS=1`). The live pipeline in
+`screen.js` does not yet apply the filter; porting it is the next
+load-bearing pipeline change.

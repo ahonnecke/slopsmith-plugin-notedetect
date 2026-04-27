@@ -1,0 +1,35 @@
+{
+  "stem": "Michael-Jackson_Billie-Jean_v2_0_DD_m",
+  "song": "Michael-Jackson_Billie-Jean_v2_0_DD_m.psarc",
+  "arrangement": "Bass",
+  "variant": "band-pass-30-250",
+  "chartNoteCount": 1012,
+  "durationSec": 294.478,
+  "score": 700,
+  "total": 1012,
+  "ceilingPct": 69.1699604743083,
+  "buckets": {
+    "PIPELINE_HIT": {
+      "count": 0,
+      "total": 1012
+    },
+    "PIPELINE_MISSED_REAL_PLAY": {
+      "count": 700,
+      "total": 1012
+    },
+    "PIPELINE_YIN_DISAGREES": {
+      "count": 0,
+      "total": 1012
+    },
+    "USER_WRONG_PITCH": {
+      "count": 310,
+      "total": 1012
+    },
+    "USER_SILENT": {
+      "count": 2,
+      "total": 1012
+    }
+  },
+  "measuredAt": "2026-04-27T17:41:55.394Z",
+  "pipelineCommit": "c70a309"
+}

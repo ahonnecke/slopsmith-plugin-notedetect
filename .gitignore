@@ -3,3 +3,8 @@ node_modules/
 /.agent-shell/
 __pycache__/
 *.pyc
+# Cached song-ceiling audio (large, regenerable from the slopsmith library).
+# JSON ceiling/classification files are kept as the regression baseline.
+test/fixtures/song-ceiling/*.wav
+test/fixtures/song-ceiling/*.mp3
+test/fixtures/song-ceiling/*.ogg

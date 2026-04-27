@@ -39,6 +39,9 @@ const SONG_QUERY = getArg('song', 'Mexico');
 const ARRANGEMENT = getArg('arrangement', null);
 const CONTAINER = getArg('container', 'slopsmith-web-1');
 const OUT_DIR = getArg('out-dir', path.join(__dirname, 'fixtures', 'song-ceiling'));
+// Forward --band-pass through to classify-session.js. Output goes to
+// <stem>.bp.ceiling.json so it doesn't overwrite the unfiltered baseline.
+const BAND_PASS = args.includes('--band-pass');
 
 function execContainer(cmd) {
     return execSync(`docker exec ${CONTAINER} sh -c '${cmd.replace(/'/g, "'\\''")}'`, { encoding: 'utf8' });
@@ -135,10 +138,10 @@ function runClassifier(wavPath, dumpPath) {
     if (!fs.existsSync(sidecar)) {
         fs.writeFileSync(sidecar, JSON.stringify({ chartStartTime: 0, sampleRate: 48000 }));
     }
-    const r = spawnSync('node', [
-        path.join(__dirname, 'classify-session.js'),
-        '--wav', wavPath, '--dump', dumpPath, '--no-auto-align',
-    ], { encoding: 'utf8' });
+    const cmd = [path.join(__dirname, 'classify-session.js'),
+                 '--wav', wavPath, '--dump', dumpPath, '--no-auto-align'];
+    if (BAND_PASS) cmd.push('--band-pass');
+    const r = spawnSync('node', cmd, { encoding: 'utf8' });
     if (r.status !== 0) {
         console.error(r.stdout);
         console.error(r.stderr);
@@ -208,9 +211,11 @@ async function main() {
     else if (ceilingPct >= 60) console.log(`  → Hard chart. User scores in the 50-70 range are likely at-ceiling.`);
     else                       console.log(`  → Architectural-limit chart. User score reflects pipeline + audio-content limits, not playing.`);
 
-    const resultPath = path.join(OUT_DIR, `${stem}.ceiling.json`);
+    const variantSuffix = BAND_PASS ? '.bp' : '';
+    const resultPath = path.join(OUT_DIR, `${stem}${variantSuffix}.ceiling.json`);
     fs.writeFileSync(resultPath, JSON.stringify({
         stem, song: song.filename, arrangement: songInfo.arrangement,
+        variant: BAND_PASS ? 'band-pass-30-250' : 'baseline',
         chartNoteCount: chartCount, durationSec: duration,
         score: audioTruthHits, total, ceilingPct,
         buckets,
