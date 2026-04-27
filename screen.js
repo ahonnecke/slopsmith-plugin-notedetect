@@ -1022,6 +1022,82 @@ function _ndVerdictGlyph(kind) {
     return { glyph: '', color: '#6b7280' };
 }
 
+// ── Failure-mode classifier ──────────────────────────────────────────────
+// Each note in a play snapshot resolves to ONE primary failure mode (or
+// CLEAN for perfect hits). The Practice Report's Top Issues tile
+// aggregates these so the user knows what specifically to fix instead of
+// staring at a matrix and guessing.
+//
+// The buckets are deliberately fingering-actionable: "WRONG_FRET" maps to
+// a +/-1-3 semitone error (likely off-by-a-fret), "OPEN_STRING" surfaces
+// the open-string-ringing pattern documented in test/string-hygiene.js,
+// "WRONG_OCTAVE" catches the YIN octave-down failure mode that keeps
+// showing up in real bass audio, etc.
+const _ND_BASS_OPEN_STRING_MIDIS = new Set([28, 33, 38, 43]);
+
+function _ndClassifyFailureMode(note) {
+    const { primary, labels = [], pitchError, detectedMidi, expectedMidi } = note;
+
+    if (primary === 'HIT') {
+        if (labels.includes('LATE'))  return { mode: 'TIMING_LATE',  severity: 0.3 };
+        if (labels.includes('EARLY')) return { mode: 'TIMING_EARLY', severity: 0.3 };
+        if (labels.includes('SHARP')) return { mode: 'PITCH_SHARP',  severity: 0.3 };
+        if (labels.includes('FLAT'))  return { mode: 'PITCH_FLAT',   severity: 0.3 };
+        return { mode: 'CLEAN', severity: 0 };
+    }
+    if (primary === 'DIRTY_HIT') {
+        return { mode: 'STRING_BLEED', severity: 0.6 };
+    }
+    if (primary === 'MISSED_NO_DETECTION') {
+        // Without per-frame hygiene we can't tell "you didn't pluck" from
+        // "your pluck didn't trigger an onset." Lump them under one bucket
+        // for now; per-frame data would let us split "no signal at all"
+        // from "signal too weak / wrong attack profile."
+        return { mode: 'NO_PLUCK_OR_ONSET', severity: 1.0 };
+    }
+    if (primary === 'MISSED_WRONG_PITCH') {
+        // Reconstruct what live YIN saw if detectedMidi is null on misses.
+        const liveMidi = detectedMidi != null
+            ? detectedMidi
+            : (expectedMidi != null && pitchError != null
+                ? Math.round(expectedMidi + pitchError / 100)
+                : null);
+        const semiOff = pitchError != null ? Math.round(pitchError / 100) : null;
+        if (semiOff != null && Math.abs(semiOff) === 12) {
+            return { mode: 'WRONG_OCTAVE', severity: 0.9 };
+        }
+        if (liveMidi != null
+                && _ND_BASS_OPEN_STRING_MIDIS.has(liveMidi)
+                && !_ND_BASS_OPEN_STRING_MIDIS.has(expectedMidi)) {
+            // Detected an open-string MIDI when expected was fretted.
+            return { mode: 'OPEN_STRING', severity: 1.0 };
+        }
+        if (semiOff != null && Math.abs(semiOff) <= 3) {
+            return { mode: 'WRONG_FRET', severity: 0.9 };
+        }
+        return { mode: 'WRONG_PITCH', severity: 0.9 };
+    }
+    return { mode: 'UNKNOWN', severity: 0.5 };
+}
+
+// Human-readable description + suggested action for each failure mode.
+// These show up in the Top Issues tile so the user knows what to do, not
+// just what went wrong.
+const _ND_FAILURE_MODE_INFO = {
+    CLEAN:             { color: '#4ade80', label: 'Clean hits', advice: 'Perfect.' },
+    TIMING_LATE:       { color: '#facc15', label: 'Late hits', advice: 'Try anticipating from the chart instead of waiting for visual cues.' },
+    TIMING_EARLY:      { color: '#60a5fa', label: 'Early hits', advice: 'You\'re leading the beat. Hold on the upbeat for one extra moment before plucking.' },
+    PITCH_SHARP:       { color: '#fb923c', label: 'Sharp hits', advice: 'Pitch reads above target. Check intonation / fret pressure.' },
+    PITCH_FLAT:        { color: '#a78bfa', label: 'Flat hits', advice: 'Pitch reads below target. Press behind the fret, not on top.' },
+    STRING_BLEED:      { color: '#facc15', label: 'String-hygiene leaks', advice: 'You hit the right note but another string was ringing. Right-hand mute the lower strings.' },
+    OPEN_STRING:       { color: '#f87171', label: 'Open-string contamination', advice: 'A fretted note came out as an open string. Fret-hand finger probably wasn\'t engaged or you brushed an open string while plucking.' },
+    WRONG_FRET:        { color: '#fb923c', label: 'Wrong fret (1-3 semitones off)', advice: 'Hand position drifted by a fret or two. Slow the passage and check your fret-hand landing.' },
+    WRONG_OCTAVE:      { color: '#fb923c', label: 'Octave error', advice: 'Detector or playing produced an octave displacement. If consistent, check for open-string ringing or YIN octave confusion.' },
+    WRONG_PITCH:       { color: '#fb923c', label: 'Other wrong pitch', advice: 'Detection captured a pitch that doesn\'t match expected by more than 3 semitones.' },
+    NO_PLUCK_OR_ONSET: { color: '#f87171', label: 'No detection', advice: 'No onset fired in the timing window. Either you didn\'t pluck or the attack was too soft to register.' },
+    UNKNOWN:           { color: '#6b7280', label: 'Other', advice: '' },
+};
+
 // POST a suggested loop into slopsmith's persisted loops table so it shows
 // up in the saved-loops dropdown next page-load. Slopsmith's /api/loops
 // endpoint expects { filename, name, start, end }; auto-names if name
@@ -1139,6 +1215,38 @@ async function _ndShowReport() {
         }
     }
     const labelPct = (n) => nLabeledHits ? `${(n / nLabeledHits * 100).toFixed(0)}%` : '—';
+
+    // Failure-mode aggregation across every note in the loaded plays.
+    // Each note resolves to one mode; counts are sorted descending and
+    // the top 5 surface in the Top Issues tile with concrete advice.
+    const failureCounts = new Map();
+    const failureExamples = new Map();   // mode → [{chartT, stringFret, expectedMidi, detected}, ...]
+    let totalNotesEval = 0;
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            const { mode } = _ndClassifyFailureMode(r);
+            failureCounts.set(mode, (failureCounts.get(mode) || 0) + 1);
+            if (!failureExamples.has(mode)) failureExamples.set(mode, []);
+            const ex = failureExamples.get(mode);
+            if (ex.length < 4) {
+                const live = r.detectedMidi != null
+                    ? r.detectedMidi
+                    : (r.expectedMidi != null && r.pitchError != null
+                        ? Math.round(r.expectedMidi + r.pitchError / 100)
+                        : null);
+                ex.push({
+                    chartT: r.chartT,
+                    sf: `s${r.s}/f${r.f}`,
+                    expected: r.expectedMidi,
+                    live,
+                });
+            }
+            totalNotesEval++;
+        }
+    }
+    const sortedFailures = [...failureCounts.entries()]
+        .filter(([m]) => m !== 'CLEAN')
+        .sort((a, b) => b[1] - a[1]);
 
     // Build the matrix HTML row by row.
     const matrixRows = rows.map(row => {
@@ -1265,6 +1373,35 @@ async function _ndShowReport() {
             </div>
             <div class="text-gray-500 text-[10px] mt-2 leading-tight">
                 Labels fire when timing or pitch is outside the strictness preset's "perfect" zone (currently ±${_ndPerfectTimingMs}ms / ±${_ndPerfectPitchCent}¢). All five buckets above counted as HITs in the score; this tile shows precision, not pass/fail.
+            </div>
+        </div>
+        ` : ''}
+
+        ${sortedFailures.length > 0 ? `
+        <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
+            <div class="text-gray-400 mb-2">Top issues this session — what to fix next</div>
+            <div class="space-y-2">
+                ${sortedFailures.slice(0, 5).map(([mode, count]) => {
+                    const info = _ND_FAILURE_MODE_INFO[mode] || _ND_FAILURE_MODE_INFO.UNKNOWN;
+                    const pct = totalNotesEval ? (count / totalNotesEval * 100).toFixed(0) : '0';
+                    const exs = failureExamples.get(mode) || [];
+                    const exampleStr = exs.slice(0, 3).map(e =>
+                        `${e.chartT.toFixed(1)}s ${e.sf}${e.live != null ? ` (heard MIDI ${e.live})` : ''}`
+                    ).join('  ·  ');
+                    return `
+                    <div class="bg-dark-700 rounded p-2">
+                        <div class="flex justify-between items-baseline">
+                            <span style="color:${info.color}" class="font-semibold">${info.label}</span>
+                            <span class="text-gray-400 font-mono">${count} notes (${pct}%)</span>
+                        </div>
+                        ${info.advice ? `<div class="text-gray-300 text-[11px] mt-1">${info.advice}</div>` : ''}
+                        ${exs.length > 0 ? `<div class="text-gray-500 text-[10px] mt-1 font-mono">examples: ${exampleStr}</div>` : ''}
+                    </div>
+                    `;
+                }).join('')}
+            </div>
+            <div class="text-gray-500 text-[10px] mt-2 leading-tight">
+                Each note resolves to one failure mode. CLEAN hits aren't shown here; this lists what's costing you points.
             </div>
         </div>
         ` : ''}
