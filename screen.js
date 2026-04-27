@@ -1059,10 +1059,13 @@ function _ndClassifyFailureMode(note) {
         return { mode: 'STRING_BLEED', severity: 0.6 };
     }
     if (primary === 'MISSED_NO_DETECTION') {
-        // Without per-frame hygiene we can't tell "you didn't pluck" from
-        // "your pluck didn't trigger an onset." Lump them under one bucket
-        // for now; per-frame data would let us split "no signal at all"
-        // from "signal too weak / wrong attack profile."
+        if (note.siblingClaimed) {
+            // Demotion case: the user plucked, but a same-pitch sibling
+            // chart note nearby got the credit. Not a soft-attack issue —
+            // a pacing / matcher accounting issue on rapid same-pitch
+            // passages.
+            return { mode: 'SIBLING_CLAIMED', severity: 0.7 };
+        }
         return { mode: 'NO_PLUCK_OR_ONSET', severity: 1.0 };
     }
     if (primary === 'MISSED_WRONG_PITCH') {
@@ -1108,6 +1111,7 @@ const _ND_FAILURE_MODE_INFO = {
     WRONG_OCTAVE:      { color: '#fb923c', label: 'Octave error', advice: 'Detector or playing produced an octave displacement. If consistent, check for open-string ringing or YIN octave confusion.' },
     WRONG_PITCH:       { color: '#fb923c', label: 'Other wrong pitch', advice: 'Detection captured a pitch that doesn\'t match expected by more than 3 semitones.' },
     NO_PLUCK_OR_ONSET: { color: '#f87171', label: 'No detection', advice: 'No onset fired in the timing window. Either you didn\'t pluck or the attack was too soft to register.' },
+    SIBLING_CLAIMED:   { color: '#fbbf24', label: 'Sibling-claimed (rapid same-pitch)', advice: 'You plucked, but the matcher gave the onset to a same-pitch chart note next to this one. Common in rapid same-pitch passages — not a playing error. Pipeline tradeoff: one onset, one chart note. Practice plays through it, the score lags.' },
     UNKNOWN:           { color: '#6b7280', label: 'Other', advice: '' },
 };
 
@@ -4792,6 +4796,13 @@ function _ndCheckMisses() {
                 s,
                 f,
                 chartT: noteTime,
+                // Flag distinguishes "user didn't pluck / onset didn't fire"
+                // from "user plucked, but the matcher gave the onset to a
+                // same-pitch sibling chart note instead of this one." The
+                // failure-mode classifier reads this to surface
+                // SIBLING_CLAIMED separately from NO_PLUCK_OR_ONSET so the
+                // user gets accurate "what to fix" advice.
+                siblingClaimed,
             });
             _ndMisses++;
             if (primary === 'MISSED_WRONG_PITCH') _ndPitchMisses++;
