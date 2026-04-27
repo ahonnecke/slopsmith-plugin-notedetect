@@ -63,10 +63,15 @@ const NOISE_FLOOR = parseFloat(getArg('noise-floor', '0.002'));
 // enough to feel without drowning the bass tones.
 const NO_CLICK = args.includes('--no-click');
 const DOWNBEATS_ONLY = args.includes('--downbeats-only');
-const CLICK_FREQ_HZ = parseFloat(getArg('click-freq', '2000'));   // clicky high
-const CLICK_DOWNBEAT_FREQ_HZ = parseFloat(getArg('click-downbeat-freq', '3000'));
-const CLICK_AMP = parseFloat(getArg('click-amp', '0.18'));
-const CLICK_DURATION_MS = parseFloat(getArg('click-duration', '15'));
+// Click defaults tuned to cut through 0.8s sustained bass tones. Earlier
+// 0.18 amp + 15 ms duration was inaudible against the bass — empirically
+// "clicks sounded the same" between every-beat and downbeats-only because
+// neither was loud enough to feel rhythmically. 0.45 amp + 60 ms gives
+// a percussive anchor that doesn't get masked.
+const CLICK_FREQ_HZ = parseFloat(getArg('click-freq', '1200'));
+const CLICK_DOWNBEAT_FREQ_HZ = parseFloat(getArg('click-downbeat-freq', '1800'));
+const CLICK_AMP = parseFloat(getArg('click-amp', '0.45'));
+const CLICK_DURATION_MS = parseFloat(getArg('click-duration', '60'));
 
 // Same harmonic profile as test/synthesize-bass.js — weak fundamental,
 // strong 2nd harmonic. Mirrors realistic bass content so the live YIN
@@ -103,17 +108,24 @@ function addNoiseFloor(samples, rms, seed = 42) {
     for (let i = 0; i < samples.length; i++) samples[i] += (rng() - 0.5) * 2 * rms;
 }
 
-// Render a short percussive click — exponentially-decaying sine burst.
-// Used for the metronome layer so the player has a tempo anchor without
-// drowning the bass tones.
+// Render a percussive click — two-frequency mix (fundamental + 2nd harmonic
+// at 2.5x) with a fast attack, sustained body, and exponential decay tail.
+// More wood-block / hi-hat than pure sine ping. Cuts through sustained
+// bass tones without needing to be obnoxiously loud.
 function renderClick(samples, sampleRate, startSample, freqHz, amp, durationMs) {
     const len = Math.floor(sampleRate * durationMs / 1000);
+    const attackLen = Math.floor(sampleRate * 0.002);   // 2 ms hard attack
+    const f2 = freqHz * 2.5;                            // upper partial — adds bite
     for (let i = 0; i < len; i++) {
         const idx = startSample + i;
         if (idx >= samples.length) break;
         const t = i / sampleRate;
-        const env = Math.exp(-i / (len * 0.3)); // decay to ~0 by end
-        samples[idx] += amp * env * Math.sin(2 * Math.PI * freqHz * t);
+        let env;
+        if (i < attackLen) env = i / attackLen;
+        else env = Math.exp(-(i - attackLen) / (len * 0.35));
+        const wave = 0.7 * Math.sin(2 * Math.PI * freqHz * t)
+                   + 0.3 * Math.sin(2 * Math.PI * f2     * t);
+        samples[idx] += amp * env * wave;
     }
 }
 
