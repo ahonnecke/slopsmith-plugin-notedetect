@@ -1632,10 +1632,16 @@ const _ND_REATTACK_WINDOW = 4;
 // onset blocked. The Level session showed 5 clean plucks (peak RMS 0.19-0.25,
 // attack-vs-preattack ratio 50-250×) that the pipeline missed — hypothesis
 // is chained spurious body-peak retriggers blocked them via refractory.
-// Re-arm threshold is the exit level (0.02): if RMS decays below that
-// between plucks, we know the previous note is truly releasing and a
-// subsequent spike is a fresh pluck, not envelope noise.
-const _ND_REATTACK_REARM_LEVEL = 0.02;
+// Re-arm threshold (was 0.02 — same as exit level). On real bass plays
+// the sustain decays to ~0.025-0.035 between dense notes and never dips
+// below 0.02, so the rearm gate stays disarmed even when the next pluck
+// has 5-10× ratio over sustain. test/onset-probe.js measured this on
+// Gasoline + Stand by Me sessions: 63% / 80% of "missed real play"
+// notes had pre-attack min between 0.025 and 0.040. Bumping to 0.03
+// recovers the majority while staying below typical body-resonance
+// (sustained body peaks rarely exceed 0.04, and a spurious fire would
+// also need rms > 2×0.025 = 0.05 by the ratio gate).
+const _ND_REATTACK_REARM_LEVEL = 0.03;
 let _ndReattackArmed = true;          // true when a release has been seen since last onset
 // Fallback-path stability-vote compensation. The onset path uses the onset's
 // chart time directly; fallback only triggers when no onset fired, and at
