@@ -909,9 +909,12 @@ async function _ndFetchPlays(songId) {
 
 function _ndAggregatePlays(plays) {
     // Per-play metadata + per-note attempt verdicts joined across plays.
+    // Sort newest-first so the user sees the latest attempt as column 1
+    // in the matrix without scrolling to the right edge of the row. The
+    // attempt label is "Most recent" for index 0 and walks back from there.
     plays = (plays || []).slice().sort((a, b) => {
         const ax = a.startedAt || 0, bx = b.startedAt || 0;
-        return ax - bx;
+        return bx - ax;
     });
     const playMeta = plays.map((p, i) => {
         const ts = (p.noteResults || []).map(r => r.chartT).filter(t => Number.isFinite(t));
@@ -1315,7 +1318,7 @@ async function _ndShowReport() {
             <span class="text-gray-200 font-semibold">Practice Report — ${songId}</span>
             <button onclick="document.getElementById('nd-report-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
         </div>
-        <div class="text-xs text-gray-400 mb-3">${playMeta.length} attempts · ${rows.length} unique notes</div>
+        <div class="text-xs text-gray-400 mb-3">${playMeta.length} attempts · ${rows.length} unique notes · matrix shows newest attempt first (left → right)</div>
         <div class="grid grid-cols-4 gap-2 mb-3 text-xs">
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Best-of-${N}</div><div class="text-green-400 font-semibold">${bestOfN}/${total} (${total ? (bestOfN/total*100).toFixed(0) : '0'}%)</div></div>
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Perfect</div><div class="text-blue-300 font-semibold">${perfectAcrossN}/${total} (${total ? (perfectAcrossN/total*100).toFixed(0) : '0'}%)</div></div>
