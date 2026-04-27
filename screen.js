@@ -3118,6 +3118,10 @@ function createNoteDetector(options = {}) {
 // in one place.
 function _ndProcessAudioChunk(input) {
     if (!_ndEnabled) return;
+    // Watchdog timestamp: last time we saw audio data flow. The HUD reads
+    // this to decide whether to surface an "audio stalled" banner. Without
+    // it the (d) silent-stop failure has no visible signal.
+    _ndLastAudioFrameAt = performance.now();
 
     // Record raw audio if recording is active. Chart-time anchor is captured
     // inside this callback (not at _ndRecordStart) so WAV t=0 corresponds to
@@ -3679,33 +3683,41 @@ async function _ndStartAudio() {
         _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
         _ndResetBpFilter(_ndAudioCtx.sampleRate);
 
-    // ── Settings persistence (only the default singleton writes) ──────
-    function saveSettings() {
-        if (!isDefault) return;
-        try {
-            localStorage.setItem(_ND_STORAGE_KEY, JSON.stringify({
-                deviceId: selectedDeviceId,
-                channel: selectedChannel,
-                method: detectionMethod,
-                timingTolerance,
-                pitchTolerance,
-                timingHitThreshold,
-                chordTimingHitThreshold,
-                pitchHitThreshold,
-                showTimingErrors,
-                showPitchErrors,
-                edgeFlash: edgeFlashEnabled,
-                tuningMode,
-                detectEnabled: detectPreference,
-                missMarkerDuration,
-                hitGlowDuration,
-                inputGain,
-                latencyOffset,
-                chordHitRatio,
-                detectionConfidenceMin,
-            }));
-        } catch (e) { /* unavailable */ }
-    }
+        // ── Silent-stop recovery ──────────────────────────────────────────
+        // Three known causes of "Detect stays green-checked but no input
+        // pickup": AudioContext auto-suspends (Chrome hides idle/backgrounded
+        // tabs), MediaStreamTrack ends (USB unplug, BT drop, device steal),
+        // or the ScriptProcessor stops firing without throwing. The first
+        // two emit events; the third needs a watchdog. Without recovery
+        // hooks, frames just stop flowing and the user has no signal that
+        // anything went wrong — the (d) "works for a while then silently
+        // stops" failure mode reported during play sessions.
+        _ndAudioCtx.addEventListener('statechange', async () => {
+            console.log(`[note_detect] AudioContext state → ${_ndAudioCtx?.state}`);
+            if (_ndAudioCtx && _ndAudioCtx.state === 'suspended' && _ndEnabled) {
+                try {
+                    await _ndAudioCtx.resume();
+                    console.log('[note_detect] AudioContext auto-resumed');
+                } catch (e) {
+                    console.warn('[note_detect] AudioContext resume failed:', e);
+                }
+            }
+        });
+        for (const tr of _ndStream.getAudioTracks()) {
+            tr.addEventListener('ended', () => {
+                console.warn(`[note_detect] Audio track ended: "${tr.label}". Attempting restart...`);
+                if (_ndEnabled) {
+                    _ndStopAudio();
+                    setTimeout(() => _ndStartAudio(), 500);
+                }
+            });
+        }
+        // Prime the stall watchdog so the HUD stall badge doesn't false-fire
+        // during the brief gap before the first audio chunk arrives.
+        _ndLastAudioFrameAt = performance.now();
+
+        const source = _ndAudioCtx.createMediaStreamSource(_ndStream);
+        const streamChannels = source.channelCount;
 
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
@@ -3851,8 +3863,10 @@ async function _ndStartAudio() {
                 processFrame(buf).finally(() => { processingFrame = false; });
             }, 50);
 
-            gainNode.connect(processor);
-            processor.connect(audioCtx.destination);
+let _ndDetectInterval = null;
+let _ndPendingBuffer = null;
+let _ndLastAudioFrameAt = 0;     // performance.now() of most recent audio chunk
+const _ND_AUDIO_STALL_THRESHOLD_MS = 3000;  // HUD turns red after 3s of no chunks
 
 function _ndStopAudio() {
     _ndStopLevelMeter();
@@ -3875,6 +3889,7 @@ function _ndStopAudio() {
     _ndInputPeak = 0;
     _ndAccumBuffer = new Float32Array(0);
     _ndOnsetRmsHistory = [];
+    _ndLastAudioFrameAt = 0;
 }
 
 // ── Input Level Metering ──────────────────────────────────────────────────
@@ -5706,11 +5721,22 @@ function _ndUpdateHUD() {
 
     const statsEl = document.getElementById('nd-hud-stats');
     if (statsEl) {
+        // Stall indicator: if no audio chunk has flowed in 3s while detect
+        // is on, the audio path is silently dead (suspended context, ended
+        // track, or worklet death). Surface this prominently — without it
+        // the user has no visible cue, just "Detect green-checked but no
+        // notes scoring." Red badge so it can't be mistaken for normal stats.
+        const sinceFrame = _ndLastAudioFrameAt > 0
+            ? performance.now() - _ndLastAudioFrameAt
+            : Infinity;
+        const stalled = _ndEnabled && sinceFrame > _ND_AUDIO_STALL_THRESHOLD_MS;
+        const ctxState = _ndAudioCtx?.state || 'closed';
+        const stallBadge = stalled
+            ? ` <span style="color:#ff4444;font-weight:bold">⚠ AUDIO STALLED (${(sinceFrame/1000).toFixed(0)}s, ctx:${ctxState})</span>`
+            : '';
+
         const s = _ndStats();
         if (s) {
-            // Colour the timing line red if drift is outside the plugin's own
-            // timing tolerance, yellow if within but systematic, green if near
-            // zero. Gives one-glance feedback on whether calibration is needed.
             const tolMs = _ndTimingTolerance * 1000;
             const dtColor = Math.abs(s.dtMean) < 20 ? '#6edf8f'
                           : Math.abs(s.dtMean) < tolMs ? '#ffcc00' : '#ff6b6b';
@@ -5719,13 +5745,10 @@ function _ndUpdateHUD() {
             statsEl.innerHTML =
                 `<span style="color:${dtColor}">Δt ${dtSign}${Math.round(s.dtMean)} ±${Math.round(s.dtStd)} ms</span> ` +
                 `<span class="text-gray-500">· ${cSign}${Math.round(s.cMean)} ±${Math.round(s.cStd)} ¢ · n=${s.n}</span>` +
-                `<span class="text-gray-500"> · trouble:${_ndTroubleNotes.size}</span>`;
+                `<span class="text-gray-500"> · trouble:${_ndTroubleNotes.size}</span>` +
+                stallBadge;
         } else {
-            // Always show trouble-map size even before scoring stats are
-            // ready — it's the load-bearing diagnostic for the pre-arrival
-            // glow path. 0 means "no last-play data wired in"; >0 means
-            // "data is there, look for orange/red ! badges on upcoming notes".
-            statsEl.innerHTML = `<span class="text-gray-500">trouble:${_ndTroubleNotes.size}</span>`;
+            statsEl.innerHTML = `<span class="text-gray-500">trouble:${_ndTroubleNotes.size}</span>` + stallBadge;
         }
     }
 
