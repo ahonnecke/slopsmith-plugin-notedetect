@@ -1034,6 +1034,13 @@ function _ndVerdictGlyph(kind) {
 // "WRONG_OCTAVE" catches the YIN octave-down failure mode that keeps
 // showing up in real bass audio, etc.
 const _ND_BASS_OPEN_STRING_MIDIS = new Set([28, 33, 38, 43]);
+// Octave above each open string. YIN on a 4096-sample buffer at low bass
+// frequencies (E1=41 Hz, A1=55 Hz) often locks onto the 2nd harmonic
+// rather than the weak fundamental, so an unmuted ringing open A
+// reads as A2 (MIDI 45) rather than A1. Detecting either pattern as
+// OPEN_STRING contamination matches the underlying physics — same
+// muting issue, different YIN output.
+const _ND_BASS_OPEN_STRING_OCTAVE_MIDIS = new Set([40, 45, 50, 55]);
 
 function _ndClassifyFailureMode(note) {
     const { primary, labels = [], pitchError, detectedMidi, expectedMidi } = note;
@@ -1066,10 +1073,13 @@ function _ndClassifyFailureMode(note) {
         if (semiOff != null && Math.abs(semiOff) === 12) {
             return { mode: 'WRONG_OCTAVE', severity: 0.9 };
         }
-        if (liveMidi != null
-                && _ND_BASS_OPEN_STRING_MIDIS.has(liveMidi)
-                && !_ND_BASS_OPEN_STRING_MIDIS.has(expectedMidi)) {
-            // Detected an open-string MIDI when expected was fretted.
+        const liveIsOpen = liveMidi != null && _ND_BASS_OPEN_STRING_MIDIS.has(liveMidi);
+        const liveIsOpenOctave = liveMidi != null && _ND_BASS_OPEN_STRING_OCTAVE_MIDIS.has(liveMidi);
+        const expectedIsOpen = _ND_BASS_OPEN_STRING_MIDIS.has(expectedMidi)
+            || _ND_BASS_OPEN_STRING_OCTAVE_MIDIS.has(expectedMidi);
+        if ((liveIsOpen || liveIsOpenOctave) && !expectedIsOpen) {
+            // Detected an open-string MIDI (or its 2nd harmonic via YIN
+            // octave-up) when the chart expected a fretted note.
             return { mode: 'OPEN_STRING', severity: 1.0 };
         }
         if (semiOff != null && Math.abs(semiOff) <= 3) {
@@ -1090,7 +1100,7 @@ const _ND_FAILURE_MODE_INFO = {
     PITCH_SHARP:       { color: '#fb923c', label: 'Sharp hits', advice: 'Pitch reads above target. Check intonation / fret pressure.' },
     PITCH_FLAT:        { color: '#a78bfa', label: 'Flat hits', advice: 'Pitch reads below target. Press behind the fret, not on top.' },
     STRING_BLEED:      { color: '#facc15', label: 'String-hygiene leaks', advice: 'You hit the right note but another string was ringing. Right-hand mute the lower strings.' },
-    OPEN_STRING:       { color: '#f87171', label: 'Open-string contamination', advice: 'A fretted note came out as an open string. Fret-hand finger probably wasn\'t engaged or you brushed an open string while plucking.' },
+    OPEN_STRING:       { color: '#f87171', label: 'Open-string contamination', advice: 'Detection captured an open string (or its octave via YIN harmonic) when a fretted note was expected. Right-hand mute the lower strings — the unmuted string is ringing alongside your fretted note and dominating the audio.' },
     WRONG_FRET:        { color: '#fb923c', label: 'Wrong fret (1-3 semitones off)', advice: 'Hand position drifted by a fret or two. Slow the passage and check your fret-hand landing.' },
     WRONG_OCTAVE:      { color: '#fb923c', label: 'Octave error', advice: 'Detector or playing produced an octave displacement. If consistent, check for open-string ringing or YIN octave confusion.' },
     WRONG_PITCH:       { color: '#fb923c', label: 'Other wrong pitch', advice: 'Detection captured a pitch that doesn\'t match expected by more than 3 semitones.' },
