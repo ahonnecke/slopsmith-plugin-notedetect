@@ -48,7 +48,12 @@ const OUT_DIR = getArg('out-dir', path.join(__dirname, 'fixtures', 'synth'));
 const NO_INJECT = args.includes('--no-inject');
 const RESTORE = args.includes('--restore');
 const SAMPLE_RATE = parseInt(getArg('sample-rate', '48000'), 10);
-const NOTE_SUSTAIN_SEC = parseFloat(getArg('note-sustain', '0.40'));
+// Bumped from 0.40 to 0.80 — at 0.40 every chart note ended in a hard
+// stop, the track sounded staccato, and there was no harmonic context
+// between plucks for the player to anticipate from. 0.80 gives notes
+// room to ring into each other (still auto-shortened if the next chart
+// note arrives sooner — no overlap).
+const NOTE_SUSTAIN_SEC = parseFloat(getArg('note-sustain', '0.80'));
 const ATTACK_MS = parseFloat(getArg('attack-ms', '8'));
 const AMPLITUDE = parseFloat(getArg('amplitude', '0.5'));
 const NOISE_FLOOR = parseFloat(getArg('noise-floor', '0.002'));
@@ -57,6 +62,7 @@ const NOISE_FLOOR = parseFloat(getArg('noise-floor', '0.002'));
 // rhythmic anchor. Click is a short high-frequency burst, just loud
 // enough to feel without drowning the bass tones.
 const NO_CLICK = args.includes('--no-click');
+const DOWNBEATS_ONLY = args.includes('--downbeats-only');
 const CLICK_FREQ_HZ = parseFloat(getArg('click-freq', '2000'));   // clicky high
 const CLICK_DOWNBEAT_FREQ_HZ = parseFloat(getArg('click-downbeat-freq', '3000'));
 const CLICK_AMP = parseFloat(getArg('click-amp', '0.18'));
@@ -261,13 +267,17 @@ function synthesize(notes, beats, durationSec) {
         renderNote(samples, SAMPLE_RATE, startSample, endSample, n.midi, AMPLITUDE);
     }
     if (!NO_CLICK && beats && beats.length > 0) {
-        // Beats are chart-time positions of every beat in the song. measure=1
-        // marks downbeats — render those a touch louder/higher so the user
-        // can feel where the bar starts.
+        // Beats are chart-time positions of every beat in the song.
+        // Downbeats (start of each measure) carry a non-negative measure
+        // index; mid-measure beats are tagged -1 in slopsmith's output.
+        // --downbeats-only fires the click ONLY at bar starts, giving a
+        // ~1-click-per-2s pulse at typical tempos (vs ~2-clicks/s every
+        // beat) so the soundscape has space for the bass to breathe.
         for (const b of beats) {
             const startSample = Math.floor(b.t * SAMPLE_RATE);
             if (startSample < 0 || startSample >= samples.length) continue;
-            const downbeat = b.measure && b.measure !== -1 && b.measure % 1 === 0 && b.measure !== 0;
+            const downbeat = b.measure != null && b.measure !== -1;
+            if (DOWNBEATS_ONLY && !downbeat) continue;
             const f = downbeat ? CLICK_DOWNBEAT_FREQ_HZ : CLICK_FREQ_HZ;
             const a = downbeat ? CLICK_AMP * 1.4 : CLICK_AMP;
             renderClick(samples, SAMPLE_RATE, startSample, f, a, CLICK_DURATION_MS);
@@ -316,7 +326,8 @@ async function main() {
     const wavPath = path.join(OUT_DIR, `${stem}.wav`);
     const sidecarPath = path.join(OUT_DIR, `${stem}.json`);
 
-    console.log(`Synthesizing ${duration.toFixed(1)}s of audio at ${SAMPLE_RATE} Hz${NO_CLICK ? '' : ' (with metronome click on every beat)'}…`);
+    const clickDesc = NO_CLICK ? '' : (DOWNBEATS_ONLY ? ' (click on downbeats only)' : ' (click on every beat)');
+    console.log(`Synthesizing ${duration.toFixed(1)}s of audio at ${SAMPLE_RATE} Hz${clickDesc}, sustain≤${NOTE_SUSTAIN_SEC}s…`);
     const samples = synthesize(notes, beats || [], duration + 1.0);
     writeWav(wavPath, samples, SAMPLE_RATE);
     fs.writeFileSync(sidecarPath, JSON.stringify({

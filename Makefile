@@ -224,7 +224,11 @@ loop-report: ## Aggregate plays into a best-of-N report (SONG=<substring> option
 synth-track: ## Generate a chart-aligned synth WAV for a song and inject it into slopsmith's audio cache (SONG=<query>)
 	@SONG_ARG=""; \
 	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
-	node test/synth-track.js $$SONG_ARG
+	EVERY_BEAT=""; \
+	if [ -n "$(EVERY_BEAT)" ]; then EVERY_BEAT="$(EVERY_BEAT)"; else EVERY_BEAT=""; fi; \
+	DOWNBEATS_FLAG="--downbeats-only"; \
+	if [ -n "$(EVERY_BEAT)" ]; then DOWNBEATS_FLAG=""; fi; \
+	node test/synth-track.js $$SONG_ARG $$DOWNBEATS_FLAG
 
 .PHONY: synth-restore
 synth-restore: ## Restore the original audio for a song (SONG=<query>)
