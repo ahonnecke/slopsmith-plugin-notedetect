@@ -872,21 +872,44 @@ function _ndSnapshotPlay(reason) {
 // before any glow appears.
 async function _ndLoadTroubleFromDisk() {
     const songId = _ndCurrentSongId();
-    if (!songId) return;
+    if (!songId) {
+        console.warn('[note_detect] Trouble map: songId is null at detect-on, retrying in 1s');
+        setTimeout(() => _ndLoadTroubleFromDisk(), 1000);
+        return;
+    }
     try {
+        console.log(`[note_detect] Trouble map fetching for songId="${songId}"`);
         const plays = await _ndFetchPlays(songId);
+        console.log(`[note_detect] Trouble map fetch returned ${plays.length} play(s)`);
         if (!plays.length) {
             _ndTroubleNotes = new Map();
+            console.log(`[note_detect] Trouble map empty — no prior plays for songId="${songId}".`);
             return;
         }
         // plays[0] is newest by mtime
-        _ndTroubleNotes = _ndBuildTroubleMap(plays[0].noteResults || []);
-        console.log(`[note_detect] Trouble map loaded: ${_ndTroubleNotes.size} notes from last play`);
+        const newest = plays[0];
+        _ndTroubleNotes = _ndBuildTroubleMap(newest.noteResults || []);
+        console.log(`[note_detect] Trouble map loaded: ${_ndTroubleNotes.size} notes from playId=${newest.playId} (${(newest.noteResults || []).length} total entries)`);
+        // Sample a few keys so a key-mismatch bug is visible in console
+        const sampleKeys = [];
+        for (const k of _ndTroubleNotes.keys()) {
+            sampleKeys.push(k);
+            if (sampleKeys.length >= 5) break;
+        }
+        console.log(`[note_detect] Trouble keys sample: ${JSON.stringify(sampleKeys)}`);
+        // Dump the first few CHART keys we'll be matching against, so a
+        // mismatch with trouble keys above is obvious. Captured at first
+        // draw frame; logs once.
+        _ndTroubleDebugDumpPending = true;
     } catch (e) {
         console.warn('[note_detect] Trouble map load failed:', e);
         _ndTroubleNotes = new Map();
     }
 }
+
+// One-shot flag: dump first few chart-note keys at the next draw frame so
+// the console shows what we're attempting to MATCH the trouble map against.
+let _ndTroubleDebugDumpPending = false;
 
 async function _ndFetchPlays(songId) {
     if (_ndPlaysCacheSongId === songId && _ndPlaysCache) return _ndPlaysCache;
@@ -5762,6 +5785,48 @@ highway.addDrawHook(function(ctx, W, H) {
     };
 
     if (_ndTroubleNotes.size > 0) {
+        // One-shot diagnostic: dump the first few chart-note keys we're
+        // about to match against the trouble keys, so a key-mismatch bug
+        // is obvious in console (e.g. trouble has "1|3|2.5" but chart
+        // produces "1|3|2.49998" due to round-trip jitter).
+        if (_ndTroubleDebugDumpPending) {
+            _ndTroubleDebugDumpPending = false;
+            const chartKeys = [];
+            if (notes) {
+                for (let i = 0; i < Math.min(5, notes.length); i++) {
+                    const n = notes[i];
+                    if (n.mt) continue;
+                    chartKeys.push(_ndTroubleKey(n.s, n.f, n.t));
+                }
+            }
+            if (chords) {
+                for (let i = 0; i < Math.min(3, chords.length); i++) {
+                    const c = chords[i];
+                    for (const cn of (c.notes || [])) {
+                        if (cn.mt) continue;
+                        chartKeys.push(_ndTroubleKey(cn.s, cn.f, c.t));
+                    }
+                }
+            }
+            console.log(`[note_detect] Chart keys sample (first frame): ${JSON.stringify(chartKeys.slice(0, 8))}`);
+            // How many chart-key matches exist anywhere in the upcoming window?
+            let matchCount = 0;
+            if (notes) {
+                for (const n of notes) {
+                    if (n.mt) continue;
+                    if (_ndTroubleNotes.has(_ndTroubleKey(n.s, n.f, n.t))) matchCount++;
+                }
+            }
+            if (chords) {
+                for (const c of chords) {
+                    for (const cn of (c.notes || [])) {
+                        if (cn.mt) continue;
+                        if (_ndTroubleNotes.has(_ndTroubleKey(cn.s, cn.f, c.t))) matchCount++;
+                    }
+                }
+            }
+            console.log(`[note_detect] Chart keys matching trouble map: ${matchCount} of ${_ndTroubleNotes.size} trouble entries`);
+        }
         if (notes) {
             const start = _ndBsearch(notes, t - 0.1);
             for (let i = start; i < notes.length; i++) {
