@@ -52,6 +52,15 @@ const NOTE_SUSTAIN_SEC = parseFloat(getArg('note-sustain', '0.40'));
 const ATTACK_MS = parseFloat(getArg('attack-ms', '8'));
 const AMPLITUDE = parseFloat(getArg('amplitude', '0.5'));
 const NOISE_FLOOR = parseFloat(getArg('noise-floor', '0.002'));
+// Layer a metronome click on every chart beat by default. Pure synth-bass
+// is too sparse to play along to — silence between plucks gives no
+// rhythmic anchor. Click is a short high-frequency burst, just loud
+// enough to feel without drowning the bass tones.
+const NO_CLICK = args.includes('--no-click');
+const CLICK_FREQ_HZ = parseFloat(getArg('click-freq', '2000'));   // clicky high
+const CLICK_DOWNBEAT_FREQ_HZ = parseFloat(getArg('click-downbeat-freq', '3000'));
+const CLICK_AMP = parseFloat(getArg('click-amp', '0.18'));
+const CLICK_DURATION_MS = parseFloat(getArg('click-duration', '15'));
 
 // Same harmonic profile as test/synthesize-bass.js — weak fundamental,
 // strong 2nd harmonic. Mirrors realistic bass content so the live YIN
@@ -86,6 +95,20 @@ function addNoiseFloor(samples, rms, seed = 42) {
     let s = seed;
     const rng = () => { s = (s * 1664525 + 1013904223) >>> 0; s ^= s >>> 16; return (s >>> 0) / 0xffffffff; };
     for (let i = 0; i < samples.length; i++) samples[i] += (rng() - 0.5) * 2 * rms;
+}
+
+// Render a short percussive click — exponentially-decaying sine burst.
+// Used for the metronome layer so the player has a tempo anchor without
+// drowning the bass tones.
+function renderClick(samples, sampleRate, startSample, freqHz, amp, durationMs) {
+    const len = Math.floor(sampleRate * durationMs / 1000);
+    for (let i = 0; i < len; i++) {
+        const idx = startSample + i;
+        if (idx >= samples.length) break;
+        const t = i / sampleRate;
+        const env = Math.exp(-i / (len * 0.3)); // decay to ~0 by end
+        samples[idx] += amp * env * Math.sin(2 * Math.PI * freqHz * t);
+    }
 }
 
 function writeWav(p, samples, sampleRate) {
@@ -210,6 +233,9 @@ async function fetchChart() {
                 chartT: n.t, s: n.s, f: n.f,
                 midi: _ndMidiFromStringFret(n.s, n.f) + (_ndPitchOffset || 0),
             })),
+            beats: (highway.getBeats ? highway.getBeats() : []).map(b => ({
+                t: b.time, measure: b.measure,
+            })),
         }));
         return { song, ...data };
     } finally { await browser.close(); }
@@ -217,7 +243,7 @@ async function fetchChart() {
 
 // ── Synthesis ──────────────────────────────────────────────────────────
 
-function synthesize(notes, durationSec) {
+function synthesize(notes, beats, durationSec) {
     const totalSamples = Math.floor(durationSec * SAMPLE_RATE);
     const samples = new Float32Array(totalSamples);
     const sorted = notes.slice().sort((a, b) => a.chartT - b.chartT);
@@ -233,6 +259,19 @@ function synthesize(notes, durationSec) {
         if (endSample <= startSample) continue;
         if (n.midi == null) continue;
         renderNote(samples, SAMPLE_RATE, startSample, endSample, n.midi, AMPLITUDE);
+    }
+    if (!NO_CLICK && beats && beats.length > 0) {
+        // Beats are chart-time positions of every beat in the song. measure=1
+        // marks downbeats — render those a touch louder/higher so the user
+        // can feel where the bar starts.
+        for (const b of beats) {
+            const startSample = Math.floor(b.t * SAMPLE_RATE);
+            if (startSample < 0 || startSample >= samples.length) continue;
+            const downbeat = b.measure && b.measure !== -1 && b.measure % 1 === 0 && b.measure !== 0;
+            const f = downbeat ? CLICK_DOWNBEAT_FREQ_HZ : CLICK_FREQ_HZ;
+            const a = downbeat ? CLICK_AMP * 1.4 : CLICK_AMP;
+            renderClick(samples, SAMPLE_RATE, startSample, f, a, CLICK_DURATION_MS);
+        }
     }
     if (NOISE_FLOOR > 0) addNoiseFloor(samples, NOISE_FLOOR);
     return samples;
@@ -264,9 +303,9 @@ async function main() {
     }
 
     console.log(`Fetching chart for "${SONG_QUERY}" from ${SLOPSMITH_URL}…`);
-    const { song, songInfo, duration, notes } = await fetchChart();
+    const { song, songInfo, duration, notes, beats } = await fetchChart();
     const stem = path.parse(song.filename).name.replace(/ /g, '_');
-    console.log(`  song: ${song.filename}  arrangement: ${songInfo.arrangement}  duration: ${duration.toFixed(1)}s  notes: ${notes.length}`);
+    console.log(`  song: ${song.filename}  arrangement: ${songInfo.arrangement}  duration: ${duration.toFixed(1)}s  notes: ${notes.length}  beats: ${beats?.length || 0}`);
 
     if (notes.length === 0) {
         console.error('No notes in chart — aborting.');
@@ -277,8 +316,8 @@ async function main() {
     const wavPath = path.join(OUT_DIR, `${stem}.wav`);
     const sidecarPath = path.join(OUT_DIR, `${stem}.json`);
 
-    console.log(`Synthesizing ${duration.toFixed(1)}s of audio at ${SAMPLE_RATE} Hz…`);
-    const samples = synthesize(notes, duration + 1.0);
+    console.log(`Synthesizing ${duration.toFixed(1)}s of audio at ${SAMPLE_RATE} Hz${NO_CLICK ? '' : ' (with metronome click on every beat)'}…`);
+    const samples = synthesize(notes, beats || [], duration + 1.0);
     writeWav(wavPath, samples, SAMPLE_RATE);
     fs.writeFileSync(sidecarPath, JSON.stringify({
         chartStartTime: 0,
