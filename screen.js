@@ -1160,9 +1160,14 @@ async function _ndShowReport() {
         `;
     }).join('');
 
-    // Suggested loops with embedded Save buttons.
+    // Suggested loops with embedded Save buttons. slopsmith's /api/loops
+    // keys off `window.currentFilename` (the global JS var its own loop UI
+    // uses) — `highway.getSongInfo().filename` is sometimes empty or shaped
+    // differently. Prefer the global; fall back to song info; if both empty
+    // the Save button reports "No song" and disables itself.
     const songInfo = highway.getSongInfo && highway.getSongInfo();
-    const songFilename = songInfo?.filename || '';
+    const songFilename = (typeof window !== 'undefined' && window.currentFilename)
+        || songInfo?.filename || '';
     const loopsHtml = loops.length === 0
         ? '<p class="text-gray-500 text-xs">No suggested loops — no clusters of ≥2 trouble notes found.</p>'
         : loops.map(lp => {
