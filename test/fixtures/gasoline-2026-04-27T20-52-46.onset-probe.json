@@ -1,0 +1,184 @@
+{
+  "classification": "gasoline-2026-04-27T20-52-46.classification.json",
+  "wav": "test/fixtures/gasoline-2026-04-27T20-52-46.wav",
+  "constants": {
+    "ONSET_LEVEL": 0.04,
+    "ONSET_EXIT_LEVEL": 0.02,
+    "REATTACK_RATIO": 2,
+    "REATTACK_MIN_LEVEL": 0.04,
+    "REATTACK_REFRACTORY_SEC": 0.2,
+    "REATTACK_WINDOW": 4,
+    "FRAME_SAMPLES": 2048
+  },
+  "missedTotal": 19,
+  "causeCounts": {
+    "soft-attack": 1,
+    "no-rearm": 12,
+    "low-ratio": 0,
+    "refractory-blocked": 0,
+    "should-have-fired": 6
+  },
+  "causes": {
+    "soft-attack": [
+      {
+        "peakRms": 0,
+        "preAttackMin": 0,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 35.715,
+        "expectedMidi": 38
+      }
+    ],
+    "no-rearm": [
+      {
+        "peakRms": 0.10284642077192149,
+        "preAttackMin": 0.023797649061010524,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 47.009,
+        "expectedMidi": 38
+      },
+      {
+        "peakRms": 0.21568651707840023,
+        "preAttackMin": 0.032518716792056486,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 83.715,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.227504697022744,
+        "preAttackMin": 0.11587379939791358,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 94.656,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.12164295121939699,
+        "preAttackMin": 0.02577077273292079,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 100.656,
+        "expectedMidi": 38
+      },
+      {
+        "peakRms": 0.18515565430709585,
+        "preAttackMin": 0.02834861373649558,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 106.303,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.17941843971892657,
+        "preAttackMin": 0.060296850421755595,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 107.009,
+        "expectedMidi": 33
+      },
+      {
+        "peakRms": 0.2637510434037302,
+        "preAttackMin": 0.024665650275766872,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 140.185,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.17317778246209498,
+        "preAttackMin": 0.020800626336374212,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 140.891,
+        "expectedMidi": 33
+      },
+      {
+        "peakRms": 0.19158049485254675,
+        "preAttackMin": 0.12249264710931038,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 151.126,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.23859619301135157,
+        "preAttackMin": 0.07424111830872651,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 162.773,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.2369397899597594,
+        "preAttackMin": 0.026994178460644377,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 188.185,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.196461950820748,
+        "preAttackMin": 0.029591944248308754,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 188.891,
+        "expectedMidi": 33
+      }
+    ],
+    "low-ratio": [],
+    "refractory-blocked": [],
+    "should-have-fired": [
+      {
+        "peakRms": 0.24167662072138693,
+        "preAttackMin": 0.01559238042914083,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 27.244,
+        "expectedMidi": 34
+      },
+      {
+        "peakRms": 0.11108770141156472,
+        "preAttackMin": 0.006347103091928764,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 32.891,
+        "expectedMidi": 38
+      },
+      {
+        "peakRms": 0.0977327370599831,
+        "preAttackMin": 0.00981581816177556,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 63.95,
+        "expectedMidi": 38
+      },
+      {
+        "peakRms": 0.1650297443862774,
+        "preAttackMin": 0.019972424548443075,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 84.068,
+        "expectedMidi": 33
+      },
+      {
+        "peakRms": 0.12918540893192582,
+        "preAttackMin": 0.011420325038081625,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 126.068,
+        "expectedMidi": 38
+      },
+      {
+        "peakRms": 0.10889118327481294,
+        "preAttackMin": 0,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 182.185,
+        "expectedMidi": 38
+      }
+    ]
+  },
+  "measuredAt": "2026-04-27T21:20:19.972Z"
+}

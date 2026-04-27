@@ -1,0 +1,71 @@
+{
+  "classification": "stand_by_me-2026-04-27T20-25-46.classification.json",
+  "wav": "test/fixtures/stand_by_me-2026-04-27T20-25-46.wav",
+  "constants": {
+    "ONSET_LEVEL": 0.04,
+    "ONSET_EXIT_LEVEL": 0.02,
+    "REATTACK_RATIO": 2,
+    "REATTACK_MIN_LEVEL": 0.04,
+    "REATTACK_REFRACTORY_SEC": 0.2,
+    "REATTACK_WINDOW": 4,
+    "FRAME_SAMPLES": 2048
+  },
+  "missedTotal": 5,
+  "causeCounts": {
+    "soft-attack": 0,
+    "no-rearm": 4,
+    "low-ratio": 0,
+    "refractory-blocked": 0,
+    "should-have-fired": 1
+  },
+  "causes": {
+    "soft-attack": [],
+    "no-rearm": [
+      {
+        "peakRms": 0.09854911062505577,
+        "preAttackMin": 0.021170043793658763,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 35.113,
+        "expectedMidi": 44
+      },
+      {
+        "peakRms": 0.13676934999731338,
+        "preAttackMin": 0.04256790822335741,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 95.088,
+        "expectedMidi": 40
+      },
+      {
+        "peakRms": 0.12072190221826254,
+        "preAttackMin": 0.022885223594636215,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 117.171,
+        "expectedMidi": 40
+      },
+      {
+        "peakRms": 0.10758598188816557,
+        "preAttackMin": 0.047446546111611185,
+        "sawReleaseInPrior": false,
+        "refractoryBlocked": false,
+        "chartT": 129.718,
+        "expectedMidi": 45
+      }
+    ],
+    "low-ratio": [],
+    "refractory-blocked": [],
+    "should-have-fired": [
+      {
+        "peakRms": 0.12610737451985307,
+        "preAttackMin": 0.008966426092652134,
+        "sawReleaseInPrior": true,
+        "refractoryBlocked": false,
+        "chartT": 157.321,
+        "expectedMidi": 38
+      }
+    ]
+  },
+  "measuredAt": "2026-04-27T21:20:20.174Z"
+}

@@ -251,6 +251,17 @@ silent-probe: ## Root-cause split for the USER_SILENT bucket on a song (STEM=<ce
 	fi; \
 	node test/silent-probe.js --stem $(STEM)
 
+.PHONY: onset-probe
+onset-probe: ## Root-cause split for PIPELINE_MISSED_REAL_PLAY (onset didn't fire) — SESSION=<name> or STEM=<ceiling-stem>
+	@if [ -n "$(SESSION)" ]; then \
+	    node test/onset-probe.js --session $(SESSION); \
+	elif [ -n "$(STEM)" ]; then \
+	    node test/onset-probe.js --stem $(STEM); \
+	else \
+	    echo "usage: make onset-probe SESSION=<session-name>  OR  STEM=<ceiling-stem>"; \
+	    exit 1; \
+	fi
+
 .PHONY: song-ceiling-roster
 song-ceiling-roster: ## Run ceiling test across the curated roster (FORCE=1, EXTENDED=1, BANDPASS=1, SONGS="a,b,c")
 	@FLAGS=""; \
