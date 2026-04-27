@@ -1109,6 +1109,24 @@ async function _ndShowReport() {
         ? Math.round(p50Timing - avOffsetMs + onsetCompMs)
         : null;
 
+    // Label distribution across HITs: LATE / EARLY / SHARP / FLAT and the
+    // residue (perfect-zone hits with no labels). Surfaces "how precisely
+    // did I hit my hits?" — the existing matrix only shows hit-vs-miss.
+    let nLate = 0, nEarly = 0, nSharp = 0, nFlat = 0, nClean = 0, nLabeledHits = 0;
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            if (r.primary !== 'HIT' && r.primary !== 'DIRTY_HIT') continue;
+            nLabeledHits++;
+            const labels = r.labels || [];
+            if (labels.includes('LATE')) nLate++;
+            if (labels.includes('EARLY')) nEarly++;
+            if (labels.includes('SHARP')) nSharp++;
+            if (labels.includes('FLAT')) nFlat++;
+            if (labels.length === 0) nClean++;
+        }
+    }
+    const labelPct = (n) => nLabeledHits ? `${(n / nLabeledHits * 100).toFixed(0)}%` : '—';
+
     // Build the matrix HTML row by row.
     const matrixRows = rows.map(row => {
         const s = _ndStatsForRow(row);
@@ -1195,6 +1213,40 @@ async function _ndShowReport() {
                 ${Math.abs(_ndDriftEstimateMs) > 150
                     ? '<span class="text-purple-300"> Large drift detected — chart-vs-audio sync is significant for this song.</span>'
                     : ''}
+            </div>
+        </div>
+        ` : ''}
+
+        ${nLabeledHits > 0 ? `
+        <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
+            <div class="flex justify-between items-baseline mb-2">
+                <span class="text-gray-400">Hit precision (label breakdown across ${nLabeledHits} hits)</span>
+                <span class="text-gray-500 text-[10px]">a HIT can carry timing AND pitch labels</span>
+            </div>
+            <div class="grid grid-cols-5 gap-2">
+                <div class="bg-dark-700 rounded p-2">
+                    <div class="text-gray-500 text-[10px]">Clean (no label)</div>
+                    <div class="text-emerald-300 font-mono">${nClean} (${labelPct(nClean)})</div>
+                </div>
+                <div class="bg-dark-700 rounded p-2">
+                    <div class="text-gray-500 text-[10px]">LATE</div>
+                    <div class="text-yellow-300 font-mono">${nLate} (${labelPct(nLate)})</div>
+                </div>
+                <div class="bg-dark-700 rounded p-2">
+                    <div class="text-gray-500 text-[10px]">EARLY</div>
+                    <div class="text-blue-300 font-mono">${nEarly} (${labelPct(nEarly)})</div>
+                </div>
+                <div class="bg-dark-700 rounded p-2">
+                    <div class="text-gray-500 text-[10px]">SHARP</div>
+                    <div class="text-orange-300 font-mono">${nSharp} (${labelPct(nSharp)})</div>
+                </div>
+                <div class="bg-dark-700 rounded p-2">
+                    <div class="text-gray-500 text-[10px]">FLAT</div>
+                    <div class="text-purple-300 font-mono">${nFlat} (${labelPct(nFlat)})</div>
+                </div>
+            </div>
+            <div class="text-gray-500 text-[10px] mt-2 leading-tight">
+                Labels fire when timing or pitch is outside the strictness preset's "perfect" zone (currently ±${_ndPerfectTimingMs}ms / ±${_ndPerfectPitchCent}¢). All five buckets above counted as HITs in the score; this tile shows precision, not pass/fail.
             </div>
         </div>
         ` : ''}
@@ -5084,9 +5136,14 @@ function _ndUpdateHUD() {
             const cSign  = s.cMean  >= 0 ? '+' : '';
             statsEl.innerHTML =
                 `<span style="color:${dtColor}">Δt ${dtSign}${Math.round(s.dtMean)} ±${Math.round(s.dtStd)} ms</span> ` +
-                `<span class="text-gray-500">· ${cSign}${Math.round(s.cMean)} ±${Math.round(s.cStd)} ¢ · n=${s.n}</span>`;
+                `<span class="text-gray-500">· ${cSign}${Math.round(s.cMean)} ±${Math.round(s.cStd)} ¢ · n=${s.n}</span>` +
+                `<span class="text-gray-500"> · trouble:${_ndTroubleNotes.size}</span>`;
         } else {
-            statsEl.textContent = '';
+            // Always show trouble-map size even before scoring stats are
+            // ready — it's the load-bearing diagnostic for the pre-arrival
+            // glow path. 0 means "no last-play data wired in"; >0 means
+            // "data is there, look for orange/red ! badges on upcoming notes".
+            statsEl.innerHTML = `<span class="text-gray-500">trouble:${_ndTroubleNotes.size}</span>`;
         }
     }
 
@@ -5377,8 +5434,6 @@ highway.addDrawHook(function(ctx, W, H) {
     // is naturally superseded — same draw call, later timestamp wins).
     const drawTroubleGlow = (s, f, noteTime, trouble) => {
         const tOff = noteTime - t;
-        // Only glow notes that are upcoming or AT the now-line — past notes
-        // either have a current judgment (handled below) or aren't relevant.
         if (tOff < -0.05) return;
         const p = highway.project(tOff);
         if (!p) return;
@@ -5386,34 +5441,58 @@ highway.addDrawHook(function(ctx, W, H) {
         const y = p.y * H;
         const sev = trouble.severity || 0.5;
 
-        // Distance-based intensity: faint when far away, full when reaching
-        // the now-line, so the warning ramps as the player approaches.
-        const proximity = Math.max(0, 1 - tOff / 2.5); // ramps over last 2.5s
-        const alpha = 0.25 + 0.55 * proximity * sev;
+        // Visibility-first: lock high base intensity even far from the now-line
+        // so the player notices the warning when the note FIRST appears, not
+        // 0.5s before it lands. Pulse adds urgency near the line; proximity
+        // boost is additive on top of an already-visible base.
+        const proximity = Math.max(0, 1 - tOff / 3.0);
+        const baseAlpha = 0.55 + 0.4 * sev;          // 0.55..0.95
+        const proxBoost = 0.0 + 0.3 * proximity * sev;
+        const alpha = Math.min(1.0, baseAlpha + proxBoost);
 
-        // Pulse rate also scales with proximity — slow shimmer far out,
-        // urgent flash near the now-line. nowSec lets the pulse animate.
         const nowSec = performance.now() / 1000;
-        const pulseRate = 2 + 5 * proximity;
-        const pulse = 0.6 + 0.4 * Math.sin(nowSec * pulseRate);
+        const pulseRate = 2 + 4 * proximity;
+        const pulse = 0.75 + 0.25 * Math.sin(nowSec * pulseRate);
 
-        // Color: orange → red as severity climbs. Same hue family as the
-        // miss-X marker so the player learns "these colors mean trouble"
-        // but distinct enough that it doesn't read as "you already missed it."
+        // Color: bright orange → red as severity climbs. r=255 always; g
+        // drops with severity so a chronic miss reads as bright red.
         const r = 255;
-        const g = Math.round(180 - 140 * sev);
-        const b = 60;
-        const colour = `rgba(${r},${g},${b},${(alpha * pulse).toFixed(3)})`;
+        const g = Math.round(190 - 150 * sev);
+        const b = 40;
+        const ringColour = `rgba(${r},${g},${b},${(alpha * pulse).toFixed(3)})`;
+        const fillColour = `rgba(${r},${g},${b},${(alpha * 0.28).toFixed(3)})`;
 
-        const sz = Math.max(22, 30 * p.scale);
+        const sz = Math.max(26, 36 * p.scale);
         ctx.save();
-        ctx.shadowColor = colour;
-        ctx.shadowBlur = 18 * p.scale;
-        ctx.strokeStyle = colour;
-        ctx.lineWidth = Math.max(2, 3 * p.scale);
+        // Filled translucent disc — the eye-catching base layer
+        ctx.fillStyle = fillColour;
+        ctx.shadowColor = ringColour;
+        ctx.shadowBlur = 22 * p.scale;
+        ctx.beginPath();
+        ctx.arc(x, y, sz, 0, Math.PI * 2);
+        ctx.fill();
+        // Heavy outlined ring on top
+        ctx.strokeStyle = ringColour;
+        ctx.lineWidth = Math.max(3, 4 * p.scale);
         ctx.beginPath();
         ctx.arc(x, y, sz, 0, Math.PI * 2);
         ctx.stroke();
+        // "!" badge above the note — the unambiguous heads-up. Drawn even
+        // far away so the player can scan ahead and prepare.
+        const badgeY = y - sz - Math.max(10, 14 * p.scale);
+        const fontPx = Math.max(20, 28 * p.scale) | 0;
+        ctx.font = `bold ${fontPx}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+        ctx.shadowColor = ringColour;
+        ctx.shadowBlur = 12 * p.scale;
+        // Black outline so the "!" survives against any chart-bar color
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#000';
+        highway.fillTextUnmirrored
+            ? highway.fillTextUnmirrored('!', x, badgeY)
+            : ctx.fillText('!', x, badgeY);
         ctx.restore();
     };
 
