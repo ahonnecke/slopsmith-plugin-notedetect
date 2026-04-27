@@ -220,6 +220,18 @@ loop-report: ## Aggregate plays into a best-of-N report (SONG=<substring> option
 	if [ -n "$(LAST)" ]; then LAST_ARG="--last $(LAST)"; fi; \
 	node test/aggregate-plays.js $$SONG_ARG $$LAST_ARG
 
+.PHONY: synth-track
+synth-track: ## Generate a chart-aligned synth WAV for a song and inject it into slopsmith's audio cache (SONG=<query>)
+	@SONG_ARG=""; \
+	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
+	node test/synth-track.js $$SONG_ARG
+
+.PHONY: synth-restore
+synth-restore: ## Restore the original audio for a song (SONG=<query>)
+	@SONG_ARG=""; \
+	if [ -n "$(SONG)" ]; then SONG_ARG="--song $(SONG)"; fi; \
+	node test/synth-track.js $$SONG_ARG --restore
+
 .PHONY: hygiene
 hygiene: ## Scan the newest session for string-hygiene issues (open strings ringing, off-pitch contamination)
 	@$(RESOLVE_SESSION); \
