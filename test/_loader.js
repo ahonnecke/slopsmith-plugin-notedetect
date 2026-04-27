@@ -96,6 +96,7 @@ function loadDetectionCore() {
         '_ndSeverity', '_ndRankPracticeNotes', '_ndDescribeFailureMode',
         '_ndAggregatePlayErrors', '_ndBinErrors',
         '_ndBuildTroubleMap', '_ndTroubleKey',
+        '_ndComputeTop3Prescriptions',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -127,6 +128,7 @@ function loadDetectionCore() {
         binErrors: sandbox._ndBinErrors,
         buildTroubleMap: sandbox._ndBuildTroubleMap,
         troubleKey: sandbox._ndTroubleKey,
+        computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
     };
 }
 

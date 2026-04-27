@@ -330,3 +330,118 @@ test('binning: timing-histogram defaults match what _ndRenderHistogram passes', 
     // Index of 100ms: floor(400/25) = 16
     assert.equal(bins[16], 1);
 });
+
+// ── Top 3 prescriptions ──────────────────────────────────────────────────
+
+function makePlay(notes, startedAt = Date.now()) {
+    return {
+        songId: 'TestSong__bass',
+        playId: 't' + startedAt,
+        startedAt,
+        reason: 'loop_restart',
+        noteResults: notes.map((n, i) => ({
+            key: `${n.chartT}_${n.s}_${n.f}`,
+            primary: n.primary || 'HIT',
+            severity: n.severity ?? 0,
+            s: n.s ?? 0,
+            f: n.f ?? 0,
+            chartT: n.chartT,
+            expectedMidi: n.expectedMidi ?? 40,
+            detectedMidi: n.detectedMidi ?? null,
+            timingError: n.timingError ?? null,
+            pitchError: n.pitchError ?? null,
+            labels: n.labels || [],
+        })),
+    };
+}
+
+test('top3: empty plays returns empty list', () => {
+    assert.equal(core.computeTop3Prescriptions([], 'song.psarc').length, 0);
+});
+
+test('top3: produces at most 3 prescriptions', () => {
+    // Build a play with multiple distinct failure signals — should clamp to 3.
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 1, f: 3, chartT: i, primary: 'MISSED_NO_DETECTION', severity: 1.0,
+                     expectedMidi: 40 });
+    }
+    for (let i = 0; i < 8; i++) {
+        notes.push({ s: 0, f: 0, chartT: 20 + i, primary: 'HIT', severity: 0.4,
+                     timingError: 120, labels: ['LATE'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc');
+    assert.ok(top3.length <= 3, `expected ≤3, got ${top3.length}`);
+    assert.ok(top3.length >= 1, 'should produce at least one prescription');
+});
+
+test('top3: timing-bias prescription fires for chronic late hits', () => {
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: 80, labels: ['LATE'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc');
+    const hasTiming = top3.some(p => /late|early/i.test(p.text));
+    assert.ok(hasTiming, `expected late/early prescription, got: ${top3.map(p => p.text).join(' || ')}`);
+});
+
+test('top3: per-string weakness fires when one string dominates misses', () => {
+    const notes = [];
+    // String 1 misses heavily
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 1, f: 3, chartT: i, primary: 'MISSED_NO_DETECTION', severity: 1.0,
+                     expectedMidi: 40 });
+    }
+    // String 0 hits cleanly
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: 10 + i, primary: 'HIT', severity: 0,
+                     expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc');
+    const hasString = top3.some(p => /string/i.test(p.text));
+    assert.ok(hasString, `expected per-string prescription, got: ${top3.map(p => p.text).join(' || ')}`);
+});
+
+test('top3: action.kind=save_loop attaches when a hotspot is found', () => {
+    // Many missed notes clustered in time → hotspot loop suggestion
+    const notes = [];
+    for (let attempt = 0; attempt < 4; attempt++) {
+        for (let i = 0; i < 6; i++) {
+            notes.push({ s: 1, f: 5, chartT: 10 + i * 0.5, primary: 'MISSED_NO_DETECTION',
+                         severity: 1.0, expectedMidi: 40 });
+        }
+    }
+    const plays = [];
+    for (let i = 0; i < 4; i++) plays.push(makePlay(notes.slice(i * 6, (i + 1) * 6), Date.now() - i * 1000));
+    const top3 = core.computeTop3Prescriptions(plays, 'mexico.psarc');
+    const loopRec = top3.find(p => p.action && p.action.kind === 'save_loop');
+    if (loopRec) {
+        assert.ok(loopRec.action.payload.filename === 'mexico.psarc');
+        assert.ok(typeof loopRec.action.payload.start === 'number');
+        assert.ok(loopRec.action.payload.end > loopRec.action.payload.start);
+    }
+    // It's OK if no loop signal fires — hotspot heuristic has min thresholds.
+    // The main assertion is: when one DOES fire, it's well-formed.
+});
+
+test('top3: prescriptions sort by score (highest impact first)', () => {
+    const notes = [];
+    for (let i = 0; i < 15; i++) {
+        notes.push({ s: 1, f: 3, chartT: i, primary: 'MISSED_NO_DETECTION', severity: 1.0,
+                     expectedMidi: 40 });
+    }
+    for (let i = 0; i < 5; i++) {
+        notes.push({ s: 0, f: 0, chartT: 20 + i, primary: 'HIT', severity: 0.3,
+                     timingError: 60, labels: ['LATE'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc');
+    if (top3.length >= 2) {
+        assert.ok(top3[0].score >= top3[1].score,
+            `expected score-descending, got ${top3.map(p => p.score).join(',')}`);
+    }
+});

@@ -1039,6 +1039,271 @@ function _ndSuggestLoops(rows, opts = {}) {
     });
 }
 
+// ── Top-3 actionable prescriptions ────────────────────────────────────────
+// Distill plays[] into 3 short, ranked "do this next" instructions. Score
+// each candidate signal by impact (occurrences × severity-equivalent), keep
+// the best 3. The headline tile in the report renders these; the tip card
+// after each loop shows the top one. Goal: the user can read it once and
+// know what to change without reading the full report.
+//
+// Each prescription:
+//   { text: short single sentence,
+//     detail: optional secondary line (specifics),
+//     action: { label, kind, payload? } | null,
+//     score: number }
+//
+// action.kind values:
+//   'save_loop'    payload = { start, end }   — POST to /api/loops via _ndSaveSuggestedLoop
+//   'open_report'  scroll to a section anchor
+//   'open_tuner'   open the standalone tuner
+//   null           no actionable button
+function _ndComputeTop3Prescriptions(plays, songFilename) {
+    const candidates = [];
+    if (!plays || plays.length === 0) return [];
+
+    const { rows } = _ndAggregatePlays(plays);
+
+    // ── Signal A: dominant failure mode (uses existing classifier) ───────
+    const failureCounts = new Map();
+    let totalEvaluated = 0;
+    let totalSeverityFromFailures = 0;
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            const { mode, severity } = _ndClassifyFailureMode(r);
+            if (mode === 'CLEAN') { totalEvaluated++; continue; }
+            const prev = failureCounts.get(mode) || { count: 0, sevSum: 0 };
+            prev.count++;
+            prev.sevSum += severity;
+            failureCounts.set(mode, prev);
+            totalEvaluated++;
+            totalSeverityFromFailures += severity;
+        }
+    }
+    if (failureCounts.size > 0) {
+        const sorted = [...failureCounts.entries()].sort((a, b) => b[1].count - a[1].count);
+        const [mode, stats] = sorted[0];
+        const info = _ND_FAILURE_MODE_INFO[mode] || { label: mode, advice: '' };
+        if (info.advice && stats.count >= 2) {
+            candidates.push({
+                text: `${info.advice}`,
+                detail: `${info.label}: ${stats.count} of ${totalEvaluated} notes`,
+                action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'top-issues' } },
+                score: stats.count * (stats.sevSum / stats.count),
+                signal: 'failure_mode',
+            });
+        }
+    }
+
+    // ── Signal B: systematic timing offset ────────────────────────────────
+    const timingErrors = [];
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
+                    && typeof r.timingError === 'number' && isFinite(r.timingError)) {
+                timingErrors.push(r.timingError);
+            }
+        }
+    }
+    if (timingErrors.length >= 5) {
+        timingErrors.sort((a, b) => a - b);
+        const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
+        const absMedian = Math.abs(median);
+        // 30ms is the existing _ND_PERFECT_TIMING_MS threshold — beyond
+        // that, it's systematically off and the fix is anticipation, not
+        // calibration.
+        if (absMedian > 30) {
+            const direction = median > 0 ? 'late' : 'early';
+            const action = median > 0
+                ? 'Anticipate the click instead of waiting for the visual cue.'
+                : 'Hold an extra moment on the upbeat — you\'re leading the beat.';
+            candidates.push({
+                text: `You\'re ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
+                detail: `Median timing offset across ${timingErrors.length} hits`,
+                action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'latency-stack' } },
+                score: absMedian * Math.min(timingErrors.length, 50) / 100,
+                signal: 'timing_bias',
+            });
+        }
+    }
+
+    // ── Signal C: per-string weakness ─────────────────────────────────────
+    const stringStats = new Map(); // s → { attempts, misses }
+    for (const p of plays) {
+        for (const r of p.noteResults || []) {
+            if (typeof r.s !== 'number') continue;
+            const stat = stringStats.get(r.s) || { attempts: 0, misses: 0 };
+            stat.attempts++;
+            if (r.primary && r.primary.startsWith('MISSED')) stat.misses++;
+            stringStats.set(r.s, stat);
+        }
+    }
+    let totalAttempts = 0, totalMisses = 0;
+    for (const stat of stringStats.values()) {
+        totalAttempts += stat.attempts;
+        totalMisses += stat.misses;
+    }
+    const overallMissRate = totalAttempts > 0 ? totalMisses / totalAttempts : 0;
+    if (totalAttempts >= 10) {
+        for (const [s, stat] of stringStats) {
+            if (stat.attempts < 5) continue;
+            const rate = stat.misses / stat.attempts;
+            if (rate >= 0.4 && rate >= overallMissRate * 1.5) {
+                const stringNames = _ndCurrentArrangement === 'bass'
+                    ? ['E (low)', 'A', 'D', 'G (high)', '', '']
+                    : ['E (low)', 'A', 'D', 'G', 'B', 'E (high)'];
+                const stringLabel = stringNames[s] || `string ${s + 1}`;
+                candidates.push({
+                    text: `${stringLabel} string is your weak point — ${Math.round(rate * 100)}% miss rate vs ${Math.round(overallMissRate * 100)}% overall.`,
+                    detail: `${stat.misses} of ${stat.attempts} attempts on this string failed`,
+                    action: null,
+                    score: (rate - overallMissRate) * stat.attempts,
+                    signal: 'per_string',
+                });
+                break; // one per-string prescription per report
+            }
+        }
+    }
+
+    // ── Signal D: hotspot loop suggestion ─────────────────────────────────
+    // Reuses _ndSuggestLoops which is already wired into the report's
+    // Suggested Loops section. We surface the densest one as a prescription.
+    const loops = _ndSuggestLoops(rows);
+    if (loops.length > 0 && songFilename) {
+        const top = loops[0];
+        const startMmSs = `${Math.floor(top.startSec / 60)}:${Math.floor(top.startSec % 60).toString().padStart(2, '0')}`;
+        const endMmSs   = `${Math.floor(top.endSec   / 60)}:${Math.floor(top.endSec   % 60).toString().padStart(2, '0')}`;
+        candidates.push({
+            text: `Loop ${startMmSs}–${endMmSs} — ${top.noteCount} trouble notes (${Math.round(top.avgMissRate * 100)}% avg miss).`,
+            detail: top.positions ? `Positions: ${top.positions}` : '',
+            action: {
+                kind: 'save_loop',
+                label: 'Save this loop',
+                payload: { filename: songFilename, start: top.startSec, end: top.endSec },
+            },
+            score: top.avgMissRate * top.noteCount * top.durationSec,
+            signal: 'loop_hotspot',
+        });
+    }
+
+    // ── Signal E: chronic single note (missed across multiple plays) ─────
+    let chronic = null;
+    let chronicScore = 0;
+    for (const row of rows) {
+        const stats = _ndStatsForRow(row);
+        if (stats.nAttempts < 3) continue;
+        const missCount = stats.nAttempts - stats.hits;
+        if (missCount < 3) continue;
+        const sc = missCount * (1 - stats.hitRate);
+        if (sc > chronicScore) {
+            chronicScore = sc;
+            chronic = { row, stats };
+        }
+    }
+    if (chronic) {
+        const { row, stats } = chronic;
+        const mm = Math.floor(row.chartT / 60);
+        const ss = Math.floor(row.chartT % 60).toString().padStart(2, '0');
+        candidates.push({
+            text: `Note at ${mm}:${ss} (${row.stringFret}) failed ${stats.nAttempts - stats.hits} of ${stats.nAttempts} plays. Slow this transition.`,
+            detail: '',
+            action: null,
+            score: chronicScore * 5, // emphasize chronic-single-note signal
+            signal: 'chronic_note',
+        });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.slice(0, 3);
+}
+
+// Render the top-3 prescriptions as the headline of the report. Action buttons
+// route into existing flows: Save loop reuses _ndSaveSuggestedLoop, open_report
+// just scrolls to an anchor inside the same panel.
+function _ndRenderPrescriptionsBlock(top3) {
+    if (!top3 || top3.length === 0) {
+        return `<div class="bg-dark-800 border border-gray-700 rounded p-3 mb-3">
+            <div class="text-gray-400 text-xs">Not enough data yet for actionable advice. Play through once or loop a section.</div>
+        </div>`;
+    }
+    const rows = top3.map((p, i) => {
+        let actionHtml = '';
+        if (p.action) {
+            if (p.action.kind === 'save_loop') {
+                const { filename, start, end } = p.action.payload;
+                const safeFn = (filename || '').replace(/'/g, "\\'");
+                actionHtml = `<button onclick="_ndSaveSuggestedLoop('${safeFn}', ${start.toFixed(2)}, ${end.toFixed(2)}, this)"
+                    class="px-2 py-0.5 bg-blue-900/40 hover:bg-blue-900/70 rounded text-blue-200 text-[11px] flex-shrink-0">${p.action.label}</button>`;
+            } else if (p.action.kind === 'open_report' && p.action.payload?.anchor) {
+                actionHtml = `<button onclick="document.getElementById('nd-anchor-${p.action.payload.anchor}')?.scrollIntoView({behavior:'smooth'})"
+                    class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-gray-200 text-[11px] flex-shrink-0">${p.action.label}</button>`;
+            }
+        }
+        const tier = ['#f87171', '#fb923c', '#facc15'][i] || '#facc15';
+        return `<div class="flex items-start gap-2 mb-2 last:mb-0">
+            <span class="text-base font-bold mt-0.5" style="color:${tier}">${i + 1}.</span>
+            <div class="flex-1 min-w-0">
+                <div class="text-gray-100 text-sm">${p.text}</div>
+                ${p.detail ? `<div class="text-gray-500 text-[10px] font-mono">${p.detail}</div>` : ''}
+            </div>
+            ${actionHtml}
+        </div>`;
+    }).join('');
+    return `<div class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3">
+        <div class="text-orange-400 text-xs font-semibold mb-2 uppercase tracking-wide">Top 3 things to fix</div>
+        ${rows}
+    </div>`;
+}
+
+// Tip card: top-left, slides in, auto-dismisses, click-to-expand. Throttled
+// so a tight loop doesn't spam the user — only one card every 30s, and only
+// if the top prescription scores above a quality threshold.
+let _ndLastTipShownAt = 0;
+const _ND_TIP_MIN_INTERVAL_MS = 30_000;
+const _ND_TIP_MIN_SCORE = 5; // score below this = noise, don't bother
+const _ND_TIP_DISPLAY_MS = 8_000;
+
+function _ndShowTipCard(prescription) {
+    if (!prescription || prescription.score < _ND_TIP_MIN_SCORE) return;
+    const now = performance.now();
+    if (now - _ndLastTipShownAt < _ND_TIP_MIN_INTERVAL_MS) return;
+    _ndLastTipShownAt = now;
+
+    let card = document.getElementById('nd-tip-card');
+    if (card) card.remove();
+    card = document.createElement('div');
+    card.id = 'nd-tip-card';
+    // Top-LEFT placement (top-right is occupied by HUD/other overlays).
+    card.style.cssText = 'position:fixed;top:80px;left:16px;z-index:160;max-width:380px;'
+        + 'background:rgba(20,20,28,0.95);border:1px solid rgba(251,146,60,0.5);'
+        + 'border-radius:8px;padding:10px 12px;box-shadow:0 8px 24px rgba(0,0,0,0.4);'
+        + 'cursor:pointer;transition:opacity 0.3s;font-size:13px;color:#f3f4f6;';
+    card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+            <div style="flex:1;min-width:0">
+                <div style="color:#fb923c;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">Next thing to fix</div>
+                <div style="line-height:1.35">${prescription.text}</div>
+            </div>
+            <button id="nd-tip-close" style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:18px;line-height:1;padding:0;flex-shrink:0">&times;</button>
+        </div>
+    `;
+    card.onclick = (e) => {
+        if (e.target && e.target.id === 'nd-tip-close') {
+            card.remove();
+            return;
+        }
+        card.remove();
+        _ndShowReport();
+    };
+    document.body.appendChild(card);
+
+    // Auto-dismiss with fade
+    setTimeout(() => {
+        if (!card.parentElement) return;
+        card.style.opacity = '0';
+        setTimeout(() => card.remove(), 320);
+    }, _ND_TIP_DISPLAY_MS);
+}
+
 function _ndVerdictGlyph(kind) {
     if (kind === 'HIT') return { glyph: '✓', color: '#4ade80' };           // green
     if (kind === 'DIRTY_HIT') return { glyph: '⚠', color: '#facc15' };     // yellow
@@ -1137,6 +1402,16 @@ const _ND_FAILURE_MODE_INFO = {
     SIBLING_CLAIMED:   { color: '#fbbf24', label: 'Sibling-claimed (rapid same-pitch)', advice: 'You plucked, but the matcher gave the onset to a same-pitch chart note next to this one. Common in rapid same-pitch passages — not a playing error. Pipeline tradeoff: one onset, one chart note. Practice plays through it, the score lags.' },
     UNKNOWN:           { color: '#6b7280', label: 'Other', advice: '' },
 };
+
+// Slopsmith stores window.currentFilename URL-encoded but decodes before
+// hitting /api/loops (app.js:958, 998). We have to match that or saved
+// loops orphan in the DB and never appear in slopsmith's dropdown.
+function _ndDecodedSongFilename() {
+    const songInfo = highway.getSongInfo && highway.getSongInfo();
+    const raw = (typeof window !== 'undefined' && window.currentFilename)
+        || songInfo?.filename || '';
+    try { return decodeURIComponent(raw); } catch (e) { return raw; }
+}
 
 // POST a suggested loop into slopsmith's persisted loops table so it shows
 // up in the saved-loops dropdown next page-load. Slopsmith's /api/loops
@@ -1313,9 +1588,7 @@ async function _ndShowReport() {
     // uses) — `highway.getSongInfo().filename` is sometimes empty or shaped
     // differently. Prefer the global; fall back to song info; if both empty
     // the Save button reports "No song" and disables itself.
-    const songInfo = highway.getSongInfo && highway.getSongInfo();
-    const songFilename = (typeof window !== 'undefined' && window.currentFilename)
-        || songInfo?.filename || '';
+    const songFilename = _ndDecodedSongFilename();
     const loopsHtml = loops.length === 0
         ? '<p class="text-gray-500 text-xs">No suggested loops — no clusters of ≥2 trouble notes found.</p>'
         : loops.map(lp => {
@@ -1340,11 +1613,15 @@ async function _ndShowReport() {
             `;
         }).join('');
 
+    const top3 = _ndComputeTop3Prescriptions(plays, songFilename);
+    const prescriptionsHtml = _ndRenderPrescriptionsBlock(top3);
+
     panel.innerHTML = `
         <div class="flex justify-between items-center mb-3">
             <span class="text-gray-200 font-semibold">Practice Report — ${songId}</span>
             <button onclick="document.getElementById('nd-report-panel').remove()" class="text-gray-500 hover:text-white">&times;</button>
         </div>
+        ${prescriptionsHtml}
         <div class="text-xs text-gray-400 mb-3">${playMeta.length} attempts · ${rows.length} unique notes · matrix shows newest attempt first (left → right)</div>
         <div class="grid grid-cols-4 gap-2 mb-3 text-xs">
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Best-of-${N}</div><div class="text-green-400 font-semibold">${bestOfN}/${total} (${total ? (bestOfN/total*100).toFixed(0) : '0'}%)</div></div>
@@ -1355,7 +1632,7 @@ async function _ndShowReport() {
 
         ${p50Timing != null ? `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
-            <div class="text-gray-400 mb-2">Where your "lateness" comes from</div>
+            <div id="nd-anchor-latency-stack" class="text-gray-400 mb-2">Where your "lateness" comes from</div>
             <div class="grid grid-cols-4 gap-2">
                 <div>
                     <div class="text-gray-500 text-[10px]">HIT timing (p50)</div>
@@ -1419,7 +1696,7 @@ async function _ndShowReport() {
 
         ${sortedFailures.length > 0 ? `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
-            <div class="text-gray-400 mb-2">Top issues this session — what to fix next</div>
+            <div id="nd-anchor-top-issues" class="text-gray-400 mb-2">Top issues this session — what to fix next</div>
             <div class="space-y-2">
                 ${sortedFailures.slice(0, 5).map(([mode, count]) => {
                     const info = _ND_FAILURE_MODE_INFO[mode] || _ND_FAILURE_MODE_INFO.UNKNOWN;
@@ -1492,7 +1769,18 @@ function _ndCheckAutoDump() {
         // re-judges from scratch (without this, the existing
         // _ndNoteResults.has(key) guard at the matching site would make the
         // first iteration's result stick across all subsequent loops).
-        _ndSnapshotPlay('loop_restart');
+        // After the snapshot lands, surface the top prescription as a tip
+        // card so the user gets actionable feedback per iteration without
+        // having to open the full report.
+        _ndSnapshotPlay('loop_restart').then(() => {
+            const songId = _ndCurrentSongId();
+            if (!songId) return;
+            return _ndFetchPlays(songId).then(plays => {
+                const songFilename = _ndDecodedSongFilename();
+                const top3 = _ndComputeTop3Prescriptions(plays, songFilename);
+                if (top3.length > 0) _ndShowTipCard(top3[0]);
+            });
+        }).catch(() => { /* swallow — tip is optional */ });
         _ndLastLoopRestart = now;
     }
     _ndLastSeenScoreTime = scoreT;
@@ -6262,13 +6550,19 @@ async function _ndToggle() {
         _ndStopHUD();
         if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
 
-        // Snapshot the final play before the summary reads from history —
-        // await so the latest play is on disk by the time _ndShowSummary's
+        // Snapshot the final play before the report reads from history —
+        // await so the latest play is on disk by the time _ndShowReport's
         // GET /plays request hits the server.
         await _ndSnapshotPlay('detect_off');
 
-        // Show summary if we had results
-        _ndShowSummary();
+        // Auto-open the rich Practice Report (replaces the old _ndShowSummary
+        // modal — the report includes Top 3 prescriptions + Top Issues with
+        // advice + Suggested Loops, all driven by the same per-play history).
+        // _ndShowReport is a toggle: if it's already open, calling it removes
+        // the panel. Guard so detect-off-after-having-it-open doesn't dismiss.
+        if (!document.getElementById('nd-report-panel')) {
+            _ndShowReport();
+        }
 
         // Close settings panel
         const panel = document.getElementById('nd-settings-panel');
