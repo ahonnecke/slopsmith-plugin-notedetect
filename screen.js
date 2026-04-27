@@ -1339,8 +1339,8 @@ async function _ndShowReport() {
                     <div class="text-gray-300 font-mono">${avOffsetMs > 0 ? '+' : ''}${Math.round(avOffsetMs)} ms</div>
                 </div>
                 <div>
-                    <div class="text-gray-500 text-[10px]">Live drift estimate</div>
-                    <div class="text-purple-300 font-mono">${_ndDriftEstimateMs > 0 ? '+' : ''}${Math.round(_ndDriftEstimateMs)} ms</div>
+                    <div class="text-gray-500 text-[10px]">Drift (loaded plays p50)</div>
+                    <div class="text-purple-300 font-mono">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
                 </div>
                 <div>
                     <div class="text-gray-500 text-[10px]">Reaction residual</div>
@@ -1419,14 +1419,14 @@ async function _ndShowReport() {
         </div>
         ` : ''}
 
-        <div class="text-gray-400 text-xs mb-1">Per-note attempt matrix (chronological)</div>
+        <div class="text-gray-400 text-xs mb-1">Per-note attempt matrix (newest → oldest)</div>
         <div class="bg-dark-800 rounded p-1 mb-3 max-h-72 overflow-auto">
             <table class="w-full text-[11px]">
                 <thead><tr class="text-gray-500 border-b border-gray-700">
                     <th class="text-left px-2 py-0.5">chartT</th>
                     <th class="text-left px-1 py-0.5">midi</th>
                     <th class="text-left px-1 py-0.5">s/f</th>
-                    <th class="text-left px-2 py-0.5">attempts (oldest → newest)</th>
+                    <th class="text-left px-2 py-0.5">attempts (newest → oldest)</th>
                     <th class="text-left px-2 py-0.5">hits</th>
                 </tr></thead>
                 <tbody>${matrixRows}</tbody>
