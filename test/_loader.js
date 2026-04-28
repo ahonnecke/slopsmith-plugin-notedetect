@@ -97,6 +97,7 @@ function loadDetectionCore() {
         '_ndAggregatePlayErrors', '_ndBinErrors',
         '_ndBuildTroubleMap', '_ndTroubleKey',
         '_ndComputeTop3Prescriptions',
+        '_ndResidualMs',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -129,6 +130,7 @@ function loadDetectionCore() {
         buildTroubleMap: sandbox._ndBuildTroubleMap,
         troubleKey: sandbox._ndTroubleKey,
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
+        residualMs: sandbox._ndResidualMs,
     };
 }
 

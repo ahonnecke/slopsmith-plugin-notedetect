@@ -1057,7 +1057,7 @@ function _ndSuggestLoops(rows, opts = {}) {
 //   'open_report'  scroll to a section anchor
 //   'open_tuner'   open the standalone tuner
 //   null           no actionable button
-function _ndComputeTop3Prescriptions(plays, songFilename) {
+function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0) {
     const candidates = [];
     if (!plays || plays.length === 0) return [];
 
@@ -1095,22 +1095,27 @@ function _ndComputeTop3Prescriptions(plays, songFilename) {
     }
 
     // ── Signal B: systematic timing offset ────────────────────────────────
-    const timingErrors = [];
+    // Use *residual* (raw timing minus avOffset minus pipeline-buffer comp)
+    // so a player calibrated against slopsmith's AV offset isn't accused of
+    // being late just because the chart leads the audio. Without this, the
+    // prescription fires on structural latency the player can't fix —
+    // exactly what the user pushed back on with "I was not off by a third
+    // of a second."
+    const residualErrors = [];
     for (const p of plays) {
         for (const r of p.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
-                timingErrors.push(r.timingError);
+                residualErrors.push(_ndResidualMs(r.timingError, avOffsetMs));
             }
         }
     }
-    if (timingErrors.length >= 5) {
-        timingErrors.sort((a, b) => a - b);
-        const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
+    if (residualErrors.length >= 5) {
+        residualErrors.sort((a, b) => a - b);
+        const median = residualErrors[Math.floor((residualErrors.length - 1) * 0.5)];
         const absMedian = Math.abs(median);
-        // 30ms is the existing _ND_PERFECT_TIMING_MS threshold — beyond
-        // that, it's systematically off and the fix is anticipation, not
-        // calibration.
+        // 30ms threshold against the residual: any larger and the player
+        // really is dragging or rushing relative to the (calibrated) beat.
         if (absMedian > 30) {
             const direction = median > 0 ? 'late' : 'early';
             const action = median > 0
@@ -1118,9 +1123,9 @@ function _ndComputeTop3Prescriptions(plays, songFilename) {
                 : 'Hold an extra moment on the upbeat — you\'re leading the beat.';
             candidates.push({
                 text: `You\'re ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
-                detail: `Median timing offset across ${timingErrors.length} hits`,
+                detail: `Median residual offset across ${residualErrors.length} hits (pipeline-corrected)`,
                 action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'latency-stack' } },
-                score: absMedian * Math.min(timingErrors.length, 50) / 100,
+                score: absMedian * Math.min(residualErrors.length, 50) / 100,
                 signal: 'timing_bias',
             });
         }
@@ -1613,7 +1618,7 @@ async function _ndShowReport() {
             `;
         }).join('');
 
-    const top3 = _ndComputeTop3Prescriptions(plays, songFilename);
+    const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs);
     const prescriptionsHtml = _ndRenderPrescriptionsBlock(top3);
 
     panel.innerHTML = `
@@ -1777,7 +1782,8 @@ function _ndCheckAutoDump() {
             if (!songId) return;
             return _ndFetchPlays(songId).then(plays => {
                 const songFilename = _ndDecodedSongFilename();
-                const top3 = _ndComputeTop3Prescriptions(plays, songFilename);
+                const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
+                const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs);
                 if (top3.length > 0) _ndShowTipCard(top3[0]);
             });
         }).catch(() => { /* swallow — tip is optional */ });
@@ -1894,6 +1900,19 @@ function _ndApplyBpToChunk(input) {
 const _ND_ONSET_LEVEL = 0.04;         // RMS above this = entering a note (silence→playing transition)
 const _ND_ONSET_EXIT_LEVEL = 0.02;    // below this = note ended (hysteresis gap prevents re-fire on sustain noise)
 const _ND_ONSET_BUFFER_COMP_SEC = 0.020; // half of ScriptProcessor 2048-sample buffer at 48 kHz — compensates for callback lag
+
+// Strip the structural-latency components out of a raw timingError so what
+// surfaces to the user is *their* offset, not the pipeline's. Formula
+// matches the existing latency-stack derivation: residual = raw - avOffset
+// + onsetComp. Used by the highway label and the prescription engine so a
+// player calibrated against slopsmith's AV offset doesn't get charged for
+// the offset's effect. Raw timing stays in noteResults for the report's
+// breakdown tile; only display/diagnosis paths use this helper.
+function _ndResidualMs(rawMs, avOffsetMs) {
+    if (typeof rawMs !== 'number' || !isFinite(rawMs)) return rawMs;
+    const onsetCompMs = _ND_ONSET_BUFFER_COMP_SEC * 1000;
+    return rawMs - (avOffsetMs || 0) + onsetCompMs;
+}
 // Sustain re-attack detection — fires a new onset when RMS spikes above the
 // recent running minimum during an in-progress note. Needed for repeated
 // plucks (Mexico bass is dense same-pitch E-string repeats) where sustain
@@ -6007,9 +6026,14 @@ highway.addDrawHook(function(ctx, W, H) {
             labelY -= lineH;
         }
 
-        // Timing error (for hits and pitch-misses that had timing data)
+        // Timing error (for hits and pitch-misses that had timing data).
+        // Display the *residual* \u2014 raw timingError minus avOffset minus
+        // pipeline-buffer comp \u2014 so what the player sees is their actual
+        // offset, not the structural latency they can't act on. Raw is
+        // preserved in noteResults for the report's latency-stack tile.
         if (judgment.timingError !== null && judgment.timingError !== undefined) {
-            const ms = Math.round(judgment.timingError);
+            const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
+            const ms = Math.round(_ndResidualMs(judgment.timingError, avOffsetMs));
             if (Math.abs(ms) > _ndPerfectTimingMs) {
                 ctx.fillStyle = '#ffaa33';
                 const arrow = ms > 0 ? '\u2193' : '\u2191';
