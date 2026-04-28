@@ -446,60 +446,54 @@ test('top3: prescriptions sort by score (highest impact first)', () => {
     }
 });
 
-// ── Residual timing (pipeline-corrected) ─────────────────────────────────
+// ── Timing-bias prescription (uses raw timingError directly post-cleanup) ─
 
-test('residualMs: subtracts avOffset and adds back onset comp (20ms)', () => {
-    // raw=150, avOffset=95 → 150 - 95 + 20 = 75
-    assert.equal(core.residualMs(150, 95), 75);
-    // raw=295, avOffset=95 → 220
-    assert.equal(core.residualMs(295, 95), 220);
-    // No avOffset = raw + 20 (just the buffer comp credit)
-    assert.equal(core.residualMs(150, 0), 170);
-});
-
-test('residualMs: passes non-numbers through unchanged', () => {
-    assert.equal(core.residualMs(null, 95), null);
-    assert.equal(core.residualMs(undefined, 95), undefined);
-    // NaN/Infinity unchanged (no isFinite slip-through that would silently
-    // produce a number)
-    assert.ok(Number.isNaN(core.residualMs(NaN, 95)));
-});
-
-test('top3: timing-bias prescription uses residual, not raw', () => {
-    // Build plays with raw timingError=+150ms on 10 hits; pass avOffset=95.
-    // Residual = 150-95+20 = +75. Both fire (both > 30) but the *score*
-    // and *text* should reflect the smaller residual.
+test('top3: timing-bias prescription uses timingError as-is (no residual subtraction)', () => {
+    // chartTime is avOffset-shifted upstream, so timingError IS the player's
+    // offset. Earlier code subtracted avOffset back out (residual layer);
+    // that was circular and is now removed. avOffset arg is ignored for
+    // the timing-bias signal — kept in the signature only for back-compat
+    // with callers.
     const notes = [];
     for (let i = 0; i < 10; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 150, labels: ['LATE'], expectedMidi: 40 });
     }
     const plays = [makePlay(notes)];
-    const top3WithCal   = core.computeTop3Prescriptions(plays, 'song.psarc', 95);
-    const top3NoCal     = core.computeTop3Prescriptions(plays, 'song.psarc', 0);
-    const timingWithCal = top3WithCal.find(p => p.signal === 'timing_bias');
-    const timingNoCal   = top3NoCal.find(p => p.signal === 'timing_bias');
-    assert.ok(timingWithCal, 'timing_bias should still fire at 75ms residual');
-    assert.match(timingWithCal.text, /75ms late/, `expected 75ms in text, got: ${timingWithCal.text}`);
-    assert.match(timingNoCal.text,  /170ms late/, `with no avOffset, residual=170; got: ${timingNoCal.text}`);
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 95);
+    const timing = top3.find(p => p.signal === 'timing_bias');
+    assert.ok(timing, 'timing_bias should fire at 150ms median');
+    assert.match(timing.text, /150ms late/, `expected 150ms in text, got: ${timing.text}`);
 });
 
-test('top3: timing-bias does NOT fire when residual is below 30ms despite raw being large', () => {
-    // raw=110ms, avOffset=100 → residual = 110-100+20 = +30. NOT > 30.
+test('top3: timing-bias output is independent of avOffset arg', () => {
+    // Same data, different avOffset arg → same prescription text.
     const notes = [];
     for (let i = 0; i < 10; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
-                     timingError: 110, labels: ['LATE'], expectedMidi: 40 });
+                     timingError: 150, labels: ['LATE'], expectedMidi: 40 });
     }
     const plays = [makePlay(notes)];
-    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 100);
-    const timing = top3.find(p => p.signal === 'timing_bias');
-    assert.ok(!timing, `timing prescription should NOT fire when residual is at threshold; got: ${timing?.text}`);
+    const a = core.computeTop3Prescriptions(plays, 'song.psarc', 0);
+    const b = core.computeTop3Prescriptions(plays, 'song.psarc', 200);
+    const timingA = a.find(p => p.signal === 'timing_bias');
+    const timingB = b.find(p => p.signal === 'timing_bias');
+    assert.equal(timingA.text, timingB.text);
 });
 
-test('top3: timing-bias detects EARLY direction in residual space', () => {
-    // raw=-50ms, avOffset=0 → residual = -50+20 = -30. NOT > 30 (boundary).
-    // raw=-80ms → residual = -60. Triggers EARLY.
+test('top3: timing-bias does not fire when |median| ≤ 30 ms', () => {
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: 25, labels: [], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 0);
+    const timing = top3.find(p => p.signal === 'timing_bias');
+    assert.ok(!timing, `timing prescription should NOT fire at 25ms median; got: ${timing?.text}`);
+});
+
+test('top3: timing-bias detects EARLY direction', () => {
     const notes = [];
     for (let i = 0; i < 10; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
@@ -508,7 +502,7 @@ test('top3: timing-bias detects EARLY direction in residual space', () => {
     const plays = [makePlay(notes)];
     const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 0);
     const timing = top3.find(p => p.signal === 'timing_bias');
-    assert.ok(timing, 'timing prescription should fire on -60ms residual');
+    assert.ok(timing, 'timing prescription should fire on -80ms median');
     assert.match(timing.text, /early/i);
 });
 

@@ -97,7 +97,6 @@ function loadDetectionCore() {
         '_ndAggregatePlayErrors', '_ndBinErrors',
         '_ndBuildTroubleMap', '_ndTroubleKey',
         '_ndComputeTop3Prescriptions',
-        '_ndResidualMs',
         '_ndChartHasNoteWithin',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -131,7 +130,6 @@ function loadDetectionCore() {
         buildTroubleMap: sandbox._ndBuildTroubleMap,
         troubleKey: sandbox._ndTroubleKey,
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
-        residualMs: sandbox._ndResidualMs,
         chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
         // Expose the sandbox so tests can mock highway data
         _sandbox: sandbox,

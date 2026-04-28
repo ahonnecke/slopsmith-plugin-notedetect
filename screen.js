@@ -1096,37 +1096,37 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0) {
     }
 
     // ── Signal B: systematic timing offset ────────────────────────────────
-    // Use *residual* (raw timing minus avOffset minus pipeline-buffer comp)
-    // so a player calibrated against slopsmith's AV offset isn't accused of
-    // being late just because the chart leads the audio. Without this, the
-    // prescription fires on structural latency the player can't fix —
-    // exactly what the user pushed back on with "I was not off by a third
-    // of a second."
-    const residualErrors = [];
+    // Use the matcher's stored timingError directly. It IS the player's
+    // offset — chartTime is already avOffset-compensated upstream
+    // (highway.js setTime: chartTime = audio.currentTime + avOffsetSec),
+    // so timingError reflects what the player did relative to the
+    // calibrated chart clock. The earlier "residual = raw - avOffset"
+    // subtraction was circular: changing avOffset shifts raw timing by
+    // the same amount, so the two cancel and residual was just a
+    // calibration-drift indicator, not a player-feedback metric.
+    const timingErrors = [];
     for (const p of plays) {
         for (const r of p.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
-                residualErrors.push(_ndResidualMs(r.timingError, avOffsetMs));
+                timingErrors.push(r.timingError);
             }
         }
     }
-    if (residualErrors.length >= 5) {
-        residualErrors.sort((a, b) => a - b);
-        const median = residualErrors[Math.floor((residualErrors.length - 1) * 0.5)];
+    if (timingErrors.length >= 5) {
+        timingErrors.sort((a, b) => a - b);
+        const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
         const absMedian = Math.abs(median);
-        // 30ms threshold against the residual: any larger and the player
-        // really is dragging or rushing relative to the (calibrated) beat.
         if (absMedian > 30) {
             const direction = median > 0 ? 'late' : 'early';
             const action = median > 0
-                ? 'Anticipate the click instead of waiting for the visual cue.'
-                : 'Hold an extra moment on the upbeat — you\'re leading the beat.';
+                ? 'Run the AV-offset auto-calibrator (settings panel) — your chart-clock is biased and the easy fix is calibration before practice.'
+                : 'Run the AV-offset auto-calibrator — chart-clock is biased early; calibrate before practice.';
             candidates.push({
                 text: `You\'re ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
-                detail: `Median residual offset across ${residualErrors.length} hits (pipeline-corrected)`,
+                detail: `Median timing offset across ${timingErrors.length} hits`,
                 action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'latency-stack' } },
-                score: absMedian * Math.min(residualErrors.length, 50) / 100,
+                score: absMedian * Math.min(timingErrors.length, 50) / 100,
                 signal: 'timing_bias',
             });
         }
@@ -1491,12 +1491,14 @@ async function _ndShowReport() {
     const total = rows.length;
     const loops = _ndSuggestLoops(rows);
 
-    // Latency stack — break the HIT timing distribution down into the
-    // structural pieces so the user knows which part of "lateness" is
-    // theirs vs. the pipeline. Onset capture compensates the audio-buffer
-    // half-chunk via _ND_ONSET_BUFFER_COMP_SEC; av_offset is slopsmith's
-    // visual/audio sync setting; residual = the player's actual reaction
-    // time relative to the audio.
+    // Timing summary: just the median HIT timing. chartTime is already
+    // avOffset-compensated upstream (highway.js setTime: chartTime =
+    // audio.currentTime + avOffsetSec), so timingError directly reflects
+    // the player's offset relative to the calibrated chart clock. We used
+    // to compute a "Reaction residual = raw - avOffset + onsetComp" but
+    // that subtraction was circular: increasing avOffset shifts raw by
+    // the same amount, so the two cancel. The previous formula gave a
+    // calibration-drift indicator, not a player-feedback metric.
     const hitTimings = [];
     for (const p of plays) {
         for (const r of p.noteResults || []) {
@@ -1511,13 +1513,6 @@ async function _ndShowReport() {
         ? hitTimings[Math.floor((hitTimings.length - 1) * 0.5)]
         : null;
     const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
-    // _ND_ONSET_BUFFER_COMP_SEC is 20 ms — onset chart-time is captured at
-    // the midpoint of the trigger chunk to undo half the ScriptProcessor
-    // buffer delay. timingError = player_offset + avOffset - 20.
-    const onsetCompMs = _ND_ONSET_BUFFER_COMP_SEC * 1000;
-    const playerOffsetMs = p50Timing != null
-        ? Math.round(p50Timing - avOffsetMs + onsetCompMs)
-        : null;
 
     // Label distribution across HITs: LATE / EARLY / SHARP / FLAT and the
     // residue (perfect-zone hits with no labels). Surfaces "how precisely
@@ -1638,29 +1633,25 @@ async function _ndShowReport() {
 
         ${p50Timing != null ? `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
-            <div id="nd-anchor-latency-stack" class="text-gray-400 mb-2">Where your "lateness" comes from</div>
-            <div class="grid grid-cols-4 gap-2">
+            <div id="nd-anchor-latency-stack" class="text-gray-400 mb-2">Timing offset</div>
+            <div class="grid grid-cols-3 gap-2">
                 <div>
                     <div class="text-gray-500 text-[10px]">HIT timing (p50)</div>
-                    <div class="text-gray-200 font-mono ${p50Timing > 100 ? 'text-orange-300' : p50Timing > 50 ? 'text-yellow-300' : 'text-green-400'}">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
+                    <div class="text-gray-200 font-mono ${Math.abs(p50Timing) > 100 ? 'text-orange-300' : Math.abs(p50Timing) > 50 ? 'text-yellow-300' : 'text-green-400'}">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
                 </div>
                 <div>
                     <div class="text-gray-500 text-[10px]">AV offset (slopsmith)</div>
                     <div class="text-gray-300 font-mono">${avOffsetMs > 0 ? '+' : ''}${Math.round(avOffsetMs)} ms</div>
                 </div>
                 <div>
-                    <div class="text-gray-500 text-[10px]">Drift (loaded plays p50)</div>
-                    <div class="text-purple-300 font-mono">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
-                </div>
-                <div>
-                    <div class="text-gray-500 text-[10px]">Reaction residual</div>
-                    <div class="font-mono ${playerOffsetMs > 150 ? 'text-orange-300' : playerOffsetMs > 75 ? 'text-yellow-300' : 'text-green-400'}">${playerOffsetMs > 0 ? '+' : ''}${playerOffsetMs} ms</div>
+                    <div class="text-gray-500 text-[10px]">Rolling drift</div>
+                    <div class="text-purple-300 font-mono">${_ndDriftEstimateMs > 0 ? '+' : ''}${Math.round(_ndDriftEstimateMs)} ms</div>
                 </div>
             </div>
             <div class="text-gray-500 text-[10px] mt-2 leading-tight">
-                Onset capture removes ${Math.round(onsetCompMs)} ms of audio-buffer delay. The drift estimate is a rolling median of recent HIT timings — it adapts as the chart wanders relative to the audio, and the matcher shifts the hit window to compensate. LATE/EARLY labels are computed against drift-adjusted timing.
+                HIT timing is your offset relative to the avOffset-calibrated chart clock — what you actually played. Persistent non-zero values mean either you\'re playing late/early OR avOffset is miscalibrated. Run "Auto-calibrate AV offset" (settings panel) to drive this toward zero, then any remaining offset is genuinely you. Drift is a rolling-median compensation the matcher applies internally to keep the hit window aligned mid-session.
                 ${Math.abs(_ndDriftEstimateMs) > 150
-                    ? '<span class="text-purple-300"> Large drift detected — chart-vs-audio sync is significant for this song.</span>'
+                    ? '<span class="text-purple-300"> Large drift — chart-vs-audio sync is significant.</span>'
                     : ''}
             </div>
         </div>
@@ -1902,13 +1893,16 @@ const _ND_ONSET_LEVEL = 0.04;         // RMS above this = entering a note (silen
 const _ND_ONSET_EXIT_LEVEL = 0.02;    // below this = note ended (hysteresis gap prevents re-fire on sustain noise)
 const _ND_ONSET_BUFFER_COMP_SEC = 0.020; // half of ScriptProcessor 2048-sample buffer at 48 kHz — compensates for callback lag
 
-// Strip the structural-latency components out of a raw timingError so what
-// surfaces to the user is *their* offset, not the pipeline's. Formula
-// matches the existing latency-stack derivation: residual = raw - avOffset
-// + onsetComp. Used by the highway label and the prescription engine so a
-// player calibrated against slopsmith's AV offset doesn't get charged for
-// the offset's effect. Raw timing stays in noteResults for the report's
-// breakdown tile; only display/diagnosis paths use this helper.
+// DEPRECATED — left in place for the offline harness's "what would the
+// pre-cleanup display have shown" comparison. Don't call from live code.
+//
+// The earlier display layer subtracted avOffset back out of timingError
+// to expose a "player residual." That was circular: chartTime in the
+// matcher is already avOffset-shifted (highway.js setTime), so timingError
+// already accounts for the calibration. Changing avOffset shifts raw
+// timing by the same amount this formula subtracts; the two cancel and
+// the result is a calibration-drift indicator (≈ output_latency - 20ms),
+// not a player metric. Live display now uses timingError directly.
 function _ndResidualMs(rawMs, avOffsetMs) {
     if (typeof rawMs !== 'number' || !isFinite(rawMs)) return rawMs;
     const onsetCompMs = _ND_ONSET_BUFFER_COMP_SEC * 1000;
@@ -1974,23 +1968,27 @@ function _ndCalibrationFinishRound() {
     const sorted = _ndCalibBuffer.slice().sort((a, b) => a - b);
     const medianRaw = sorted[Math.floor((sorted.length - 1) * 0.5)];
     const currentAvOffset = highway.getAvOffset ? highway.getAvOffset() : 0;
-    const medianResidual = _ndResidualMs(medianRaw, currentAvOffset);
-    console.log(`[note_detect] Calibration round ${_ndCalibRound}: median raw=${Math.round(medianRaw)}ms, residual=${Math.round(medianResidual)}ms (avOffset=${currentAvOffset}ms)`);
+    console.log(`[note_detect] Calibration round ${_ndCalibRound}: median timing=${Math.round(medianRaw)}ms (avOffset=${currentAvOffset}ms)`);
 
-    if (Math.abs(medianResidual) < _ND_CALIB_CONVERGED_MS) {
-        _ndStopAvCalibration(`Converged: residual ${Math.round(medianResidual)}ms (avOffset ${currentAvOffset}ms)`);
+    if (Math.abs(medianRaw) < _ND_CALIB_CONVERGED_MS) {
+        _ndStopAvCalibration(`Converged: median timing ${Math.round(medianRaw)}ms (avOffset ${currentAvOffset}ms)`);
         _ndPersistAvOffset(currentAvOffset);
         return;
     }
     if (_ndCalibRound >= _ND_CALIB_MAX_ROUNDS) {
-        _ndStopAvCalibration(`Max rounds reached: residual ${Math.round(medianResidual)}ms (avOffset ${currentAvOffset}ms)`);
+        _ndStopAvCalibration(`Max rounds reached: median timing ${Math.round(medianRaw)}ms (avOffset ${currentAvOffset}ms)`);
         _ndPersistAvOffset(currentAvOffset);
         return;
     }
 
-    // Adjust: residual = raw - avOffset + 20. To drive median(residual) → 0,
-    // increase avOffset by median(residual). Clamp to slopsmith's ±1000ms range.
-    const newAvOffset = Math.max(-1000, Math.min(1000, currentAvOffset + Math.round(medianResidual)));
+    // Closed-loop calibration: chartTime = audio.currentTime + avOffsetSec
+    // (slopsmith app.js:506). Increasing avOffset by Δ shifts chart-time
+    // forward by Δ, which makes future timingError = onsetChartT - chartNote.t
+    // INCREASE by Δ. To drive median(timingError) toward 0, *subtract* the
+    // current median from avOffset. (The earlier `+= residual` math was
+    // circular — residual = raw - avOffset, so adding it to avOffset
+    // changed raw by the same amount and never converged in real usage.)
+    const newAvOffset = Math.max(-1000, Math.min(1000, currentAvOffset - Math.round(medianRaw)));
     _ndApplyAvOffset(newAvOffset);
     console.log(`[note_detect] Calibration round ${_ndCalibRound}: avOffset ${currentAvOffset} → ${newAvOffset}ms`);
 
@@ -6194,14 +6192,14 @@ highway.addDrawHook(function(ctx, W, H) {
             labelY -= lineH;
         }
 
-        // Timing error (for hits and pitch-misses that had timing data).
-        // Display the *residual* \u2014 raw timingError minus avOffset minus
-        // pipeline-buffer comp \u2014 so what the player sees is their actual
-        // offset, not the structural latency they can't act on. Raw is
-        // preserved in noteResults for the report's latency-stack tile.
+        // Timing error: display the matcher's stored timingError directly.
+        // chartTime is avOffset-compensated upstream, so timingError reflects
+        // the player's actual offset relative to the calibrated chart clock
+        // \u2014 no further subtraction needed. If the player is consistently
+        // late/early, the fix is to run the AV-offset auto-calibrator, not
+        // to mask the number.
         if (judgment.timingError !== null && judgment.timingError !== undefined) {
-            const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
-            const ms = Math.round(_ndResidualMs(judgment.timingError, avOffsetMs));
+            const ms = Math.round(judgment.timingError);
             if (Math.abs(ms) > _ndPerfectTimingMs) {
                 ctx.fillStyle = '#ffaa33';
                 const arrow = ms > 0 ? '\u2193' : '\u2191';

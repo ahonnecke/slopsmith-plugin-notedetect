@@ -94,24 +94,21 @@ function median(values) {
     return sorted[Math.floor((sorted.length - 1) * 0.5)];
 }
 
-function summarizeTimings(snapshots, avOffsetMs) {
-    const rawTimings = [];
-    const residualTimings = [];
+function summarizeTimings(snapshots) {
+    const timings = [];
     let hitCount = 0, dirtyCount = 0;
     for (const s of snapshots) {
         for (const r of s.data.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
-                rawTimings.push(r.timingError);
-                residualTimings.push(core.residualMs(r.timingError, avOffsetMs));
+                timings.push(r.timingError);
                 if (r.primary === 'HIT') hitCount++; else dirtyCount++;
             }
         }
     }
     return {
-        n: rawTimings.length,
-        rawMedian: median(rawTimings),
-        residualMedian: median(residualTimings),
+        n: timings.length,
+        median: median(timings),
         hitCount, dirtyCount,
     };
 }
@@ -130,15 +127,21 @@ function classifySnapshotPrimaries(snapshots) {
     return { counts, total };
 }
 
-// AV calibrator simulation — mirrors the math in screen.js: per round of 30
-// HITs, take median(raw), compute residual, adjust avOffset by the median
-// residual. Stop on |residual| < 10 ms or 3 rounds elapsed.
+// AV calibrator simulation — mirrors the new math in screen.js. chartTime
+// is set to (audio.currentTime + avOffsetSec), so increasing avOffset by Δ
+// shifts future timingError up by Δ. To drive median(timing) → 0, we
+// SUBTRACT the current median from avOffset each round.
+//
+// Note about modeling: the simulator uses the recorded timings as-is. In
+// real usage, each round's avOffset change shifts ALL future raw timings
+// by the same Δ, so the next round's median would also shift. We model
+// this by tracking the cumulative avOffset delta and applying it to the
+// observed timings before computing the new median — this is what the
+// live calibrator's feed loop actually sees.
 function simulateAvCalibrator(snapshots, startAvOffset) {
     const SAMPLES_PER_ROUND = 30;
     const MAX_ROUNDS = 3;
     const CONVERGED_MS = 10;
-    // Walk all HITs in chart-time order across all snapshots so the
-    // simulation reflects what a continuous play session would feed.
     const orderedRaw = [];
     for (const s of snapshots) {
         for (const r of s.data.noteResults || []) {
@@ -159,42 +162,35 @@ function simulateAvCalibrator(snapshots, startAvOffset) {
                          needed: SAMPLES_PER_ROUND, available: orderedRaw.length - cursor });
             break;
         }
+        // Apply cumulative avOffset shift to the observed timings: real
+        // future timing = recorded_raw + (avOffset - startAvOffset).
+        const shift = avOffset - startAvOffset;
         const slice = orderedRaw.slice(cursor, cursor + SAMPLES_PER_ROUND);
-        const med = median(slice.map(s => s.raw));
-        const residual = core.residualMs(med, avOffset);
+        const observed = slice.map(s => s.raw + shift);
+        const med = median(observed);
         cursor += SAMPLES_PER_ROUND;
-        if (Math.abs(residual) < CONVERGED_MS) {
-            trace.push({ round, avOffsetBefore: avOffset, medianRaw: med,
-                         residual, avOffsetAfter: avOffset, status: 'CONVERGED' });
+        if (Math.abs(med) < CONVERGED_MS) {
+            trace.push({ round, avOffsetBefore: avOffset, medianTiming: med,
+                         avOffsetAfter: avOffset, status: 'CONVERGED' });
             return { trace, finalAvOffset: avOffset, samplesUsed: cursor };
         }
         const next = Math.max(-1000, Math.min(1000,
-            avOffset + Math.round(residual)));
-        trace.push({ round, avOffsetBefore: avOffset, medianRaw: med,
-                     residual, avOffsetAfter: next, status: 'ADJUST' });
+            avOffset - Math.round(med)));
+        trace.push({ round, avOffsetBefore: avOffset, medianTiming: med,
+                     avOffsetAfter: next, status: 'ADJUST' });
         avOffset = next;
     }
     return { trace, finalAvOffset: avOffset, samplesUsed: cursor, status: 'MAX_ROUNDS' };
 }
 
-// Compare prescription output: would the timing-bias prescription have
-// fired before vs after the residual switch?
-function comparePrescriptionImpact(snapshots, avOffsetMs) {
-    const playsOldStyle = snapshots.map(s => ({
-        ...s.data,
-        // Pretend avOffset = 0 — what raw-based prescription would have seen
-    }));
-    const playsNewStyle = snapshots.map(s => s.data);
-    const out = { firedBefore: 0, firedAfter: 0, songFilename: 'unknown.psarc' };
-    for (const p of playsOldStyle) {
-        const top3 = core.computeTop3Prescriptions([p], out.songFilename, 0);
-        if (top3.some(t => t.signal === 'timing_bias')) out.firedBefore++;
+// Frequency at which the timing-bias prescription fires across snapshots.
+function prescriptionFireRate(snapshots) {
+    let fired = 0;
+    for (const s of snapshots) {
+        const top3 = core.computeTop3Prescriptions([s.data], 'unknown.psarc', 0);
+        if (top3.some(t => t.signal === 'timing_bias')) fired++;
     }
-    for (const p of playsNewStyle) {
-        const top3 = core.computeTop3Prescriptions([p], out.songFilename, avOffsetMs);
-        if (top3.some(t => t.signal === 'timing_bias')) out.firedAfter++;
-    }
-    return out;
+    return fired;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -236,38 +232,37 @@ function main() {
     console.log(`Current avOffset (slopsmith /api/settings): ${avOffsetMs} ms`);
     console.log();
 
-    // Timing residual delta
-    const timing = summarizeTimings(snapshots, avOffsetMs);
-    console.log('── Timing residual (residual switch, commit b68cd75) ──');
+    // Timing summary
+    const timing = summarizeTimings(snapshots);
+    console.log('── HIT timing (matcher output, post-cleanup) ──');
     console.log(`  HITs analyzed:         ${timing.n} (${timing.hitCount} clean + ${timing.dirtyCount} dirty)`);
-    console.log(`  Raw timing median:     ${timing.rawMedian != null ? timing.rawMedian.toFixed(0) : '—'} ms (what the highway label used to show)`);
-    console.log(`  Residual median:       ${timing.residualMedian != null ? timing.residualMedian.toFixed(0) : '—'} ms (what it shows now)`);
-    if (timing.rawMedian != null && timing.residualMedian != null) {
-        const delta = Math.abs(timing.rawMedian) - Math.abs(timing.residualMedian);
-        console.log(`  |raw| − |residual|:    ${delta.toFixed(0)} ms ${delta > 0 ? '(player no longer charged for pipeline latency)' : '(no change — avOffset is 0 or onset comp dominates)'}`);
-    }
+    console.log(`  Median timing:         ${timing.median != null ? timing.median.toFixed(0) : '—'} ms`);
+    console.log(`  Highway label shows:   ${timing.median != null ? `${timing.median > 0 ? '+' : ''}${Math.round(timing.median)} ms` : '—'}`);
+    console.log(`  This is the player's offset against the avOffset-calibrated chart clock.`);
+    console.log(`  Persistent non-zero → run Auto-calibrate (settings panel) to fix.`);
     console.log();
 
     // Prescription frequency
-    const presc = comparePrescriptionImpact(snapshots, avOffsetMs);
-    console.log('── Top 3 prescription firing rate (timing_bias signal) ──');
-    console.log(`  Before residual switch: ${presc.firedBefore} of ${snapshots.length} plays`);
-    console.log(`  After residual switch:  ${presc.firedAfter} of ${snapshots.length} plays`);
-    if (presc.firedBefore > presc.firedAfter) {
-        const pct = ((presc.firedBefore - presc.firedAfter) / presc.firedBefore * 100).toFixed(0);
-        console.log(`  → ${pct}% fewer false-positive timing prescriptions`);
+    const fired = prescriptionFireRate(snapshots);
+    console.log('── Top 3 timing_bias prescription ──');
+    console.log(`  Fires in:              ${fired} of ${snapshots.length} plays`);
+    if (timing.median != null && Math.abs(timing.median) > 30) {
+        console.log(`  Median ${timing.median.toFixed(0)} ms is above the 30 ms threshold — prescription correctly fires.`);
+        console.log(`  Suggested action: run AV-offset auto-calibrator to drive median toward 0.`);
+    } else if (timing.median != null) {
+        console.log(`  Median ${timing.median.toFixed(0)} ms is within tolerance — prescription should not fire.`);
     }
     console.log();
 
-    // AV calibrator simulation
-    console.log('── AV calibrator replay (commit 8cb64cf) ──');
+    // AV calibrator simulation (corrected math)
+    console.log('── AV calibrator replay (corrected math: new = old − median) ──');
     const calib = simulateAvCalibrator(snapshots, avOffsetMs);
     console.log(`  Starting avOffset:     ${avOffsetMs} ms`);
     for (const t of calib.trace) {
         if (t.status === 'INSUFFICIENT_DATA') {
             console.log(`  Round ${t.round}: ${t.status} (need ${t.needed} HITs, have ${t.available})`);
         } else {
-            console.log(`  Round ${t.round}: avOffset ${t.avOffsetBefore} → ${t.avOffsetAfter} (median raw ${Math.round(t.medianRaw)} ms, residual ${Math.round(t.residual)} ms) — ${t.status}`);
+            console.log(`  Round ${t.round}: avOffset ${t.avOffsetBefore} → ${t.avOffsetAfter} (observed median ${Math.round(t.medianTiming)} ms) — ${t.status}`);
         }
     }
     console.log(`  Final avOffset:        ${calib.finalAvOffset} ms`);
@@ -277,11 +272,11 @@ function main() {
         console.log(`     Either current avOffset is already calibrated, or there aren't enough HITs.`);
     } else {
         console.log(`  → Calibrator SHOULD shift avOffset by ${calib.finalAvOffset - avOffsetMs} ms.`);
-        console.log(`     If the live calibrator didn't change anything, check:`);
-        console.log(`       1. Was Detect ON when "Auto-calibrate AV offset" was clicked?`);
-        console.log(`       2. Did at least 30 HITs flow during the calibration window?`);
-        console.log(`       3. Did POST /api/settings succeed? (browser console for warnings)`);
-        console.log(`       4. Did slopsmith pick up the new avOffset? (reload may be needed)`);
+        console.log(`     Live calibrator wiring debug checks (if click didn't apply):`);
+        console.log(`       1. Was Detect ON? (no hits → no samples)`);
+        console.log(`       2. Did ≥30 HITs flow during the calibration window?`);
+        console.log(`       3. Status string updated past "Calibrating: 0/30"?`);
+        console.log(`       (POST /api/settings persist verified working via curl probe.)`);
     }
     console.log();
 
@@ -306,9 +301,9 @@ function main() {
         console.log();
         console.log('── Per-snapshot detail ──');
         for (const s of snapshots) {
-            const t = summarizeTimings([s], avOffsetMs);
+            const t = summarizeTimings([s]);
             const stamp = new Date(s.mtime).toISOString().slice(0, 19);
-            console.log(`  ${stamp}  ${s.song.padEnd(28)} hits=${String(t.n).padStart(4)}  raw=${t.rawMedian != null ? t.rawMedian.toFixed(0).padStart(5) : '   —'}ms  resid=${t.residualMedian != null ? t.residualMedian.toFixed(0).padStart(5) : '   —'}ms`);
+            console.log(`  ${stamp}  ${s.song.padEnd(28)} hits=${String(t.n).padStart(4)}  median=${t.median != null ? t.median.toFixed(0).padStart(5) : '   —'}ms`);
         }
     }
 }
