@@ -4737,6 +4737,11 @@ const _ND_METRO_BPM = 75;
 const _ND_METRO_BEATS_TOTAL = 18;
 const _ND_METRO_COUNTIN = 2;
 const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of a beat
+// Hard cap for the wizard's outlier rejection. Entries beyond this are
+// dropped before any further median/σ math because they're either half-beat
+// aliases (±400 ms at 75 BPM) or reaction-time responses (+150-300 ms),
+// neither of which represent calibrated mic capture latency.
+const _ND_WIZ_HARD_CAP_MS = 200;
 
 let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-visual' | 'running-audio' | 'review'
 let _ndWizBeats = [];             // wall times (performance.now) of measured beats
@@ -4979,28 +4984,52 @@ function _ndWizFinishRun(mode) {
         return { beatT, dt: pickedDt, detection: picked };
     });
 
-    // Outlier rejection: drop values more than 2σ from the mean. With a
-    // musician who occasionally misses a beat or plays one wildly off, a
-    // single bad sample pulls the naïve median around. σ-trimming is a
-    // decent compromise — we keep reporting the raw per-beat numbers so the
-    // user can see which were dropped.
+    // Two-stage outlier rejection. Pure-σ alone fails when the data is
+    // bimodal (a typical wizard run has a small "anticipated" cluster
+    // near 0 and a larger "reaction-time or aliased" cluster — the σ
+    // window covers everything and no outliers are dropped).
+    //
+    // Stage 1 — hard cap at ±_ND_WIZ_HARD_CAP_MS. Drops:
+    //   • Half-beat aliases (±400 ms at 75 BPM) where the user's pluck
+    //     was assigned to the wrong beat boundary.
+    //   • Reaction-time responses (+150-300 ms) where the user heard the
+    //     click and plucked AFTER instead of anticipating.
+    // Both pollute mic-latency estimation. The cap is generous enough
+    // (200 ms) that genuinely-anticipated plucks survive even if the
+    // user is biased late by typical hardware latency.
+    //
+    // Stage 2 — 2σ filter on whatever survived stage 1. Catches any
+    // remaining stragglers without aggressive trimming.
     const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
+    const HARD_CAP_MS = _ND_WIZ_HARD_CAP_MS;
+    const inCap = dts.filter(dt => Math.abs(dt) <= HARD_CAP_MS);
+    const droppedHardCap = dts.length - inCap.length;
+
+    let used = inCap;
     let droppedOutliers = 0;
-    let used = dts;
-    if (dts.length >= 4) {
-        const mean = dts.reduce((s, x) => s + x, 0) / dts.length;
-        const variance = dts.reduce((s, x) => s + (x - mean) * (x - mean), 0) / dts.length;
+    if (inCap.length >= 4) {
+        const mean = inCap.reduce((s, x) => s + x, 0) / inCap.length;
+        const variance = inCap.reduce((s, x) => s + (x - mean) * (x - mean), 0) / inCap.length;
         const std = Math.sqrt(variance);
-        used = dts.filter(x => Math.abs(x - mean) <= 2 * std);
-        droppedOutliers = dts.length - used.length;
+        used = inCap.filter(x => Math.abs(x - mean) <= 2 * std);
+        droppedOutliers = inCap.length - used.length;
     }
     const sorted = used.slice().sort((a, b) => a - b);
     const medianDt = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 
+    // Quality flag: if too few entries survived the hard cap, the user
+    // was probably reacting to clicks instead of anticipating, OR they
+    // were off-beat in some structured way. The review screen surfaces
+    // this so the user knows to retry rather than Apply a noisy result.
+    const minUsable = Math.max(4, Math.floor(perBeat.length * 0.4));
+    const lowQuality = used.length < minUsable;
+
     const runResult = {
-        perBeat, medianDt, droppedOutliers,
+        perBeat, medianDt, droppedOutliers, droppedHardCap,
         droppedNoDetection: perBeat.length - dts.length,
         usedCount: used.length,
+        lowQuality,
+        hardCapMs: HARD_CAP_MS,
     };
     if (mode === 'visual') _ndWizVisualRun = runResult;
     else if (mode === 'audio') _ndWizAudioRun = runResult;
@@ -5160,27 +5189,43 @@ function _ndWizRender() {
 
         const perBeatTable = (run, label) => {
             if (!run) return '';
+            const cap = run.hardCapMs || _ND_WIZ_HARD_CAP_MS;
+            // Recompute the inCap → used pipeline so we can tag each row
+            // exactly as it was tagged at finishRun time.
+            const dts = run.perBeat.filter(x => x.dt !== null).map(x => x.dt);
+            const inCap = dts.filter(dt => Math.abs(dt) <= cap);
+            let mean = 0, std = 0;
+            if (inCap.length >= 4) {
+                mean = inCap.reduce((s, x) => s + x, 0) / inCap.length;
+                std = Math.sqrt(inCap.reduce((s, x) => s + (x - mean) * (x - mean), 0) / inCap.length);
+            }
+            const tag = (dt) => {
+                if (dt === null) return { kind: 'none', label: '' };
+                if (Math.abs(dt) > cap) return { kind: 'cap', label: 'off-beat / reacted' };
+                if (inCap.length >= 4 && Math.abs(dt - mean) > 2 * std) {
+                    return { kind: 'sigma', label: 'outlier' };
+                }
+                return { kind: 'used', label: '' };
+            };
             const rows = run.perBeat.map((b, i) => {
                 const dtTxt = b.dt === null ? '<span class="text-gray-600">no detection</span>'
                     : `<span class="text-gray-200 font-mono">${b.dt >= 0 ? '+' : ''}${Math.round(b.dt)} ms</span>`;
                 const note = b.detection ? noteName(b.detection.midi) : '—';
-                // Flag outliers: used set = |dt − mean| ≤ 2σ of raw (same check
-                // we did in finishRun); regenerate quickly so we can mark them.
-                const dts = run.perBeat.filter(x => x.dt !== null).map(x => x.dt);
-                let outlier = false;
-                if (b.dt !== null && dts.length >= 4) {
-                    const mean = dts.reduce((s, x) => s + x, 0) / dts.length;
-                    const std = Math.sqrt(dts.reduce((s, x) => s + (x - mean) * (x - mean), 0) / dts.length);
-                    outlier = Math.abs(b.dt - mean) > 2 * std;
-                }
+                const t = tag(b.dt);
+                const rowCls = t.kind === 'cap' ? 'text-orange-400'
+                             : t.kind === 'sigma' ? 'text-yellow-400'
+                             : '';
                 return `
-                    <tr class="${outlier ? 'text-yellow-400' : ''}">
+                    <tr class="${rowCls}">
                         <td class="py-0.5 pr-2 text-gray-500">${i + 1}</td>
                         <td class="py-0.5 pr-2">${dtTxt}</td>
                         <td class="py-0.5 pr-2 font-mono text-gray-500">${note}</td>
-                        <td class="py-0.5 text-[10px] text-yellow-500">${outlier ? 'outlier' : ''}</td>
+                        <td class="py-0.5 text-[10px]">${t.label}</td>
                     </tr>`;
             }).join('');
+            const warning = run.lowQuality
+                ? `<p class="text-[11px] text-orange-400 mt-2 leading-tight"><strong>Low-quality run:</strong> only ${run.usedCount} of ${run.perBeat.length} beats survived filtering. Most plucks landed >${cap} ms off the click — you may have been reacting to clicks instead of anticipating, or off by half a beat. Consider re-running.</p>`
+                : '';
             return `
                 <details class="mb-3 bg-dark-800 rounded-xl p-3 text-xs">
                     <summary class="cursor-pointer text-gray-300 font-semibold">${label} · per-beat data (${run.usedCount} of ${run.perBeat.length} used)</summary>
@@ -5191,8 +5236,9 @@ function _ndWizRender() {
                         <tbody>${rows}</tbody>
                     </table>
                     <p class="text-[10px] text-gray-600 mt-2 leading-tight">
-                        ${run.droppedNoDetection} beats had no detection within ±${_ND_METRO_BEAT_WINDOW_MS} ms · ${run.droppedOutliers} dropped as outliers · median of remaining used as the run's value.
+                        ${run.droppedNoDetection} no detection · ${run.droppedHardCap || 0} dropped as off-beat (>±${cap} ms) · ${run.droppedOutliers} dropped as ${'σ'} outliers · median of the remaining is the run's value.
                     </p>
+                    ${warning}
                 </details>`;
         };
 
@@ -5210,7 +5256,7 @@ function _ndWizRender() {
                 <div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-[11px] text-yellow-200 leading-tight space-y-1">
                     ${warnings.map(w => `<div>${w}</div>`).join('')}
                 </div>` : ''}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">Yellow rows = outliers (&gt;2σ from mean). They're dropped from the median. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if the number still feels off.</p>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight"><span class="text-orange-400">Orange</span> rows = off-beat (&gt;±${_ND_WIZ_HARD_CAP_MS} ms) — half-beat aliases or reaction-time responses. <span class="text-yellow-400">Yellow</span> rows = σ outliers among what survived the cap. Both are dropped before computing the median. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if the number still feels off.</p>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
                 <button onclick="_ndWizStep='intro'; _ndWizRender()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Re-run</button>
