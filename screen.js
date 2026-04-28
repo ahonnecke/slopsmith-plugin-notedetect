@@ -401,7 +401,8 @@ let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
 // 0.600 matches the calibrated value from CREPE.log working session
 // (598.7 ms) on this hardware. 0.350 (prior default) leaves detections
 // landing ~250 ms past every chart note, producing near-zero hits out of box.
-let _ndDetectionLatencySec = 0.600;
+// Legacy. Kept for save/load compat but always 0 at runtime — see load logic.
+let _ndDetectionLatencySec = 0;
 // Gate must sit below typical bass RMS (p95 ~0.005 on observed hardware).
 // 0.020 (prior default) killed 59% of frames before pitch detection ran;
 // 0.005 still rejects the idle noise floor (~0.001–0.003) but lets quiet
@@ -1999,13 +2000,14 @@ function _ndLoadSettings() {
         if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
         if (s.latencyOffset !== undefined) {
-            // Physically, pipeline latency for YIN on bass is ~150–500ms
-            // (2048-sample buffer + 2-of-3 stability votes + audio hop).
-            // Values above 0.7s are almost certainly calibration overshoot —
-            // symptom: hits cluster with dtMs strongly negative (detections
-            // land before chart notes after compensation). Clamp to 0.5 to
-            // restore sane behavior; user can retune via the slider.
-            _ndDetectionLatencySec = s.latencyOffset > 0.7 ? 0.5 : s.latencyOffset;
+            // Legacy field. The old calibration-wizard flow set this to ~500-
+            // 600 ms and the score code subtracted it from chart-time when
+            // matching. With slopsmith's chart-clock now applying avOffset
+            // (fix/loop-count-in-bpm @ 8d8c299) and the plugin's drift-
+            // compensation (rolling-median timing) handling residual offsets
+            // adaptively, the legacy value just stacks on top and corrupts
+            // scoring. Force-zero on load — saved value is read but ignored.
+            _ndDetectionLatencySec = 0;
         }
         if (s.silenceGate !== undefined) _ndSilenceGate = s.silenceGate;
         if (s.pitchOffset !== undefined) {
@@ -3211,8 +3213,11 @@ function _ndProcessAudioChunk(input) {
     }
 
     if (fireOnset) {
-        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-        _ndPendingOnsetChartT = highway.getTime() + avOffsetSec - _ND_ONSET_BUFFER_COMP_SEC;
+        // highway.getTime() now returns chartTime with avOffset already applied
+        // (slopsmith fix/loop-count-in-bpm @ 8d8c299 onwards). Adding avOffset
+        // here would double-apply it. Onset chart-time = current chart-time
+        // minus the half-buffer compensation.
+        _ndPendingOnsetChartT = highway.getTime() - _ND_ONSET_BUFFER_COMP_SEC;
         _ndRawMidiHistory = [];
         _ndStableMidi = -1;
         _ndLastOnsetPerfNow = nowPerfSec;
@@ -4110,8 +4115,7 @@ async function _ndProcessFrame(buffer) {
 
     // Log every stable frame
     if (_ndFrameLogEnabled) {
-        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-        const scoreT = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+        const scoreT = highway.getTime();
         _ndFrameLog.push({
             t: now, type: 'stable',
             midi: _ndStableMidi,
@@ -4323,8 +4327,7 @@ function _ndMatchNotes(tOverride) {
         // register here — the fingerprint was HITs in the dump labelled LATE
         // with +200 to +600 ms timing errors. See classify-session analysis
         // of mexico_full_play_apr24.wav for the evidence.
-        const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-        t = highway.getTime() + avOffsetSec - _ND_FALLBACK_STABILITY_LAG_SEC;
+        t = highway.getTime() - _ND_FALLBACK_STABILITY_LAG_SEC;
     }
 
     const notes = highway.getNotes();
@@ -5169,9 +5172,9 @@ function _ndTunerRender() {
 function _ndCheckMisses() {
     if (!_ndEnabled) return;
     // Mirror _ndMatchNotes's time derivation so hit/miss are measured on the
-    // same clock (visual-target time the player is actually aiming at).
-    const avOffsetSec = (highway.getAvOffset ? highway.getAvOffset() : 0) / 1000;
-    const t = highway.getTime() + avOffsetSec - _ndDetectionLatencySec;
+    // same clock. highway.getTime() is the audio-aligned chart-time with
+    // avOffset already applied (slopsmith fix/loop-count-in-bpm @ 8d8c299).
+    const t = highway.getTime();
     // A note is missed once it has passed the late bound of the hit window.
     // Matches _ndMatchNotes's window; see docs/ROCKSMITH_TIMING_MODEL.md.
     // Grace period absorbs detections arriving at the edge.
