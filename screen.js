@@ -4972,23 +4972,20 @@ function _ndWizFireBeat(b, mode, scheduledTime) {
     }
 }
 
-function _ndWizFinishRun(mode) {
+// Pure: take the wizard's beat schedule + detection events, return the run
+// record (perBeat, medianDt, drop counts, lowQuality flag). No side effects,
+// no DOM, no module-state writes — fully testable offline. The wrapper
+// (_ndWizFinishRun) handles the imperative parts.
+function _ndWizComputeRun(beats, detections, mode) {
     // Pre-filter detections to "fresh" ones — the first detection after a
-    // silence gap. Using gap-only (not pitch-change) because YIN's pitch
-    // jitters during the attack transient of each pluck: a single pluck can
-    // briefly report 5-6 different midi values in the first 100 ms before
-    // settling. Counting each jitter as a "fresh pluck" adds spurious events
-    // that pollute the beat-to-pluck assignment.
-    //
-    // Trade-off: if the user plays sustained notes with no gap between
-    // plucks (e.g. long-sustain open-string bass at 75 BPM), gap filtering
-    // misses re-plucks of the same note. Instructions on the running panel
-    // tell the user to play short / palm-muted notes so there's an audible
-    // silence between plucks for the gap filter to catch.
+    // silence gap. YIN's pitch jitters during the attack transient of each
+    // pluck (5-6 different midi values in the first 100 ms before settling);
+    // counting each jitter as a "fresh pluck" pollutes the beat-to-pluck
+    // assignment.
     const _ND_FRESH_GAP_MS = 120;
     const fresh = [];
     let lastTime = -Infinity;
-    for (const det of _ndWizDetections) {
+    for (const det of detections) {
         if (det.time - lastTime > _ND_FRESH_GAP_MS) {
             fresh.push(det);
         }
@@ -4996,11 +4993,8 @@ function _ndWizFinishRun(mode) {
     }
 
     // Assignment: for each beat, find the fresh detection within the beat
-    // window closest in time. "Closest-by-abs-dt" is correct now because
-    // sustain detections are already filtered out — each remaining detection
-    // is an attack event, so the one closest to the beat is "this beat's
-    // pluck."
-    const perBeat = _ndWizBeats.map(beatT => {
+    // window closest in time.
+    const perBeat = beats.map(beatT => {
         let picked = null;
         let pickedDt = null;
         for (const det of fresh) {
@@ -5014,22 +5008,9 @@ function _ndWizFinishRun(mode) {
         return { beatT, dt: pickedDt, detection: picked };
     });
 
-    // Two-stage outlier rejection. Pure-σ alone fails when the data is
-    // bimodal (a typical wizard run has a small "anticipated" cluster
-    // near 0 and a larger "reaction-time or aliased" cluster — the σ
-    // window covers everything and no outliers are dropped).
-    //
-    // Stage 1 — hard cap at ±_ND_WIZ_HARD_CAP_MS. Drops:
-    //   • Half-beat aliases (±400 ms at 75 BPM) where the user's pluck
-    //     was assigned to the wrong beat boundary.
-    //   • Reaction-time responses (+150-300 ms) where the user heard the
-    //     click and plucked AFTER instead of anticipating.
-    // Both pollute mic-latency estimation. The cap is generous enough
-    // (200 ms) that genuinely-anticipated plucks survive even if the
-    // user is biased late by typical hardware latency.
-    //
-    // Stage 2 — 2σ filter on whatever survived stage 1. Catches any
-    // remaining stragglers without aggressive trimming.
+    // Two-stage outlier rejection. Pure-σ alone fails on bimodal data.
+    // Stage 1: hard cap at ±_ND_WIZ_HARD_CAP_MS — drops half-beat aliases
+    // and reaction-time responses. Stage 2: 2σ on the survivors.
     const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
     const HARD_CAP_MS = _ND_WIZ_HARD_CAP_MS;
     const inCap = dts.filter(dt => Math.abs(dt) <= HARD_CAP_MS);
@@ -5047,20 +5028,21 @@ function _ndWizFinishRun(mode) {
     const sorted = used.slice().sort((a, b) => a - b);
     const medianDt = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 
-    // Quality flag: if too few entries survived the hard cap, the user
-    // was probably reacting to clicks instead of anticipating, OR they
-    // were off-beat in some structured way. The review screen surfaces
-    // this so the user knows to retry rather than Apply a noisy result.
     const minUsable = Math.max(4, Math.floor(perBeat.length * 0.4));
     const lowQuality = used.length < minUsable;
 
-    const runResult = {
+    return {
         perBeat, medianDt, droppedOutliers, droppedHardCap,
         droppedNoDetection: perBeat.length - dts.length,
         usedCount: used.length,
         lowQuality,
         hardCapMs: HARD_CAP_MS,
+        mode,
     };
+}
+
+function _ndWizFinishRun(mode) {
+    const runResult = _ndWizComputeRun(_ndWizBeats, _ndWizDetections, mode);
     if (mode === 'visual') _ndWizVisualRun = runResult;
     else if (mode === 'audio') _ndWizAudioRun = runResult;
 

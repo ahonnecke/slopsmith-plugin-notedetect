@@ -98,6 +98,7 @@ function loadDetectionCore() {
         '_ndBuildTroubleMap', '_ndTroubleKey',
         '_ndComputeTop3Prescriptions',
         '_ndChartHasNoteWithin',
+        '_ndWizComputeRun',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -131,7 +132,9 @@ function loadDetectionCore() {
         troubleKey: sandbox._ndTroubleKey,
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
         chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
-        // Expose the sandbox so tests can mock highway data
+        wizComputeRun: sandbox._ndWizComputeRun,
+        // Expose the sandbox so tests can mock highway data + reach into
+        // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,
     };
 }
