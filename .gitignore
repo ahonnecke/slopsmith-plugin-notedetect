@@ -8,3 +8,4 @@ __pycache__/
 test/fixtures/song-ceiling/*.wav
 test/fixtures/song-ceiling/*.mp3
 test/fixtures/song-ceiling/*.ogg
+test/fixtures/nd_plays/

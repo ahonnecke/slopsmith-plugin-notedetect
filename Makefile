@@ -63,6 +63,10 @@ test: ## Run node:test suite (FILE=<name> scopes to test/<name>.test.js)
 test-plays-roundtrip: ## Server-side round-trip harness for the per-play history routes
 	python3 test/plays-roundtrip.py
 
+.PHONY: replay-fix-impact
+replay-fix-impact: ## Replay snapshots through new analytics — measures residual / calibrator / sibling deltas. SONG=<dir> LIMIT=<N> VERBOSE=1.
+	node test/replay-fix-impact.js --pull $(if $(SONG),--song $(SONG)) $(if $(LIMIT),--limit $(LIMIT)) $(if $(VERBOSE),--verbose)
+
 # Default fixture matches the "4/127" baseline (commit 2e99ab0). Override with
 # WAV=<path> for other takes. Companion .json in test/fixtures/ supplies
 # chartStartTime automatically, so --wav-offset is not required.
