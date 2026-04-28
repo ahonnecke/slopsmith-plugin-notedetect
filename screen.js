@@ -2040,6 +2040,14 @@ function _ndUpdateCalibStatus(text) {
 // refractory, but Mexico's gaps are 200+ ms so 200 ms works here.
 const _ND_REATTACK_RATIO = 2.0;
 const _ND_REATTACK_REFRACTORY_SEC = 0.200;
+// Tightened refractory used when the chart has another note coming up
+// within _ND_FAST_REPEAT_LOOKAHEAD_SEC. Bass repeats at 16th notes / 120 BPM
+// are 125 ms apart — too fast for the 200 ms baseline. Chart-aware
+// loosening lets rapid same-pitch passages (Gasoline's bridge line is full
+// of MIDI-38 repeats at ~350 ms; faster songs go below 200 ms) register
+// every pluck instead of dropping every other one to refractory.
+const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
+const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
 // Release-before-retrigger: after any onset fires, another re-attack can't
@@ -3291,7 +3299,18 @@ function _ndProcessAudioChunk(input) {
     if (_ndReattackRmsBuf.length > _ND_REATTACK_WINDOW) _ndReattackRmsBuf.shift();
 
     const nowPerfSec = performance.now() / 1000;
-    const refractoryOk = (nowPerfSec - _ndLastOnsetPerfNow) > _ND_REATTACK_REFRACTORY_SEC;
+    // Chart-aware refractory: when the chart says a note is coming up within
+    // 250 ms, the 200 ms baseline is too long — the second pluck of a fast
+    // repeat would land inside the refractory window and never register.
+    // Tighten to 80 ms locally and bypass the rearm-gate too (sustain doesn't
+    // dip below rearm-level fast enough between rapid plucks). The rest of
+    // the time, keep the conservative defaults that suppress body-peak
+    // retriggers on slow notes.
+    const fastRepeatExpected = _ndChartHasNoteWithin(_ND_FAST_REPEAT_LOOKAHEAD_SEC);
+    const effRefractorySec = fastRepeatExpected
+        ? _ND_REATTACK_REFRACTORY_FAST_SEC
+        : _ND_REATTACK_REFRACTORY_SEC;
+    const refractoryOk = (nowPerfSec - _ndLastOnsetPerfNow) > effRefractorySec;
 
     // Re-arm the re-attack gate as soon as we observe a release — a frame
     // whose RMS is below the rearm level. Done OUTSIDE the onset-decision
@@ -3311,7 +3330,9 @@ function _ndProcessAudioChunk(input) {
     // AND armed by a prior release. Catches repeated plucks where sustain
     // keeps _ndInNote true between plucks (blocking Trigger 1), without
     // cascading spurious fires on a single note's body-peak resonance.
-    else if (_ndInNote && refractoryOk && _ndReattackArmed
+    // The arm-gate is bypassed when fastRepeatExpected, since rapid plucks
+    // don't give sustain enough time to dip below the rearm threshold.
+    else if (_ndInNote && refractoryOk && (_ndReattackArmed || fastRepeatExpected)
              && rms > _ND_REATTACK_MIN_LEVEL && _ndReattackRmsBuf.length >= 3) {
         const recentMin = Math.min(..._ndReattackRmsBuf.slice(0, -1));
         if (rms > recentMin * _ND_REATTACK_RATIO) fireOnset = true;
@@ -4414,6 +4435,39 @@ function _ndBsearch(arr, target) {
         else hi = mid;
     }
     return lo;
+}
+
+// Chart-density probe: does the chart have any unmuted note (or chord
+// containing one) starting within `lookaheadSec` of the current chart time?
+// Used by the onset detector to know when to relax the refractory + rearm
+// gates for rapid repeat passages. Cheap: bsearch + at most a few node
+// peeks. Returns false if highway data isn't ready.
+function _ndChartHasNoteWithin(lookaheadSec) {
+    if (!highway || !highway.getTime) return false;
+    const t = highway.getTime();
+    const notes = highway.getNotes ? highway.getNotes() : null;
+    const chords = highway.getChords ? highway.getChords() : null;
+    const tEnd = t + lookaheadSec;
+
+    if (notes && notes.length > 0) {
+        const start = _ndBsearch(notes, t);
+        for (let i = start; i < notes.length; i++) {
+            const n = notes[i];
+            if (n.t > tEnd) break;
+            if (!n.mt) return true;
+        }
+    }
+    if (chords && chords.length > 0) {
+        const start = _ndBsearch(chords, t);
+        for (let i = start; i < chords.length; i++) {
+            const c = chords[i];
+            if (c.t > tEnd) break;
+            for (const cn of (c.notes || [])) {
+                if (!cn.mt) return true;
+            }
+        }
+    }
+    return false;
 }
 
 // tOverride: optional pre-computed chart time. When provided (from an

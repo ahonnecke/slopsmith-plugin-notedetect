@@ -98,6 +98,7 @@ function loadDetectionCore() {
         '_ndBuildTroubleMap', '_ndTroubleKey',
         '_ndComputeTop3Prescriptions',
         '_ndResidualMs',
+        '_ndChartHasNoteWithin',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -131,6 +132,9 @@ function loadDetectionCore() {
         troubleKey: sandbox._ndTroubleKey,
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
         residualMs: sandbox._ndResidualMs,
+        chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
+        // Expose the sandbox so tests can mock highway data
+        _sandbox: sandbox,
     };
 }
 

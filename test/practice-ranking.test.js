@@ -511,3 +511,74 @@ test('top3: timing-bias detects EARLY direction in residual space', () => {
     assert.ok(timing, 'timing prescription should fire on -60ms residual');
     assert.match(timing.text, /early/i);
 });
+
+// ── Chart-density probe (drives chart-aware onset refractory) ────────────
+
+test('chartHasNoteWithin: empty highway → false', () => {
+    core._sandbox.highway = {
+        getTime: () => 0,
+        getNotes: () => [],
+        getChords: () => [],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), false);
+});
+
+test('chartHasNoteWithin: note within lookahead → true', () => {
+    core._sandbox.highway = {
+        getTime: () => 10.0,
+        getNotes: () => [
+            { t: 9.5, s: 0, f: 0, mt: false }, // past
+            { t: 10.15, s: 1, f: 5, mt: false }, // within 250ms
+            { t: 11.0, s: 0, f: 0, mt: false }, // beyond
+        ],
+        getChords: () => [],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), true);
+});
+
+test('chartHasNoteWithin: only note beyond lookahead → false', () => {
+    core._sandbox.highway = {
+        getTime: () => 10.0,
+        getNotes: () => [{ t: 10.50, s: 0, f: 0, mt: false }],
+        getChords: () => [],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), false);
+});
+
+test('chartHasNoteWithin: muted notes ignored', () => {
+    core._sandbox.highway = {
+        getTime: () => 10.0,
+        getNotes: () => [{ t: 10.10, s: 0, f: 0, mt: true }], // muted
+        getChords: () => [],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), false);
+});
+
+test('chartHasNoteWithin: chords with non-muted notes count', () => {
+    core._sandbox.highway = {
+        getTime: () => 10.0,
+        getNotes: () => [],
+        getChords: () => [{
+            t: 10.10,
+            notes: [{ s: 0, f: 0, mt: true }, { s: 1, f: 3, mt: false }],
+        }],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), true);
+});
+
+test('chartHasNoteWithin: all-muted chord → false', () => {
+    core._sandbox.highway = {
+        getTime: () => 10.0,
+        getNotes: () => [],
+        getChords: () => [{
+            t: 10.10,
+            notes: [{ s: 0, f: 0, mt: true }, { s: 1, f: 3, mt: true }],
+        }],
+    };
+    assert.equal(core.chartHasNoteWithin(0.250), false);
+});
+
+test('chartHasNoteWithin: missing highway methods → false (defensive)', () => {
+    core._sandbox.highway = { getTime: () => 10.0 };  // no getNotes/getChords
+    assert.equal(core.chartHasNoteWithin(0.250), false);
+});
