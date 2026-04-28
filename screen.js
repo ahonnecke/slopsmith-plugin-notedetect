@@ -414,6 +414,16 @@ let _ndPitchOffset = 0;          // semitones — calibrated or manual; compensa
 // If localStorage has a non-zero value, it'll be loaded — use Quick Calibrate
 // or the settings slider to reset.
 let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable Detect
+
+// Mic capture latency — measured once via the calibration wizard's audio run
+// (user plays in time with metronome; median dt = round-trip from speaker to
+// onset detection). Subtracted from highway timing labels and prescription
+// timing-bias signal so what surfaces is the player's actual offset, not the
+// hardware's audio stack delay. Synth replay measures only ~7ms post-capture
+// processing; the rest of the typical 100-200ms structural latency lives in
+// mic capture (USB ADC, OS audio stack, browser MediaStream) and varies per
+// setup. No way to derive offline — has to be measured for each user's rig.
+let _ndMicLatencyMs = 0;
 // Off by default — recording produces files (POSTed to the server, then to
 // /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
 // alongside the per-iteration play snapshots, e.g. for offline classifier
@@ -1058,7 +1068,7 @@ function _ndSuggestLoops(rows, opts = {}) {
 //   'open_report'  scroll to a section anchor
 //   'open_tuner'   open the standalone tuner
 //   null           no actionable button
-function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0) {
+function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0, micLatencyMs = 0) {
     const candidates = [];
     if (!plays || plays.length === 0) return [];
 
@@ -1096,20 +1106,16 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0) {
     }
 
     // ── Signal B: systematic timing offset ────────────────────────────────
-    // Use the matcher's stored timingError directly. It IS the player's
-    // offset — chartTime is already avOffset-compensated upstream
-    // (highway.js setTime: chartTime = audio.currentTime + avOffsetSec),
-    // so timingError reflects what the player did relative to the
-    // calibrated chart clock. The earlier "residual = raw - avOffset"
-    // subtraction was circular: changing avOffset shifts raw timing by
-    // the same amount, so the two cancel and residual was just a
-    // calibration-drift indicator, not a player-feedback metric.
+    // Subtract mic capture latency (measured via the calibration wizard's
+    // audio run) before computing the median. timingError = real player
+    // offset + mic_capture_latency; without this subtraction, prescriptions
+    // fire on hardware delay the player can't act on.
     const timingErrors = [];
     for (const p of plays) {
         for (const r of p.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
-                timingErrors.push(r.timingError);
+                timingErrors.push(r.timingError - micLatencyMs);
             }
         }
     }
@@ -1120,11 +1126,13 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0) {
         if (absMedian > 30) {
             const direction = median > 0 ? 'late' : 'early';
             const action = median > 0
-                ? 'Run the AV-offset auto-calibrator (settings panel) — your chart-clock is biased and the easy fix is calibration before practice.'
-                : 'Run the AV-offset auto-calibrator — chart-clock is biased early; calibrate before practice.';
+                ? 'You\'re consistently behind the beat. Anticipate the click instead of waiting for the visual cue.'
+                : 'You\'re consistently ahead of the beat. Hold the upbeat for one extra moment before plucking.';
             candidates.push({
                 text: `You\'re ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
-                detail: `Median timing offset across ${timingErrors.length} hits`,
+                detail: micLatencyMs > 0
+                    ? `Median across ${timingErrors.length} hits (mic latency ${Math.round(micLatencyMs)}ms subtracted)`
+                    : `Median across ${timingErrors.length} hits — calibrate mic latency for cleaner reading`,
                 action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'latency-stack' } },
                 score: absMedian * Math.min(timingErrors.length, 50) / 100,
                 signal: 'timing_bias',
@@ -1614,7 +1622,7 @@ async function _ndShowReport() {
             `;
         }).join('');
 
-    const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs);
+    const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs, _ndMicLatencyMs);
     const prescriptionsHtml = _ndRenderPrescriptionsBlock(top3);
 
     panel.innerHTML = `
@@ -1631,17 +1639,23 @@ async function _ndShowReport() {
             <div class="bg-dark-800 rounded p-2"><div class="text-gray-500">Dirty hits</div><div class="text-yellow-300 font-semibold">${dirtyTotal}</div></div>
         </div>
 
-        ${p50Timing != null ? `
+        ${p50Timing != null ? (() => {
+            const playerOffsetMs = Math.round(p50Timing - _ndMicLatencyMs);
+            return `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
-            <div id="nd-anchor-latency-stack" class="text-gray-400 mb-2">Timing offset</div>
-            <div class="grid grid-cols-3 gap-2">
+            <div id="nd-anchor-latency-stack" class="text-gray-400 mb-2">Timing breakdown</div>
+            <div class="grid grid-cols-4 gap-2">
                 <div>
-                    <div class="text-gray-500 text-[10px]">HIT timing (p50)</div>
-                    <div class="text-gray-200 font-mono ${Math.abs(p50Timing) > 100 ? 'text-orange-300' : Math.abs(p50Timing) > 50 ? 'text-yellow-300' : 'text-green-400'}">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
+                    <div class="text-gray-500 text-[10px]">Raw HIT timing (p50)</div>
+                    <div class="text-gray-200 font-mono">${p50Timing > 0 ? '+' : ''}${Math.round(p50Timing)} ms</div>
                 </div>
                 <div>
-                    <div class="text-gray-500 text-[10px]">AV offset (slopsmith)</div>
-                    <div class="text-gray-300 font-mono">${avOffsetMs > 0 ? '+' : ''}${Math.round(avOffsetMs)} ms</div>
+                    <div class="text-gray-500 text-[10px]">Mic latency (calibrated)</div>
+                    <div class="text-gray-300 font-mono">${_ndMicLatencyMs ? `${Math.round(_ndMicLatencyMs)} ms` : 'not run'}</div>
+                </div>
+                <div>
+                    <div class="text-gray-500 text-[10px]">Player offset</div>
+                    <div class="font-mono ${Math.abs(playerOffsetMs) > 75 ? 'text-orange-300' : Math.abs(playerOffsetMs) > 30 ? 'text-yellow-300' : 'text-green-400'}">${playerOffsetMs > 0 ? '+' : ''}${playerOffsetMs} ms</div>
                 </div>
                 <div>
                     <div class="text-gray-500 text-[10px]">Rolling drift</div>
@@ -1649,13 +1663,13 @@ async function _ndShowReport() {
                 </div>
             </div>
             <div class="text-gray-500 text-[10px] mt-2 leading-tight">
-                HIT timing is your offset relative to the avOffset-calibrated chart clock — what you actually played. Persistent non-zero values mean either you\'re playing late/early OR avOffset is miscalibrated. Run "Auto-calibrate AV offset" (settings panel) to drive this toward zero, then any remaining offset is genuinely you. Drift is a rolling-median compensation the matcher applies internally to keep the hit window aligned mid-session.
+                Player offset = raw HIT timing minus measured mic latency. ${_ndMicLatencyMs ? '' : 'Mic latency is 0 (not calibrated yet) — run <strong>Calibrate latency</strong> in the settings panel for a meaningful player-offset reading.'} Drift is a rolling-median compensation the matcher applies internally to keep the hit window aligned mid-session.
                 ${Math.abs(_ndDriftEstimateMs) > 150
                     ? '<span class="text-purple-300"> Large drift — chart-vs-audio sync is significant.</span>'
                     : ''}
             </div>
         </div>
-        ` : ''}
+        `;})() : ''}
 
         ${nLabeledHits > 0 ? `
         <div class="bg-dark-800 rounded p-3 mb-3 text-xs">
@@ -1775,7 +1789,7 @@ function _ndCheckAutoDump() {
             return _ndFetchPlays(songId).then(plays => {
                 const songFilename = _ndDecodedSongFilename();
                 const avOffsetMs = highway.getAvOffset ? highway.getAvOffset() : 0;
-                const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs);
+                const top3 = _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs, _ndMicLatencyMs);
                 if (top3.length > 0) _ndShowTipCard(top3[0]);
             });
         }).catch(() => { /* swallow — tip is optional */ });
@@ -2099,6 +2113,7 @@ function _ndSaveSettings() {
             strictness: _ndStrictness,
             dirtyHitMaxOffRatio: _ndDirtyHitMaxOffRatio,
             clickTrackOnly: _ndClickTrackOnly,
+            micLatencyMs: _ndMicLatencyMs,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -2133,6 +2148,9 @@ function _ndLoadSettings() {
         if (s.autoRecordOnPlay !== undefined) _ndAutoRecordOnPlay = !!s.autoRecordOnPlay;
         if (s.strictness !== undefined) _ndStrictness = s.strictness;
         if (s.dirtyHitMaxOffRatio !== undefined) _ndDirtyHitMaxOffRatio = s.dirtyHitMaxOffRatio;
+        if (s.micLatencyMs !== undefined && isFinite(Number(s.micLatencyMs))) {
+            _ndMicLatencyMs = Number(s.micLatencyMs);
+        }
         // clickTrackOnly intentionally NOT loaded — it's a per-session
         // training toggle, not a persistent default. Reload starts with
         // song audio enabled.
@@ -4950,30 +4968,28 @@ function _ndWizOnDetection() {
 }
 
 async function _ndWizApplyMetro() {
-    const micMs = _ndWizVisualOffsetMs !== null ? Math.round(_ndWizVisualOffsetMs) : null;
-    const totalMs = _ndWizAudioOffsetMs !== null ? Math.round(_ndWizAudioOffsetMs) : null;
+    const visualMs = _ndWizVisualOffsetMs !== null ? Math.round(_ndWizVisualOffsetMs) : null;
+    const audioMs  = _ndWizAudioOffsetMs  !== null ? Math.round(_ndWizAudioOffsetMs)  : null;
 
-    // Plugin Audio Latency Offset = total round-trip (audio run). Clamped to
-    // [0, max] because negative latency is physically impossible and would
-    // leave the highway worse than before the wizard.
-    if (totalMs !== null) {
-        const applied = Math.max(0, totalMs);
-        _ndDetectionLatencySec = Math.min(1, applied / 1000);
+    // Mic capture latency = audio run median dt (time from metronome click
+    // to onset detection). This IS the structural lateness baked into
+    // every live timingError — the gap between speaker output and the
+    // moment the mic chunk reaches the onset detector. Subtracted from
+    // highway labels and the prescription engine so the player sees
+    // their actual offset, not the hardware-stack delay.
+    if (audioMs !== null) {
+        const applied = Math.max(0, audioMs);
+        _ndMicLatencyMs = applied;
         _ndSaveSettings();
-        const sl = document.querySelector('#nd-settings-panel input[type=range]');
-        const lbl = document.getElementById('nd-latency-val');
-        if (sl) sl.value = applied;
-        if (lbl) lbl.textContent = applied;
+        console.log(`[note_detect] Mic latency calibrated: ${applied} ms (audio run median)`);
     }
 
     // Slopsmith core A/V sync offset = (visual run − audio run). The
     // direction: if dt_visual > dt_audio, your visual feedback is arriving
-    // later than your audio feedback (high visual render lag), so visuals
-    // need to shift FORWARD to match — that's a positive avOffset in core.
-    // If dt_audio > dt_visual, the opposite: shift visuals backward
-    // (negative avOffset). Core supports the full ±1000 ms range.
-    if (totalMs !== null && micMs !== null) {
-        const raw = micMs - totalMs;
+    // later than your audio feedback, so visuals need to shift FORWARD —
+    // positive avOffset. If dt_audio > dt_visual, opposite (negative).
+    if (audioMs !== null && visualMs !== null) {
+        const raw = visualMs - audioMs;
         const avMs = Math.max(-1000, Math.min(1000, raw));
         try {
             await fetch('/api/settings', {
@@ -5636,10 +5652,10 @@ function _ndShowSettings() {
                class="w-full accent-gray-500 mb-2" disabled
                style="opacity:0.35;pointer-events:none">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
-            <button id="nd-calib-btn" onclick="_ndStartAvCalibration()"
+            <button onclick="_ndOpenWizard()"
                 class="px-3 py-1 bg-blue-900/40 hover:bg-blue-900/70 rounded text-xs text-blue-200"
-                title="Watches your next ${_ND_CALIB_SAMPLES_PER_ROUND}+ hits and adjusts slopsmith's AV offset until your residual timing offset lands near zero. Up to ${_ND_CALIB_MAX_ROUNDS} rounds; converges early when residual is within ±${_ND_CALIB_CONVERGED_MS}ms.">Auto-calibrate AV offset</button>
-            <span id="nd-calib-status" class="text-[10px] text-gray-400 self-center"></span>
+                title="Two-phase metronome calibration. Tap SPACE in time with the bouncing ball (visual run), then play a note in time with audible clicks (audio run). The audio run measures the round-trip from speaker to onset detection — your mic capture latency. Saved as _ndMicLatencyMs and subtracted from highway timing labels so what you see is your actual offset, not the hardware delay.">Calibrate latency</button>
+            <span class="text-[10px] text-gray-400 self-center" id="nd-mic-latency-readout">${_ndMicLatencyMs ? `mic: ${Math.round(_ndMicLatencyMs)}ms` : 'mic: not calibrated'}</span>
             <button onclick="_ndOpenTuner()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"
                 title="Standalone tuner — play each open string, see cents offset per string, verify the instrument matches the song's tuning before scoring.">Tune</button>
@@ -6192,14 +6208,12 @@ highway.addDrawHook(function(ctx, W, H) {
             labelY -= lineH;
         }
 
-        // Timing error: display the matcher's stored timingError directly.
-        // chartTime is avOffset-compensated upstream, so timingError reflects
-        // the player's actual offset relative to the calibrated chart clock
-        // \u2014 no further subtraction needed. If the player is consistently
-        // late/early, the fix is to run the AV-offset auto-calibrator, not
-        // to mask the number.
+        // Timing error: subtract mic capture latency (measured once via the
+        // calibration wizard) so the displayed number is the player's actual
+        // offset, not the hardware-stack delay. If the wizard hasn't run,
+        // _ndMicLatencyMs is 0 and we display raw timingError.
         if (judgment.timingError !== null && judgment.timingError !== undefined) {
-            const ms = Math.round(judgment.timingError);
+            const ms = Math.round(judgment.timingError - _ndMicLatencyMs);
             if (Math.abs(ms) > _ndPerfectTimingMs) {
                 ctx.fillStyle = '#ffaa33';
                 const arrow = ms > 0 ? '\u2193' : '\u2191';

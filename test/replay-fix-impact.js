@@ -51,6 +51,7 @@ const LIMIT = parseInt(getArg('limit', '10'), 10);
 const PULL = getFlag('pull');
 const VERBOSE = getFlag('verbose');
 const CONTAINER = getArg('container', 'slopsmith-web-1');
+const MIC_LATENCY_MS = parseFloat(getArg('mic-latency', '0'));
 
 // ── Snapshot loading ────────────────────────────────────────────────────
 function pullFromContainer() {
@@ -94,21 +95,24 @@ function median(values) {
     return sorted[Math.floor((sorted.length - 1) * 0.5)];
 }
 
-function summarizeTimings(snapshots) {
-    const timings = [];
+function summarizeTimings(snapshots, micLatencyMs = 0) {
+    const rawTimings = [];
+    const correctedTimings = [];
     let hitCount = 0, dirtyCount = 0;
     for (const s of snapshots) {
         for (const r of s.data.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
-                timings.push(r.timingError);
+                rawTimings.push(r.timingError);
+                correctedTimings.push(r.timingError - micLatencyMs);
                 if (r.primary === 'HIT') hitCount++; else dirtyCount++;
             }
         }
     }
     return {
-        n: timings.length,
-        median: median(timings),
+        n: rawTimings.length,
+        rawMedian: median(rawTimings),
+        correctedMedian: median(correctedTimings),
         hitCount, dirtyCount,
     };
 }
@@ -184,10 +188,10 @@ function simulateAvCalibrator(snapshots, startAvOffset) {
 }
 
 // Frequency at which the timing-bias prescription fires across snapshots.
-function prescriptionFireRate(snapshots) {
+function prescriptionFireRate(snapshots, micLatencyMs) {
     let fired = 0;
     for (const s of snapshots) {
-        const top3 = core.computeTop3Prescriptions([s.data], 'unknown.psarc', 0);
+        const top3 = core.computeTop3Prescriptions([s.data], 'unknown.psarc', 0, micLatencyMs);
         if (top3.some(t => t.signal === 'timing_bias')) fired++;
     }
     return fired;
@@ -233,24 +237,22 @@ function main() {
     console.log();
 
     // Timing summary
-    const timing = summarizeTimings(snapshots);
-    console.log('── HIT timing (matcher output, post-cleanup) ──');
+    const timing = summarizeTimings(snapshots, MIC_LATENCY_MS);
+    console.log('── HIT timing ──');
     console.log(`  HITs analyzed:         ${timing.n} (${timing.hitCount} clean + ${timing.dirtyCount} dirty)`);
-    console.log(`  Median timing:         ${timing.median != null ? timing.median.toFixed(0) : '—'} ms`);
-    console.log(`  Highway label shows:   ${timing.median != null ? `${timing.median > 0 ? '+' : ''}${Math.round(timing.median)} ms` : '—'}`);
-    console.log(`  This is the player's offset against the avOffset-calibrated chart clock.`);
-    console.log(`  Persistent non-zero → run Auto-calibrate (settings panel) to fix.`);
+    console.log(`  Raw median:            ${timing.rawMedian != null ? timing.rawMedian.toFixed(0) : '—'} ms (matcher's stored timingError)`);
+    console.log(`  Mic latency arg:       ${MIC_LATENCY_MS} ms ${MIC_LATENCY_MS === 0 ? '(--mic-latency=N to inspect post-calibration)' : ''}`);
+    console.log(`  Player offset (p50):   ${timing.correctedMedian != null ? `${timing.correctedMedian > 0 ? '+' : ''}${Math.round(timing.correctedMedian)}` : '—'} ms`);
     console.log();
 
     // Prescription frequency
-    const fired = prescriptionFireRate(snapshots);
+    const fired = prescriptionFireRate(snapshots, MIC_LATENCY_MS);
     console.log('── Top 3 timing_bias prescription ──');
     console.log(`  Fires in:              ${fired} of ${snapshots.length} plays`);
-    if (timing.median != null && Math.abs(timing.median) > 30) {
-        console.log(`  Median ${timing.median.toFixed(0)} ms is above the 30 ms threshold — prescription correctly fires.`);
-        console.log(`  Suggested action: run AV-offset auto-calibrator to drive median toward 0.`);
-    } else if (timing.median != null) {
-        console.log(`  Median ${timing.median.toFixed(0)} ms is within tolerance — prescription should not fire.`);
+    if (timing.correctedMedian != null && Math.abs(timing.correctedMedian) > 30) {
+        console.log(`  Player offset ${Math.round(timing.correctedMedian)} ms is above the 30 ms threshold — fires correctly.`);
+    } else if (timing.correctedMedian != null) {
+        console.log(`  Player offset ${Math.round(timing.correctedMedian)} ms is within tolerance — should not fire.`);
     }
     console.log();
 
@@ -301,9 +303,9 @@ function main() {
         console.log();
         console.log('── Per-snapshot detail ──');
         for (const s of snapshots) {
-            const t = summarizeTimings([s]);
+            const t = summarizeTimings([s], MIC_LATENCY_MS);
             const stamp = new Date(s.mtime).toISOString().slice(0, 19);
-            console.log(`  ${stamp}  ${s.song.padEnd(28)} hits=${String(t.n).padStart(4)}  median=${t.median != null ? t.median.toFixed(0).padStart(5) : '   —'}ms`);
+            console.log(`  ${stamp}  ${s.song.padEnd(28)} hits=${String(t.n).padStart(4)}  raw=${t.rawMedian != null ? t.rawMedian.toFixed(0).padStart(5) : '   —'}ms  player=${t.correctedMedian != null ? t.correctedMedian.toFixed(0).padStart(5) : '   —'}ms`);
         }
     }
 }

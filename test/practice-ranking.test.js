@@ -576,3 +576,63 @@ test('chartHasNoteWithin: missing highway methods → false (defensive)', () => 
     core._sandbox.highway = { getTime: () => 10.0 };  // no getNotes/getChords
     assert.equal(core.chartHasNoteWithin(0.250), false);
 });
+
+// ── Mic-latency subtraction (calibration-wizard output) ─────────────────
+
+test('top3: timing-bias subtracts mic latency before computing median', () => {
+    // raw = +180ms; mic latency = 150ms → effective median = +30ms (at threshold).
+    // Should NOT fire (threshold is strictly > 30, the math gives equality).
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: 180, labels: ['LATE'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 0, 150);
+    const timing = top3.find(p => p.signal === 'timing_bias');
+    assert.ok(!timing, `with mic latency 150 subtracted, residual 30ms is at threshold; should not fire. Got: ${timing?.text}`);
+});
+
+test('top3: timing-bias fires when mic-corrected median is still above threshold', () => {
+    // raw = +250ms; mic latency = 150ms → effective median = +100ms. Should fire.
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: 250, labels: ['LATE'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 0, 150);
+    const timing = top3.find(p => p.signal === 'timing_bias');
+    assert.ok(timing, 'with mic latency 150 subtracted from 250, residual 100ms should fire timing_bias');
+    assert.match(timing.text, /100ms late/, `expected 100ms in text, got: ${timing.text}`);
+});
+
+test('top3: mic latency arg is independent of avOffset arg', () => {
+    // Same raw + mic latency, varying avOffset → identical text.
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: 200, labels: [], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const a = core.computeTop3Prescriptions(plays, 'song.psarc', 0, 150);
+    const b = core.computeTop3Prescriptions(plays, 'song.psarc', 105, 150);
+    const tA = a.find(p => p.signal === 'timing_bias');
+    const tB = b.find(p => p.signal === 'timing_bias');
+    assert.equal(tA.text, tB.text);
+});
+
+test('top3: mic latency subtraction handles negative residuals (early)', () => {
+    // raw = -100ms; mic latency = 0 → median = -100ms. Should fire EARLY.
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
+                     timingError: -100, labels: ['EARLY'], expectedMidi: 40 });
+    }
+    const plays = [makePlay(notes)];
+    const top3 = core.computeTop3Prescriptions(plays, 'song.psarc', 0, 0);
+    const timing = top3.find(p => p.signal === 'timing_bias');
+    assert.ok(timing);
+    assert.match(timing.text, /early/i);
+    assert.match(timing.text, /100ms/);
+});
