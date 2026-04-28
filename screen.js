@@ -4842,16 +4842,55 @@ function _ndWizStartRun(mode) {
     _ndWizCancelTimers();
 
     const intervalMs = 60000 / _ND_METRO_BPM;
+    const intervalSec = intervalMs / 1000;
     const startDelay = 1200;
     const origin = performance.now() + startDelay;
     // Ball reaches centre on every beat; the first beat anchors it.
     _ndWizBallOrigin = origin;
 
+    // Pre-schedule the entire metronome run on the AudioContext clock so
+    // click timing is deterministic regardless of setTimeout jitter. The
+    // earlier per-tick `osc = createOscillator(); osc.start(currentTime)`
+    // fired clicks at the moment the setTimeout callback ran — variable
+    // 5-50ms jitter, which the user perceived as variable click duration
+    // because the silence-between-clicks varied. Pre-scheduling decouples
+    // audio playback from JS event-loop timing entirely. setTimeout still
+    // drives UI updates (counter, line flash) — those are visual and
+    // tolerate jitter.
+    if (mode === 'audio') {
+        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const ctx = _ndWizAudioCtx;
+        if (ctx.state === 'suspended') ctx.resume();
+        const audioStartT = ctx.currentTime + startDelay / 1000;
+        for (let i = 0; i < _ND_METRO_BEATS_TOTAL; i++) {
+            const when = audioStartT + i * intervalSec;
+            const isCountIn = i < _ND_METRO_COUNTIN;
+            // Sine wave (not square) — no phase-edge artifacts at start/stop
+            // so every click sounds identical regardless of when it lands.
+            // 1000 Hz / 700 Hz tones, Hann-windowed via gain envelope.
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = isCountIn ? 700 : 1000;
+            osc.connect(gain).connect(ctx.destination);
+            gain.gain.setValueAtTime(0, when);
+            gain.gain.linearRampToValueAtTime(0.3, when + 0.005);
+            gain.gain.linearRampToValueAtTime(0, when + 0.06);
+            osc.start(when);
+            osc.stop(when + 0.07);
+        }
+    }
+
     for (let i = 0; i < _ND_METRO_BEATS_TOTAL; i++) {
         const when = origin + i * intervalMs;
         const isCountIn = i < _ND_METRO_COUNTIN;
         const delay = Math.max(0, when - performance.now());
-        _ndWizTimers.push(setTimeout(() => _ndWizFireBeat(isCountIn, mode), delay));
+        // Pass the SCHEDULED beat time so dt calculation uses the
+        // deterministic schedule, not the jittered setTimeout firing
+        // moment. (Earlier the wizard pushed performance.now() into
+        // _ndWizBeats — that captured setTimeout jitter and inflated
+        // the dt variance the user complained about.)
+        _ndWizTimers.push(setTimeout(() => _ndWizFireBeat(isCountIn, mode, when), delay));
     }
     const finishDelay = startDelay + _ND_METRO_BEATS_TOTAL * intervalMs + 500;
     _ndWizTimers.push(setTimeout(() => _ndWizFinishRun(mode), finishDelay));
@@ -4862,9 +4901,7 @@ function _ndWizStartRun(mode) {
     if (mode === 'visual') _ndWizStartBall();
 }
 
-function _ndWizFireBeat(isCountIn, mode) {
-    const now = performance.now();
-
+function _ndWizFireBeat(isCountIn, mode, scheduledTime) {
     // Flash the centre line briefly when a beat fires. Confirms alignment
     // between "ball at centre" and the actual beat time without turning
     // the metronome back into a point-in-time-only cue.
@@ -4881,23 +4918,14 @@ function _ndWizFireBeat(isCountIn, mode) {
         }, 180);
     }
 
-    if (mode === 'audio') {
-        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const ctx = _ndWizAudioCtx;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.frequency.value = isCountIn ? 700 : 1000;
-        osc.type = 'square';
-        osc.connect(gain).connect(ctx.destination);
-        const t0 = ctx.currentTime;
-        gain.gain.setValueAtTime(0, t0);
-        gain.gain.linearRampToValueAtTime(0.3, t0 + 0.002);
-        gain.gain.linearRampToValueAtTime(0, t0 + 0.06);
-        osc.start(t0);
-        osc.stop(t0 + 0.08);
-    }
+    // Audio clicks are pre-scheduled in _ndWizStartRun on the AudioContext
+    // clock; nothing audio-related happens here. The setTimeout jitter that
+    // used to corrupt click timing only affects the centre-line flash and
+    // the counter update — both visual, both fine to be slightly jittered.
 
-    if (!isCountIn) _ndWizBeats.push(now);
+    // Use the SCHEDULED beat time (not performance.now() at firing) so dt
+    // calculation reflects deterministic schedule, not setTimeout jitter.
+    if (!isCountIn) _ndWizBeats.push(scheduledTime);
 
     // Update ONLY the counter — don't re-render the modal, that would
     // replace the flash element while its fade-off timer is still running
