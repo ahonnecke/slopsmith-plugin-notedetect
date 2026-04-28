@@ -4764,11 +4764,39 @@ let _ndWizBallOrigin = 0;        // performance.now() at which ball == center fo
 Object.defineProperty(globalThis, '_ndWizVisualOffsetMs', { get: () => _ndWizVisualRun ? _ndWizVisualRun.medianDt : null, configurable: true });
 Object.defineProperty(globalThis, '_ndWizAudioOffsetMs',  { get: () => _ndWizAudioRun  ? _ndWizAudioRun.medianDt  : null, configurable: true });
 
+// Tracks whether the wizard started its own audio capture (true when
+// opened from system settings without Detect already on). Set on open,
+// checked on close so we tear down only what we started — don't kill an
+// in-game Detect session that the user wants to keep running.
+let _ndWizardOwnsMic = false;
+
 function _ndOpenWizard() {
     _ndWizStep = 'intro';
     _ndWizVisualRun = null;
     _ndWizAudioRun = null;
     _ndWizRender();
+}
+
+// Entry point from the system Settings panel (settings.html). Calibration
+// is hardware-dependent, not song-dependent, so this lets the user run it
+// without loading a song. If Detect isn't already on, we boot the mic
+// capture pipeline ourselves (covers the system-settings path) and tear
+// it down on close.
+async function _ndOpenWizardFromSettings() {
+    if (!_ndEnabled && !_ndAudioCtx) {
+        try {
+            const ok = await _ndStartAudio();
+            if (!ok) {
+                alert('Mic permission required to calibrate. Please grant access and try again.');
+                return;
+            }
+            _ndWizardOwnsMic = true;
+        } catch (e) {
+            alert('Failed to open mic: ' + (e?.message || e));
+            return;
+        }
+    }
+    _ndOpenWizard();
 }
 
 function _ndCloseWizard() {
@@ -4777,6 +4805,12 @@ function _ndCloseWizard() {
     _ndWizStep = 'closed';
     const m = document.getElementById('nd-wizard-modal');
     if (m) m.remove();
+    // Tear down our own mic if we started it. Detect-on sessions
+    // (where _ndEnabled is true) keep the mic running.
+    if (_ndWizardOwnsMic) {
+        _ndStopAudio();
+        _ndWizardOwnsMic = false;
+    }
 }
 
 function _ndWizCancelTimers() {
@@ -5078,6 +5112,11 @@ async function _ndWizApplyMetro() {
         _ndMicLatencyMs = applied;
         _ndSaveSettings();
         console.log(`[note_detect] Mic latency calibrated: ${applied} ms (audio run median)`);
+        // Notify the system-settings panel so its mic-latency readout
+        // updates without a page reload.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: applied });
+        }
     }
 
     // Slopsmith core A/V sync offset = (visual run − audio run). The
