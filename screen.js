@@ -4786,15 +4786,42 @@ function _ndWizStartBall() {
             return;
         }
         const ball = document.getElementById('nd-wiz-ball');
+        const flash = document.getElementById('nd-wiz-metro-flash');
         if (ball && _ndWizBallOrigin > 0) {
-            // phase = fractional beats since the first-beat anchor. The ball
-            // is at centre whenever phase is an integer (i.e. on each beat)
-            // and at the ±edge at half-integers (halfway between beats).
-            const phase = (performance.now() - _ndWizBallOrigin) / intervalMs;
-            const x = 0.5 + 0.5 * Math.sin(phase * Math.PI);
-            // 100% width range minus ball size; use a calc so the ball's
-            // centre (not edge) tracks x exactly.
-            ball.style.left = `calc(${(x * 100).toFixed(2)}% - 10px)`;
+            // Linear (triangle-wave) motion at constant velocity. Period =
+            // 2 beats: centre on every beat, ±edge on every half-beat. The
+            // earlier sine-wave variant accelerated through the centre,
+            // making the exact line-crossing moment hard to time — high
+            // variance in tap timing because the ball is moving fastest
+            // exactly when the user needs to read the position.
+            const elapsedBeats = (performance.now() - _ndWizBallOrigin) / intervalMs;
+            const p2 = ((elapsedBeats % 2) + 2) % 2;  // [0, 2)
+            // Triangle wave: 0 → +1 (peak at p2=0.5) → 0 (at p2=1) → −1
+            // (trough at p2=1.5) → 0 (at p2=2). Constant slope between
+            // breakpoints.
+            let v;
+            if (p2 < 0.5)      v = 2 * p2;
+            else if (p2 < 1.5) v = 2 - 2 * p2;
+            else               v = -4 + 2 * p2;
+            const x = 0.5 + 0.5 * v;
+            // 12% ball width → calc offset = 6% so centre tracks x exactly
+            ball.style.left = `calc(${(x * 100).toFixed(2)}% - 24px)`;
+
+            // Centre-line pulse: bright flash on the beat moment so the
+            // user gets a redundant "tap NOW" cue alongside the ball
+            // position. Decays over 150ms.
+            if (flash) {
+                const beatProximity = Math.min(p2 % 1, 1 - (p2 % 1));
+                const beatMs = beatProximity * intervalMs;
+                if (beatMs < 150) {
+                    const intensity = 1 - beatMs / 150;
+                    flash.style.background = `rgba(140, 220, 255, ${(0.3 + 0.6 * intensity).toFixed(2)})`;
+                    flash.style.boxShadow = `0 0 ${(8 + 14 * intensity).toFixed(0)}px rgba(140, 220, 255, ${(0.4 * intensity).toFixed(2)})`;
+                } else {
+                    flash.style.background = 'rgba(120, 120, 120, 0.5)';
+                    flash.style.boxShadow = 'none';
+                }
+            }
         }
         _ndWizBallRaf = requestAnimationFrame(tick);
     };
@@ -5059,15 +5086,15 @@ function _ndWizRender() {
         // at whichever cue arrived first, and we'd measure a blend of visual
         // and audio latency instead of audio alone.
         const runArea = mode === 'visual'
-            ? `<div class="relative h-12 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
-                   <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[3px] bg-gray-500 transition-all duration-150"></div>
-                   <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-green-400" style="left:calc(50% - 10px); box-shadow:0 0 14px 3px rgba(0,255,136,0.5);"></div>
+            ? `<div class="relative h-20 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
+                   <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[6px]" style="background:rgba(120,120,120,0.5)"></div>
+                   <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-12 h-12 rounded-full bg-green-400" style="left:calc(50% - 24px); box-shadow:0 0 22px 6px rgba(0,255,136,0.6);"></div>
                </div>`
             : `<div class="flex items-center justify-center h-20 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-400 text-sm">
                    <span>🎧 Ears only</span>
                </div>`;
         const instr = mode === 'visual'
-            ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. The ball swings side to side — centre is the beat, edges are halfway between. Use the trajectory to anticipate.'
+            ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. Ball moves at constant speed (linear, no acceleration); the line flashes blue at each beat — use both cues to anticipate.'
             : 'Close your eyes or look away. Play each time you hear a <strong>click</strong>. No visual — we deliberately hide the ball here so you can only lock onto the audio cue.';
         modal.innerHTML = wrap(`
             <p class="text-sm text-gray-300 mb-3">${instr}</p>
