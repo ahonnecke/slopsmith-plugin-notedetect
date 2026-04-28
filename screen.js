@@ -1914,6 +1914,115 @@ function _ndResidualMs(rawMs, avOffsetMs) {
     const onsetCompMs = _ND_ONSET_BUFFER_COMP_SEC * 1000;
     return rawMs - (avOffsetMs || 0) + onsetCompMs;
 }
+
+// ── AV-offset auto-calibrator ────────────────────────────────────────────
+// Watches HIT timing errors, computes the residual median, and nudges
+// slopsmith's avOffset until the player's pipeline-corrected offset
+// converges near zero. Multi-round so a single noisy sample doesn't
+// over-shoot. Persists via /api/settings + slopsmith's setAvOffsetMs so
+// the value survives reload.
+//
+// Convergence: 3 rounds × 30 hits, or stop early when |median residual|
+// drops below 10ms. Each round adjusts avOffset by the round's median
+// residual, so the next round's residual centers nearer zero.
+let _ndCalibrating = false;
+let _ndCalibBuffer = [];
+let _ndCalibRound = 0;
+let _ndCalibStartAvOffset = 0;
+const _ND_CALIB_SAMPLES_PER_ROUND = 30;
+const _ND_CALIB_MAX_ROUNDS = 3;
+const _ND_CALIB_CONVERGED_MS = 10;
+
+function _ndStartAvCalibration() {
+    if (_ndCalibrating) {
+        console.log('[note_detect] Calibration already in progress');
+        return;
+    }
+    if (!_ndEnabled) {
+        alert('Turn on Detect first, then start calibrating.');
+        return;
+    }
+    _ndCalibrating = true;
+    _ndCalibBuffer = [];
+    _ndCalibRound = 1;
+    _ndCalibStartAvOffset = highway.getAvOffset ? highway.getAvOffset() : 0;
+    console.log(`[note_detect] AV calibration started — ${_ND_CALIB_SAMPLES_PER_ROUND} hits/round, max ${_ND_CALIB_MAX_ROUNDS} rounds. Starting avOffset: ${_ndCalibStartAvOffset}ms`);
+    _ndUpdateCalibStatus(`Calibrating: 0/${_ND_CALIB_SAMPLES_PER_ROUND} (round 1)`);
+}
+
+function _ndStopAvCalibration(reason) {
+    if (!_ndCalibrating) return;
+    _ndCalibrating = false;
+    _ndCalibBuffer = [];
+    console.log(`[note_detect] AV calibration stopped: ${reason}`);
+    _ndUpdateCalibStatus(reason);
+}
+
+// Called from the HIT path on every successful match while calibrating.
+// rawMs is timingError before residual subtraction so the running
+// adjustment of avOffset is already reflected in subsequent samples.
+function _ndCalibrationFeedHit(rawMs) {
+    if (!_ndCalibrating) return;
+    if (typeof rawMs !== 'number' || !isFinite(rawMs)) return;
+    _ndCalibBuffer.push(rawMs);
+    _ndUpdateCalibStatus(`Calibrating: ${_ndCalibBuffer.length}/${_ND_CALIB_SAMPLES_PER_ROUND} (round ${_ndCalibRound})`);
+    if (_ndCalibBuffer.length < _ND_CALIB_SAMPLES_PER_ROUND) return;
+    _ndCalibrationFinishRound();
+}
+
+function _ndCalibrationFinishRound() {
+    const sorted = _ndCalibBuffer.slice().sort((a, b) => a - b);
+    const medianRaw = sorted[Math.floor((sorted.length - 1) * 0.5)];
+    const currentAvOffset = highway.getAvOffset ? highway.getAvOffset() : 0;
+    const medianResidual = _ndResidualMs(medianRaw, currentAvOffset);
+    console.log(`[note_detect] Calibration round ${_ndCalibRound}: median raw=${Math.round(medianRaw)}ms, residual=${Math.round(medianResidual)}ms (avOffset=${currentAvOffset}ms)`);
+
+    if (Math.abs(medianResidual) < _ND_CALIB_CONVERGED_MS) {
+        _ndStopAvCalibration(`Converged: residual ${Math.round(medianResidual)}ms (avOffset ${currentAvOffset}ms)`);
+        _ndPersistAvOffset(currentAvOffset);
+        return;
+    }
+    if (_ndCalibRound >= _ND_CALIB_MAX_ROUNDS) {
+        _ndStopAvCalibration(`Max rounds reached: residual ${Math.round(medianResidual)}ms (avOffset ${currentAvOffset}ms)`);
+        _ndPersistAvOffset(currentAvOffset);
+        return;
+    }
+
+    // Adjust: residual = raw - avOffset + 20. To drive median(residual) → 0,
+    // increase avOffset by median(residual). Clamp to slopsmith's ±1000ms range.
+    const newAvOffset = Math.max(-1000, Math.min(1000, currentAvOffset + Math.round(medianResidual)));
+    _ndApplyAvOffset(newAvOffset);
+    console.log(`[note_detect] Calibration round ${_ndCalibRound}: avOffset ${currentAvOffset} → ${newAvOffset}ms`);
+
+    _ndCalibBuffer = [];
+    _ndCalibRound++;
+}
+
+function _ndApplyAvOffset(ms) {
+    if (typeof setAvOffsetMs === 'function') {
+        setAvOffsetMs(ms);
+    } else if (highway.setAvOffset) {
+        highway.setAvOffset(ms);
+    }
+}
+
+async function _ndPersistAvOffset(ms) {
+    try {
+        await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ av_offset_ms: ms }),
+        });
+        console.log(`[note_detect] AV offset persisted: ${ms}ms`);
+    } catch (e) {
+        console.warn('[note_detect] AV offset persist failed:', e);
+    }
+}
+
+function _ndUpdateCalibStatus(text) {
+    const el = document.getElementById('nd-calib-status');
+    if (el) el.textContent = text || '';
+}
 // Sustain re-attack detection — fires a new onset when RMS spikes above the
 // recent running minimum during an in-progress note. Needed for repeated
 // plucks (Mexico bass is dense same-pitch E-string repeats) where sustain
@@ -4490,6 +4599,8 @@ function _ndMatchNotes(tOverride) {
     // Feed the drift estimator with the raw observed timing so future
     // matches benefit from the rolling-median.
     _ndUpdateDriftEstimate(timingError);
+    // Feed the AV-offset calibrator if it's running. No-op when not.
+    _ndCalibrationFeedHit(timingError);
 
     _ndNoteResults.set(key, {
         primary: 'HIT',
@@ -5473,10 +5584,10 @@ function _ndShowSettings() {
                class="w-full accent-gray-500 mb-2" disabled
                style="opacity:0.35;pointer-events:none">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
-            <button disabled
-                class="px-3 py-1 bg-dark-700 rounded text-xs text-gray-500 cursor-not-allowed"
-                style="opacity:0.4"
-                title="Disabled — wizard measures pipeline latency for the legacy stable-MIDI match trigger. After Phase 2 (onset-gated matching), scoring uses onset timestamps directly and this calibration no longer applies. See docs/NOTEDETECT_IMPLEMENTATION_GAPS.md.">Calibration Wizard (disabled)</button>
+            <button id="nd-calib-btn" onclick="_ndStartAvCalibration()"
+                class="px-3 py-1 bg-blue-900/40 hover:bg-blue-900/70 rounded text-xs text-blue-200"
+                title="Watches your next ${_ND_CALIB_SAMPLES_PER_ROUND}+ hits and adjusts slopsmith's AV offset until your residual timing offset lands near zero. Up to ${_ND_CALIB_MAX_ROUNDS} rounds; converges early when residual is within ±${_ND_CALIB_CONVERGED_MS}ms.">Auto-calibrate AV offset</button>
+            <span id="nd-calib-status" class="text-[10px] text-gray-400 self-center"></span>
             <button onclick="_ndOpenTuner()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"
                 title="Standalone tuner — play each open string, see cents offset per string, verify the instrument matches the song's tuning before scoring.">Tune</button>
