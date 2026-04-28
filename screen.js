@@ -4734,8 +4734,15 @@ function _ndStats() {
 //                       hear)
 
 const _ND_METRO_BPM = 75;
-const _ND_METRO_BEATS_TOTAL = 18;
-const _ND_METRO_COUNTIN = 2;
+// Ready-set-GO pattern: each cycle is 3 prep beats followed by 1 PLAY beat.
+// User plucks ONLY on the PLAY beat (cycle 4 of every 4). This replaces the
+// earlier "tap continuously to a metronome" paradigm where the user had to
+// anticipate every beat — a continuous task that produced 6/16 usable data
+// points because most plucks ended up reactive (post-click) or off-beat
+// half-aliased. Discrete prep + GO gives the user a clear cue moment.
+const _ND_METRO_PREP_BEATS = 3;       // silent/quiet count beats per cycle
+const _ND_METRO_CYCLES = 6;           // GO beats per run = data points per run
+const _ND_METRO_LEAD_IN = 3;          // initial prep before first cycle
 const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of a beat
 // Hard cap for the wizard's outlier rejection. Entries beyond this are
 // dropped before any further median/σ math because they're either half-beat
@@ -4850,95 +4857,118 @@ function _ndWizStartRun(mode) {
     const intervalSec = intervalMs / 1000;
     const startDelay = 1200;
     const origin = performance.now() + startDelay;
-    // Ball reaches centre on every beat; the first beat anchors it.
     _ndWizBallOrigin = origin;
 
-    // Pre-schedule the entire metronome run on the AudioContext clock so
-    // click timing is deterministic regardless of setTimeout jitter. The
-    // earlier per-tick `osc = createOscillator(); osc.start(currentTime)`
-    // fired clicks at the moment the setTimeout callback ran — variable
-    // 5-50ms jitter, which the user perceived as variable click duration
-    // because the silence-between-clicks varied. Pre-scheduling decouples
-    // audio playback from JS event-loop timing entirely. setTimeout still
-    // drives UI updates (counter, line flash) — those are visual and
-    // tolerate jitter.
+    // Build the beat schedule: lead-in, then N cycles of (3 prep + 1 GO).
+    // Each beat is tagged so the cue layer can render different visuals
+    // and play different tones. Only GO beats become measurement points
+    // (entered into _ndWizBeats); prep beats are pure cue.
+    const totalBeats = _ND_METRO_LEAD_IN + _ND_METRO_CYCLES * (_ND_METRO_PREP_BEATS + 1);
+    const beatPlan = [];
+    for (let i = 0; i < _ND_METRO_LEAD_IN; i++) {
+        beatPlan.push({ index: i, kind: 'lead', cycle: -1, prepNum: i + 1 });
+    }
+    for (let c = 0; c < _ND_METRO_CYCLES; c++) {
+        const baseI = _ND_METRO_LEAD_IN + c * (_ND_METRO_PREP_BEATS + 1);
+        for (let p = 0; p < _ND_METRO_PREP_BEATS; p++) {
+            beatPlan.push({ index: baseI + p, kind: 'prep', cycle: c, prepNum: p + 1 });
+        }
+        beatPlan.push({ index: baseI + _ND_METRO_PREP_BEATS, kind: 'go', cycle: c });
+    }
+
+    // Pre-schedule audio cues on the AudioContext clock — deterministic
+    // regardless of setTimeout jitter. Prep beats are quiet high-pitched
+    // ticks; GO beat is a louder, distinct lower tone.
     if (mode === 'audio') {
         if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const ctx = _ndWizAudioCtx;
         if (ctx.state === 'suspended') ctx.resume();
         const audioStartT = ctx.currentTime + startDelay / 1000;
-        for (let i = 0; i < _ND_METRO_BEATS_TOTAL; i++) {
-            const when = audioStartT + i * intervalSec;
-            const isCountIn = i < _ND_METRO_COUNTIN;
-            // Sine wave (not square) — no phase-edge artifacts at start/stop
-            // so every click sounds identical regardless of when it lands.
-            // 1000 Hz / 700 Hz tones, Hann-windowed via gain envelope.
+        for (const b of beatPlan) {
+            const when = audioStartT + b.index * intervalSec;
             const osc = ctx.createOscillator();
             const gain = ctx.createGain();
             osc.type = 'sine';
-            osc.frequency.value = isCountIn ? 700 : 1000;
+            // Lead-in and prep ticks: 1200 Hz, quiet, very short (40 ms
+            // sustain). The GO tone: 500 Hz, louder, longer (130 ms),
+            // distinctly different so the user can't miss the cue moment.
+            const isGo = b.kind === 'go';
+            osc.frequency.value = isGo ? 500 : 1200;
             osc.connect(gain).connect(ctx.destination);
+            const peak = isGo ? 0.45 : 0.15;
+            const sustainEnd = when + (isGo ? 0.13 : 0.04);
             gain.gain.setValueAtTime(0, when);
-            gain.gain.linearRampToValueAtTime(0.3, when + 0.005);
-            gain.gain.linearRampToValueAtTime(0, when + 0.06);
+            gain.gain.linearRampToValueAtTime(peak, when + 0.005);
+            gain.gain.linearRampToValueAtTime(0, sustainEnd);
             osc.start(when);
-            osc.stop(when + 0.07);
+            osc.stop(sustainEnd + 0.01);
         }
     }
 
-    for (let i = 0; i < _ND_METRO_BEATS_TOTAL; i++) {
-        const when = origin + i * intervalMs;
-        const isCountIn = i < _ND_METRO_COUNTIN;
+    for (const b of beatPlan) {
+        const when = origin + b.index * intervalMs;
         const delay = Math.max(0, when - performance.now());
-        // Pass the SCHEDULED beat time so dt calculation uses the
-        // deterministic schedule, not the jittered setTimeout firing
-        // moment. (Earlier the wizard pushed performance.now() into
-        // _ndWizBeats — that captured setTimeout jitter and inflated
-        // the dt variance the user complained about.)
-        _ndWizTimers.push(setTimeout(() => _ndWizFireBeat(isCountIn, mode, when), delay));
+        _ndWizTimers.push(setTimeout(() => _ndWizFireBeat(b, mode, when), delay));
     }
-    const finishDelay = startDelay + _ND_METRO_BEATS_TOTAL * intervalMs + 500;
+    const finishDelay = startDelay + totalBeats * intervalMs + 500;
     _ndWizTimers.push(setTimeout(() => _ndWizFinishRun(mode), finishDelay));
 
     _ndWizRender();
-    // Only animate the ball for the visual run. Audio run is deliberately
-    // visual-free so the user can only lock onto the audible click.
-    if (mode === 'visual') _ndWizStartBall();
 }
 
-function _ndWizFireBeat(isCountIn, mode, scheduledTime) {
-    // Flash the centre line briefly when a beat fires. Confirms alignment
-    // between "ball at centre" and the actual beat time without turning
-    // the metronome back into a point-in-time-only cue.
-    const line = document.getElementById('nd-wiz-metro-flash');
-    if (line) {
-        const color = isCountIn ? '#888' : '#00ff88';
-        line.style.backgroundColor = color;
-        line.style.boxShadow = isCountIn ? 'none' : '0 0 18px 4px #00ff88';
-        setTimeout(() => {
-            if (document.getElementById('nd-wiz-metro-flash') === line) {
-                line.style.backgroundColor = '#6b7280';
-                line.style.boxShadow = 'none';
-            }
-        }, 180);
-    }
+function _ndWizFireBeat(b, mode, scheduledTime) {
+    // Visual cue: light up the appropriate dot in the row of 4 indicators.
+    // For lead-in (very first beats before any cycle), light a small
+    // "preparing..." indicator. For prep beats inside a cycle, light dot
+    // 1/2/3. For the GO beat, light the GO dot prominently with a flash.
+    if (mode === 'visual') {
+        // Reset all dots to dim
+        for (let k = 1; k <= 4; k++) {
+            const el = document.getElementById(`nd-wiz-dot-${k}`);
+            if (!el) continue;
+            el.style.background = 'rgba(60, 60, 70, 0.6)';
+            el.style.boxShadow = 'none';
+            el.style.transform = 'scale(1)';
+        }
+        const goEl = document.getElementById('nd-wiz-go-text');
+        if (goEl) goEl.style.opacity = '0';
 
-    // Audio clicks are pre-scheduled in _ndWizStartRun on the AudioContext
-    // clock; nothing audio-related happens here. The setTimeout jitter that
-    // used to corrupt click timing only affects the centre-line flash and
-    // the counter update — both visual, both fine to be slightly jittered.
+        if (b.kind === 'prep') {
+            // Light dot 1/2/3 in sequence as prep beats fire
+            const el = document.getElementById(`nd-wiz-dot-${b.prepNum}`);
+            if (el) {
+                el.style.background = 'rgba(180, 180, 200, 0.85)';
+                el.style.boxShadow = '0 0 12px 3px rgba(180,180,200,0.4)';
+            }
+        } else if (b.kind === 'go') {
+            // Light all three prep dots faded + the GO dot bright + show "PLAY"
+            for (let k = 1; k <= 3; k++) {
+                const el = document.getElementById(`nd-wiz-dot-${k}`);
+                if (el) el.style.background = 'rgba(120, 120, 140, 0.5)';
+            }
+            const goDot = document.getElementById('nd-wiz-dot-4');
+            if (goDot) {
+                goDot.style.background = '#22ff88';
+                goDot.style.boxShadow = '0 0 32px 8px rgba(34,255,136,0.8)';
+                goDot.style.transform = 'scale(1.4)';
+            }
+            if (goEl) goEl.style.opacity = '1';
+        }
+        // lead-in beats keep all dots dim, just a subtle pulse on dot 1
+        if (b.kind === 'lead') {
+            const el = document.getElementById('nd-wiz-dot-1');
+            if (el) el.style.background = 'rgba(80, 80, 90, 0.7)';
+        }
+    }
 
     // Use the SCHEDULED beat time (not performance.now() at firing) so dt
     // calculation reflects deterministic schedule, not setTimeout jitter.
-    if (!isCountIn) _ndWizBeats.push(scheduledTime);
+    // Only GO beats are measurement points.
+    if (b.kind === 'go') _ndWizBeats.push(scheduledTime);
 
-    // Update ONLY the counter — don't re-render the modal, that would
-    // replace the flash element while its fade-off timer is still running
-    // (which is why the flash was previously invisible).
     const counter = document.getElementById('nd-wiz-counter');
     if (counter) {
-        const beatsExpected = _ND_METRO_BEATS_TOTAL - _ND_METRO_COUNTIN;
-        counter.textContent = `${_ndWizBeats.length} / ${beatsExpected}`;
+        counter.textContent = `${_ndWizBeats.length} / ${_ND_METRO_CYCLES}`;
     }
 }
 
@@ -5103,7 +5133,7 @@ function _ndWizRender() {
     }
 
     const beatsDone = _ndWizBeats.length;
-    const beatsExpected = _ND_METRO_BEATS_TOTAL - _ND_METRO_COUNTIN;
+    const beatsExpected = _ND_METRO_CYCLES;
     const wrap = (inner) => `
         <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl text-gray-200">
             <div class="flex items-center justify-between mb-4">
@@ -5117,8 +5147,8 @@ function _ndWizRender() {
         const vDone = _ndWizVisualOffsetMs !== null;
         const aDone = _ndWizAudioOffsetMs !== null;
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-2">Plays a metronome at <strong>${_ND_METRO_BPM} BPM</strong>. Play your bass <strong>in time with each beat</strong> — anticipate, don't react.</p>
-            <p class="text-[11px] text-gray-500 mb-4 leading-tight">First ${_ND_METRO_COUNTIN} beats are a count-in (dim). We measure the next ${beatsExpected}. Playing <em>with</em> the beat (not after it) means there's no human reaction time in the measurement.</p>
+            <p class="text-sm text-gray-300 mb-2"><strong>${_ND_METRO_CYCLES}</strong> rounds of <em>1 → 2 → 3 → PLAY</em> at ${_ND_METRO_BPM} BPM. Three quiet count beats then pluck on PLAY — the count gives you time to anticipate, the GO cue is unambiguous.</p>
+            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Don't react to the GO; pluck <em>with</em> it (you'll have heard 3 ticks at constant rhythm so the GO moment is predictable). Each round produces one data point; the median across rounds is your calibration.</p>
             <div class="space-y-2 mb-4">
                 <button onclick="_ndWizStartRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${vDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
                     <span><strong>1. Visual</strong> — flash only. Measures mic input lag.</span>
@@ -5136,23 +5166,26 @@ function _ndWizRender() {
         `);
     } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
         const mode = _ndWizStep.slice('running-'.length);
-        // Deliberately: the visual cue (ball) appears only on the visual run.
-        // The audio run shows a static "ears only" area and nothing moving,
-        // so the user locks onto the audible click as their only cue. If we
-        // also showed the ball on audio mode, the user could hit the pluck
-        // at whichever cue arrived first, and we'd measure a blend of visual
-        // and audio latency instead of audio alone.
+        // Visual mode shows a row of 4 dots: 1 → 2 → 3 → GO! Each prep
+        // beat lights its dot in turn; the GO beat lights the rightmost
+        // dot prominently with "PLAY" text. Audio mode hides the dots
+        // entirely so the user locks onto the audible cue alone.
+        const dotRow = `
+            <div class="flex items-center justify-center gap-6 h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 relative">
+                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-1" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">1</span></div>
+                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-2" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">2</span></div>
+                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-3" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">3</span></div>
+                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-4" class="w-12 h-12 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-green-400 font-bold">GO</span></div>
+                <div id="nd-wiz-go-text" class="absolute top-1 right-3 text-2xl font-black text-green-300 transition-opacity duration-100" style="opacity:0; text-shadow:0 0 12px rgba(34,255,136,0.8)">PLAY!</div>
+            </div>`;
         const runArea = mode === 'visual'
-            ? `<div class="relative h-20 bg-dark-800 rounded-xl mb-3 overflow-hidden border border-gray-800">
-                   <div id="nd-wiz-metro-flash" class="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[6px]" style="background:rgba(120,120,120,0.5)"></div>
-                   <div id="nd-wiz-ball" class="absolute top-1/2 -translate-y-1/2 w-12 h-12 rounded-full bg-green-400" style="left:calc(50% - 24px); box-shadow:0 0 22px 6px rgba(0,255,136,0.6);"></div>
-               </div>`
-            : `<div class="flex items-center justify-center h-20 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-400 text-sm">
-                   <span>🎧 Ears only</span>
+            ? dotRow
+            : `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-400 text-sm">
+                   <span>🎧 Ears only — listen for the lower-pitched <strong class="text-green-300">GO</strong> tone after 3 quiet ticks</span>
                </div>`;
         const instr = mode === 'visual'
-            ? 'Watch the ball. Play each time it crosses the <strong>centre line</strong>. Ball moves at constant speed (linear, no acceleration); the line flashes blue at each beat — use both cues to anticipate.'
-            : 'Close your eyes or look away. Play each time you hear a <strong>click</strong>. No visual — we deliberately hide the ball here so you can only lock onto the audio cue.';
+            ? 'Watch the dots. Three count-in dots light in sequence (1, 2, 3), then the GO dot pulses bright green — pluck on GO, not before, not after. The count gives you the rhythm so you can hit GO with no reaction delay.'
+            : 'Eyes closed or away. Three quiet high ticks at 75 BPM, then a louder lower tone — pluck on the lower tone. Three ticks let you anticipate; the GO is unmistakable.';
         modal.innerHTML = wrap(`
             <p class="text-sm text-gray-300 mb-3">${instr}</p>
             ${runArea}
