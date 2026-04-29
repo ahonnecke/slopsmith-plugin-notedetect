@@ -51,6 +51,59 @@ test('first-note NO_DETECTION (no previous) NOT flagged', () => {
     assert.equal(flagged.size, 0);
 });
 
+test('chain failure: NO_DETECTION 800ms after another NO_DETECTION → flagged', () => {
+    // Wider gap (>= 400ms) BUT previous note also missed → sustain bleed
+    // chain. With 1.0s window and prev=MISSED_NO_DETECTION, second miss
+    // should be flagged.
+    const notes = [
+        note({ chartT: 1.0, primary: 'MISSED_NO_DETECTION' }),
+        note({ chartT: 1.8, primary: 'MISSED_NO_DETECTION' }),   // 800ms gap, prev missed
+    ];
+    const flagged = core.likelyDetectorFailures(notes);
+    assert.ok(flagged.has(notes[1].key));
+});
+
+test('chain failure NOT triggered when previous note was a HIT', () => {
+    // Same 800ms gap, but prev was a clean hit. The current miss is the
+    // user's, not the detector's.
+    const notes = [
+        note({ chartT: 1.0, primary: 'HIT' }),
+        note({ chartT: 1.8, primary: 'MISSED_NO_DETECTION' }),
+    ];
+    const flagged = core.likelyDetectorFailures(notes);
+    assert.equal(flagged.size, 0);
+});
+
+test('chain failure stops at 1.0s gap', () => {
+    const notes = [
+        note({ chartT: 1.0, primary: 'MISSED_NO_DETECTION' }),
+        note({ chartT: 2.5, primary: 'MISSED_NO_DETECTION' }),   // 1.5s gap, too wide
+    ];
+    const flagged = core.likelyDetectorFailures(notes);
+    assert.ok(!flagged.has(notes[1].key));
+});
+
+test('chain propagates: 5 consecutive misses each flagged', () => {
+    // Series of 700ms-spaced NO_DETECTIONs; the chain heuristic should
+    // flag each subsequent one once the first triggers.
+    const notes = [];
+    for (let i = 0; i < 6; i++) {
+        notes.push(note({ chartT: 1.0 + i * 0.7,
+            primary: i === 0 ? 'HIT' : 'MISSED_NO_DETECTION' }));
+    }
+    const flagged = core.likelyDetectorFailures(notes);
+    // First miss (i=1) NOT flagged: gap 0.7s, prev was HIT
+    assert.ok(!flagged.has(notes[1].key));
+    // Subsequent misses: prev is now flagged-as-detector-failure (or
+    // MISSED_NO_DETECTION carryover); chain extends.
+    // i=2: prev (i=1) is MISSED_NO_DETECTION, gap 0.7s < 1.0s → flagged
+    // i=3,4,5: same chain
+    assert.ok(flagged.has(notes[2].key));
+    assert.ok(flagged.has(notes[3].key));
+    assert.ok(flagged.has(notes[4].key));
+    assert.ok(flagged.has(notes[5].key));
+});
+
 // ── Heuristic 2: hygiene contaminants on WRONG_PITCH ───────────────────
 
 test('WRONG_PITCH with onTargetRatio=0 + contaminants flagged', () => {
@@ -146,14 +199,17 @@ test('filterDetectorFailures: removes flagged misses, keeps everything else', ()
         noteResults: [
             note({ chartT: 1.0, primary: 'HIT' }),
             note({ chartT: 1.2, primary: 'MISSED_NO_DETECTION' }),   // fast-repeat
-            note({ chartT: 2.0, primary: 'MISSED_NO_DETECTION' }),   // slow, kept
+            note({ chartT: 3.5, primary: 'MISSED_NO_DETECTION' }),   // wide gap (1.5s), kept
         ],
     };
     const filtered = core.filterDetectorFailures([play]);
     assert.equal(filtered.length, 1);
-    assert.equal(filtered[0].noteResults.length, 2);
+    assert.equal(filtered[0].noteResults.length, 2);   // HIT + wide-gap miss
     // The fast-repeat miss should be gone
     assert.ok(!filtered[0].noteResults.some(r => r.chartT === 1.2));
+    // The wide-gap miss should be kept (1.5s gap, no chain since prev
+    // was already filtered out before chain check has chance to fire)
+    assert.ok(filtered[0].noteResults.some(r => r.chartT === 3.5));
 });
 
 test('filterDetectorFailures: returns plays unchanged if nothing flagged', () => {

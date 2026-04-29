@@ -2413,7 +2413,16 @@ const _ND_STRICTNESS_PRESETS = {
 // and the offline filter (_ndLikelyDetectorFailures, used by coaching/
 // timeline/heatmap aggregates) reference the same constants here so the
 // two paths can't drift.
+// Tight gap: rapid re-attack regime where the onset detector physically
+// can't fire again — refractory window + previous sustain dominates the
+// RMS measurement. The "sustain bleed wall".
 const _ND_DETECTOR_FAST_REPEAT_GAP_SEC = 0.4;
+// Wider gap: chain-failure regime — even with a longer gap, if the
+// PREVIOUS chart note also missed, the detector is in a bad state
+// (accumulated sustain bleed across multiple unhit notes) and the next
+// note's NO_DETECTION is also a detector limitation. Validated on
+// user's Gasoline data: 29 of 56 wide-gap misses followed another miss.
+const _ND_DETECTOR_CHAIN_FAILURE_GAP_SEC = 1.0;
 // Pitch errors at or below this many semitones from expected are almost
 // always sustain bleed from a low prior note dominating YIN's window.
 // Real finger slips stay within 1-3 semitones of the target.
@@ -5141,14 +5150,28 @@ function _ndCheckMisses() {
                 // Find the most recent prior chart note across all
                 // _ndNoteResults entries already finalised for this play.
                 let prevChartT = -Infinity;
+                let prevPrimary = null;
                 for (const v of _ndNoteResults.values()) {
                     if (v.chartT < noteTime && v.chartT > prevChartT) {
                         prevChartT = v.chartT;
+                        prevPrimary = v.primary;
                     }
                 }
-                if (prevChartT > -Infinity
-                    && (noteTime - prevChartT) < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) {
-                    detectorFailure = true;
+                if (prevChartT > -Infinity) {
+                    const gap = noteTime - prevChartT;
+                    // Tight gap: detector can't physically fire again.
+                    if (gap < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) {
+                        detectorFailure = true;
+                    }
+                    // Wider gap with chain failure: previous note also
+                    // missed/was-detector-flagged, sustain bleed is
+                    // accumulating across multiple unhit notes.
+                    else if (gap < _ND_DETECTOR_CHAIN_FAILURE_GAP_SEC
+                        && (prevPrimary === 'MISSED_NO_DETECTION'
+                            || prevPrimary === 'MISSED_WRONG_PITCH'
+                            || prevPrimary === 'IGNORED_DETECTOR_FAILURE')) {
+                        detectorFailure = true;
+                    }
                 }
             } else if (primary === 'MISSED_WRONG_PITCH') {
                 if (hyg
@@ -6068,7 +6091,18 @@ function _ndLikelyDetectorFailures(noteResults) {
         if (r.primary === 'MISSED_NO_DETECTION') {
             const prev = i > 0 ? sorted[i - 1] : null;
             const gap = prev ? (r.chartT - prev.chartT) : Infinity;
-            if (gap > 0 && gap < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) {
+            // Tight gap: detector can't fire fresh. Wider gap with chain
+            // failure (prev was also a miss / detector-flagged): sustain
+            // bleed accumulating across consecutive unhit notes.
+            const prevWasMiss = prev && (
+                prev.primary === 'MISSED_NO_DETECTION'
+                || prev.primary === 'MISSED_WRONG_PITCH'
+                || prev.primary === 'IGNORED_DETECTOR_FAILURE'
+                || flagged.has(prev.key)
+            );
+            if (gap > 0
+                && (gap < _ND_DETECTOR_FAST_REPEAT_GAP_SEC
+                    || (gap < _ND_DETECTOR_CHAIN_FAILURE_GAP_SEC && prevWasMiss))) {
                 flagged.add(r.key);
                 continue;
             }
