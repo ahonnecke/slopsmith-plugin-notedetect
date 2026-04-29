@@ -910,7 +910,10 @@ function _ndSnapshotPlay(reason) {
         // a stop-gap so the immediate next iteration had glow; this
         // overwrite uses all recent plays, so notes consistently missed
         // across multiple loops glow harder than one-off mistakes.
-        if (reason === 'loop_restart') _ndLoadTroubleFromDisk();
+        if (reason === 'loop_restart') {
+            _ndLoadTroubleFromDisk();
+            _ndMaybeSuggestPracticeLoop();
+        }
     })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
 }
@@ -6812,6 +6815,96 @@ function _ndShowIterationBanner(noteResults) {
         toast.style.transform = 'translateX(20px)';
         setTimeout(() => toast.remove(), 350);
     }, 4000);
+}
+
+// ── Hotspot practice banner ─────────────────────────────────────────────
+// After each loop_restart, look at recent plays for the current song,
+// find the worst hotspot, and surface a banner offering to set the live
+// A-B loop to that range. One click — no dropdown, no manual A/B set.
+//
+// Triggers only when the hotspot has multi-play evidence (>= 3 misses
+// across >= 2 plays) and the user isn't already practising a range that
+// covers it — re-suggesting the same hotspot during the loop they just
+// set up would be obnoxious.
+async function _ndMaybeSuggestPracticeLoop() {
+    const songId = _ndCurrentSongId();
+    if (!songId) return;
+    try {
+        const plays = await _ndFetchPlays(songId);
+        if (plays.length < 2) return;
+        const { rows } = _ndAggregatePlays(plays);
+        const loops = _ndSuggestLoops(rows, { maxLoops: 3 });
+        if (!loops.length) return;
+        const top = loops[0];
+        if (top.noteCount < 2) return;   // not enough evidence
+        // Avoid re-suggesting if the current live loop already covers this.
+        const liveStart = (typeof window.loopA === 'number') ? window.loopA : null;
+        const liveEnd = (typeof window.loopB === 'number') ? window.loopB : null;
+        if (liveStart !== null && liveEnd !== null
+            && liveStart <= top.startSec + 0.5 && liveEnd >= top.endSec - 0.5) {
+            return;
+        }
+        _ndShowPracticeBanner(top);
+    } catch (e) {
+        console.warn('[note_detect] Hotspot suggestion failed:', e);
+    }
+}
+
+function _ndShowPracticeBanner(hotspot) {
+    // De-dupe: if a banner for the same range is already up, skip.
+    const existing = document.querySelector('.nd-practice-banner');
+    if (existing && existing.dataset.start === hotspot.startSec.toFixed(2)) return;
+    if (existing) existing.remove();
+
+    const startMmSs = `${Math.floor(hotspot.startSec / 60)}:${String(Math.floor(hotspot.startSec % 60)).padStart(2, '0')}`;
+    const endMmSs = `${Math.floor(hotspot.endSec / 60)}:${String(Math.floor(hotspot.endSec % 60)).padStart(2, '0')}`;
+    const missPct = Math.round(hotspot.avgMissRate * 100);
+
+    const banner = document.createElement('div');
+    banner.className = 'nd-practice-banner fixed left-1/2 -translate-x-1/2 z-[250] bg-orange-900/90 border-2 border-orange-600 rounded-xl px-4 py-3 shadow-2xl';
+    banner.style.bottom = '80px';
+    banner.style.transition = 'opacity 0.4s, transform 0.4s';
+    banner.dataset.start = hotspot.startSec.toFixed(2);
+    banner.innerHTML = `
+        <div class="flex items-center gap-4">
+            <div>
+                <div class="text-orange-100 font-semibold text-sm">Hotspot: ${startMmSs}–${endMmSs}</div>
+                <div class="text-orange-200 text-[11px] leading-tight">${hotspot.noteCount} note${hotspot.noteCount === 1 ? '' : 's'} you keep missing · ${missPct}% miss rate</div>
+            </div>
+            <button class="nd-practice-btn px-3 py-1.5 bg-orange-200 hover:bg-orange-100 text-orange-900 rounded-lg text-sm font-bold">
+                Practice now
+            </button>
+            <button class="nd-practice-dismiss px-2 py-1 text-orange-300 hover:text-orange-100 text-lg leading-none">×</button>
+        </div>
+    `;
+    document.body.appendChild(banner);
+
+    banner.querySelector('.nd-practice-btn').addEventListener('click', () => {
+        if (typeof window.setActiveLoop !== 'function') {
+            console.warn('[note_detect] setActiveLoop not available — slopsmith may need a refresh');
+            banner.querySelector('.nd-practice-btn').textContent = 'Refresh page first';
+            return;
+        }
+        const ok = window.setActiveLoop(hotspot.startSec, hotspot.endSec);
+        if (ok) {
+            banner.style.opacity = '0';
+            setTimeout(() => banner.remove(), 400);
+        } else {
+            banner.querySelector('.nd-practice-btn').textContent = 'Failed';
+        }
+    });
+    banner.querySelector('.nd-practice-dismiss').addEventListener('click', () => {
+        banner.style.opacity = '0';
+        setTimeout(() => banner.remove(), 400);
+    });
+
+    // Auto-dismiss after 15 seconds if user doesn't engage.
+    setTimeout(() => {
+        if (banner.parentNode) {
+            banner.style.opacity = '0';
+            setTimeout(() => banner.remove(), 400);
+        }
+    }, 15000);
 }
 
 // ── Now-line judgment queue ──────────────────────────────────────────────
