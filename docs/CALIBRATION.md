@@ -4,6 +4,113 @@ What we measure, why, and what we explicitly chose NOT to do. Read this
 before changing the wizard or proposing "let's just …" alternatives. Most
 of the alternatives have been tried; the why-not is captured below.
 
+## Testing
+
+### 0. Read current calibration value
+
+Open slopsmith in browser, open devtools console:
+
+```js
+JSON.parse(localStorage.getItem('slopsmith_notedetect')).micLatencyMs
+```
+
+### 1. Validate current calibration against play history (offline, no browser)
+
+```bash
+# With current mic latency (replace 174 with your current value)
+make calibrate-from-history MIC_LATENCY=174
+
+# With raw timingError (mic_latency = 0, see uncalibrated bias)
+make calibrate-from-history
+```
+
+Reads every snapshot under `/tmp/nd_plays/`, falls back to
+`test/fixtures/nd_plays/`. Reports per-song + aggregate verdict:
+`insufficient` (< 30 hits), `biased` (off by more than playing noise),
+or `at-floor` (calibration correct, remaining variance is playing).
+
+If `biased`, output includes a recommended new mic-latency value.
+
+### 2. Apply the recommended value
+
+In the browser devtools console:
+
+```js
+// Replace 174 with the recommended value from step 1
+_ndMicLatencyMs = 174;
+_ndSaveSettings();
+window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: 174 });
+```
+
+The settings card readout should update from "—" to "174 ms" without
+reload.
+
+### 3. Verify the new value lands at-floor
+
+```bash
+make calibrate-from-history MIC_LATENCY=174
+```
+
+Should report `at-floor` with `postCalibMedian` within ±max(2×SE, 5 ms)
+of zero.
+
+### 4. Run after each new play session
+
+The recommendation tightens as N grows. Re-run periodically:
+
+```bash
+# Pull fresh snapshots from running slopsmith first if you want
+docker cp slopsmith-web-1:/tmp/nd_plays /tmp/nd_plays_latest
+make calibrate-from-history MIC_LATENCY=$(your_current) ROOT=/tmp/nd_plays_latest
+```
+
+### 5. Detect drift (different sessions, different rigs)
+
+If the wizard says X but play-history says Y, and Y is consistent
+across 30+ recent hits, trust play-history. The wizard is bootstrap.
+The lock-state UI in the wizard intro is an *internal consistency*
+indicator — it does not validate the value's correctness against
+real-world play.
+
+### 6. Wizard regression tests (no browser)
+
+```bash
+# Pure-functional tests for the bimodal estimator, apply gate,
+# stability, and play-history validator. ~51 cases, runs in ~80 ms.
+node --test test/wizard-filter.test.js
+
+# Full plugin test suite (includes the above + matching, severity,
+# practice ranking, etc.)
+make test
+```
+
+### 7. Wizard end-to-end probe (browser, headless)
+
+Slopsmith must be running at localhost:8088. The probe drives the
+wizard from settings entry through both keyboard reaction baselines
+and a synthetic visual run, asserting each milestone:
+
+```bash
+node test/probe-settings-wizard.js
+```
+
+Exits 0 on success. Reports each stage as it passes; failures point
+to the broken phase (mic boot, click click, run finish, etc.).
+
+### 8. Reset calibration
+
+```js
+// In devtools console
+_ndMicLatencyMs = 0;
+_ndUserReactionAuditoryMs = 0;
+_ndUserReactionVisualMs = 0;
+_ndCalibHistory = [];
+_ndSaveSettings();
+location.reload();
+```
+
+
+
 ## The two unknowns we calibrate
 
 ```
