@@ -32,16 +32,11 @@ const { loadDetectionCore } = require('./_loader');
 
 function parseArgs() {
     const args = process.argv.slice(2);
-    const out = {
-        root: null, micLatency: 0, verbose: false, latestOnly: 0,
-        apply: false, applyUrl: 'http://localhost:8088',
-    };
+    const out = { root: null, micLatency: 0, verbose: false, latestOnly: 0 };
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--root') out.root = args[++i];
         else if (args[i] === '--mic-latency') out.micLatency = Number(args[++i]) || 0;
         else if (args[i] === '--latest-only') out.latestOnly = Number(args[++i]) || 1;
-        else if (args[i] === '--apply') out.apply = true;
-        else if (args[i] === '--apply-url') out.applyUrl = args[++i];
         else if (args[i] === '--verbose' || args[i] === '-v') out.verbose = true;
         else if (args[i] === '--help' || args[i] === '-h') {
             console.log(`Usage: node test/calibrate-from-history.js [OPTS]
@@ -50,10 +45,6 @@ function parseArgs() {
   --mic-latency MS        Current mic latency to subtract (default 0)
   --latest-only N         Only use the N most recent snapshot files across all songs.
                           Use 1 to validate a single new loop in isolation.
-  --apply                 If verdict is BIASED, POST recommended value to the plugin
-                          via /api/plugins/note_detect/calibration. Plugin polls every
-                          30s and applies on next tick. No devtools paste required.
-  --apply-url URL         Slopsmith base URL (default http://localhost:8088)
   -v                      Verbose
 `);
             process.exit(0);
@@ -104,20 +95,6 @@ function loadSnapshots(root, latestOnly) {
         } catch (e) { /* skip */ }
     }
     return { bySong, totalFilesAvailable: allFiles.length, filesUsed: selected.length };
-}
-
-async function applyToPlugin(baseUrl, micLatencyMs) {
-    const url = `${baseUrl.replace(/\/+$/, '')}/api/plugins/note_detect/calibration`;
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ micLatencyMs }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const body = await resp.json();
-    if (body.error) throw new Error(body.error);
-    console.log(`  Staged ${micLatencyMs} ms with plugin. Next plugin poll (within 30 s) will apply.`);
-    console.log(`  Watch the browser console for "Mic latency applied via server staging".`);
 }
 
 function fmt(n, width = 7) {
@@ -194,12 +171,6 @@ function main() {
         console.log(`  Recommended mic latency: ${opts.micLatency} ${sign}${agg.suggestedNudge} = ${agg.recommendedMicLatencyMs} ms.`);
         if (agg.recommendedMicLatencyMs === 0 && agg.suggestedNudge < 0) {
             console.log(`  Note: nudge would push mic latency below 0 — clamped to 0. avOffset may be misconfigured.`);
-        }
-        if (opts.apply) {
-            applyToPlugin(opts.applyUrl, agg.recommendedMicLatencyMs)
-                .then(() => process.exit(1))
-                .catch(e => { console.error('  Apply failed:', e.message); process.exit(3); });
-            return;
         }
         process.exit(1);
     } else {

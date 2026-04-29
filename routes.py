@@ -2,7 +2,6 @@
 
 import json
 import os
-import time
 from pathlib import Path
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import FileResponse
@@ -12,7 +11,6 @@ DUMP_FILE = Path("/tmp/nd_diag_dump.json")
 RECORDING_DIR = Path("/tmp/nd_recordings")
 PLAYS_DIR = Path("/tmp/nd_plays")
 PLAYS_KEEP_PER_SONG = 10
-CALIBRATION_FILE = Path("/tmp/nd_pending_calibration.json")
 
 
 def _safe_song_dir(song_id: str) -> Path:
@@ -118,31 +116,3 @@ def setup(app: FastAPI, context: dict):
             except Exception:
                 pass
         return {"plays": plays}
-
-    @app.post("/api/plugins/note_detect/calibration")
-    async def set_calibration(request: Request):
-        """Stage a calibration value for the next plugin poll to pick up.
-        Used by `make calibrate-from-history --apply` so the user doesn't
-        have to paste the value into devtools."""
-        data = await request.json()
-        try:
-            mic_latency = float(data.get("micLatencyMs"))
-        except (TypeError, ValueError):
-            return {"error": "missing or invalid micLatencyMs"}
-        # Hardware mic latency can't be negative; cap at a generous upper bound
-        # so a CLI typo can't write absurd values into the plugin state.
-        if not (0 <= mic_latency <= 1000):
-            return {"error": f"out of range (0-1000 ms), got {mic_latency}"}
-        payload = {"micLatencyMs": round(mic_latency, 1), "stagedAt": time.time()}
-        CALIBRATION_FILE.write_text(json.dumps(payload))
-        return {"ok": True, **payload}
-
-    @app.get("/api/plugins/note_detect/calibration")
-    async def get_calibration():
-        """Plugin polls this. Returns the latest staged value (or null)."""
-        if not CALIBRATION_FILE.exists():
-            return {"micLatencyMs": None, "stagedAt": None}
-        try:
-            return json.loads(CALIBRATION_FILE.read_text())
-        except Exception:
-            return {"micLatencyMs": None, "stagedAt": None}

@@ -186,44 +186,6 @@ def main():
     check("3 severity values preserved exactly",
           severities == [1.0, 0.85, 0.27], str(severities))
 
-    # ── Test: calibration staging endpoint ───────────────────────────────
-    print("\nTest: calibration POST/GET round-trip")
-    routes.CALIBRATION_FILE = tmp / "calibration.json"
-
-    # GET when nothing staged yet
-    r = client.get("/api/plugins/note_detect/calibration")
-    check("GET 200 when nothing staged", r.status_code == 200)
-    check("GET returns null micLatencyMs", r.json().get("micLatencyMs") is None)
-
-    # POST a value
-    r = client.post("/api/plugins/note_detect/calibration", json={"micLatencyMs": 131})
-    check("POST 200", r.status_code == 200)
-    check("POST returns ok", r.json().get("ok") is True)
-    check("POST returns rounded value", r.json().get("micLatencyMs") == 131.0)
-
-    # GET reflects the staged value
-    r = client.get("/api/plugins/note_detect/calibration")
-    check("GET reflects staged value", r.json().get("micLatencyMs") == 131.0)
-    check("GET includes stagedAt", isinstance(r.json().get("stagedAt"), (int, float)))
-
-    # Out-of-range rejected
-    r = client.post("/api/plugins/note_detect/calibration", json={"micLatencyMs": -50})
-    check("POST rejects negative", "error" in r.json())
-    r = client.post("/api/plugins/note_detect/calibration", json={"micLatencyMs": 1500})
-    check("POST rejects too-large", "error" in r.json())
-
-    # Missing field rejected
-    r = client.post("/api/plugins/note_detect/calibration", json={})
-    check("POST rejects missing field", "error" in r.json())
-
-    # Updating value bumps stagedAt
-    first_staged = client.get("/api/plugins/note_detect/calibration").json().get("stagedAt")
-    time.sleep(0.01)
-    client.post("/api/plugins/note_detect/calibration", json={"micLatencyMs": 95})
-    second_staged = client.get("/api/plugins/note_detect/calibration").json().get("stagedAt")
-    check("re-staging bumps stagedAt", second_staged > first_staged,
-          f"first={first_staged} second={second_staged}")
-
     # ── Cleanup + report ─────────────────────────────────────────────────
     shutil.rmtree(tmp, ignore_errors=True)
     print()
