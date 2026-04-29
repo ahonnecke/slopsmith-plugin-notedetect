@@ -32,15 +32,29 @@ Aggregate verdict on the last line:
 - `BIASED — ... Recommended mic latency: X ms` → use that value
 - `AT-FLOOR` → no calibration needed; you're at the playing floor already
 
-### Apply the recommended value
+### Apply the recommended value (auto)
 
-Open slopsmith devtools console (F12 in browser), paste this one line:
+```bash
+node test/calibrate-from-history.js --root /tmp/nd_plays --latest-only 7 --mic-latency $CURRENT --apply
+```
+
+Validator POSTs the recommended value to
+`/api/plugins/note_detect/calibration`, plugin's poll picks it up within
+30 seconds and applies it. No browser interaction. Watch the browser
+console for `[note_detect] Mic latency applied via server staging: X ms`.
+
+Requires the routes change deployed (container restart).
+
+### Apply the recommended value (manual fallback)
+
+If `--apply` fails or the container isn't running with the new routes,
+paste this in slopsmith devtools console (F12):
 
 ```js
 _ndMicLatencyMs = 174; _ndSaveSettings(); window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: 174 });
 ```
 
-(replace `174` with the recommendation). No reload. Effective immediately.
+(replace `174`). No reload. Effective immediately.
 
 ### Verify against existing data
 
@@ -52,6 +66,11 @@ Should print `AT-FLOOR` on the last line. If still `BIASED`, repeat with
 the new recommendation.
 
 ### Validate ONE new loop in isolation (after applying a value)
+
+**Important**: don't look at the green/red timing labels while playing.
+Looking at them causes you to unconsciously adjust your playing to
+chase visual feedback, which contaminates the calibration data. Play
+to the chart by ear/feel; let the labels fall where they fall.
 
 Play one loop in the browser. The plugin saves a snapshot to
 `/tmp/nd_plays/<song>__<arrangement>/<timestamp>.json` automatically on
@@ -314,6 +333,61 @@ latency. Always measure.
 ### Don't treat the wizard's lock state as truth
 
 It only proves consistency. Truth comes from play-history validation.
+
+### Don't tell the user "play more loops" when N >= 5
+
+The validator originally required 30 hits for a verdict; that meant a user
+playing one short loop with a few HITs got "insufficient" and felt like
+they were on a treadmill. Threshold lowered to 5 hits with
+**resolution-aware verdicts** — at small N you get a wide tolerance, but
+the answer is still definitive (biased or at-floor) and the resolution is
+printed so the user knows what they could/couldn't detect. The 5-hit
+floor exists because the median is meaningless below that.
+
+### The user adapts to applied calibration values
+
+A real failure mode observed this session:
+1. Apply mic_latency=120 ms (recommendation from prior fixture data)
+2. User plays one loop, raw median = -33 ms (huge swing from prior +120)
+3. Validator recommends mic_latency=0 (sign error in our model)
+
+What happened: the user wasn't told to ignore the timing labels. After
+applying 120, the highway showed previously-late hits as on-time, and
+late hits as worse. The user unconsciously plucked earlier to chase
+green labels. Raw timing shifted by ~150 ms — not because the rig
+drifted, but because the user drifted.
+
+**Solution**: when calibrating against play history, ask the user to play
+WITHOUT looking at timing colors. Once they did, raw median was stable
+at +131 ms across 7 loops with σ=12 ms across-loop variation.
+
+**Don't**: treat consecutive recommendations as drift signal until you've
+confirmed the user wasn't watching the labels.
+
+**Do**: document this contamination mode in instructions. The validator
+can't tell adaptive playing from rig drift; only the user can.
+
+### Iteration converges over multiple uncontaminated sessions
+
+This session's recommendation history:
+- Initial fixture data: +174 ms
+- Loop 1 after applying 95: -33 ms (contaminated, user adapting)
+- 7 uncontaminated loops: +131 ms
+
+Don't lock on any single run. The truth is the cluster across multiple
+uncontaminated sessions. Once the std of recommendations across recent
+sessions drops below the per-session resolution, you're done.
+
+### Don't conflate slopsmith bugs with calibration bugs
+
+User reported "visuals half a second off" after pause-glitch during a
+session. avOffset was unchanged (verified at 2 ms via API), mic_latency
+only affects label numbers (not visual position). The drift was
+slopsmith's pause/resume not cleanly stopping the audio element — chart
+clock and audio element fell out of sync. Hard reload restores them.
+
+This is a slopsmith-side bug, not notedetect. Don't try to fix it via
+calibration knobs.
 
 ## Order of trust (most → least)
 

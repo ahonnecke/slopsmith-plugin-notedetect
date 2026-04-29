@@ -2380,6 +2380,40 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
     return { string: fallback.string, fret: fallback.fret, displayMidi: detectedMidi };
 }
 
+// Poll the server for calibration values staged by `make calibrate-from-history
+// --apply`. Picks up the value without requiring a devtools paste. Tracks the
+// last-applied stagedAt timestamp so re-applying the same value is a no-op
+// (idempotent, won't spam the calibrated event).
+let _ndLastAppliedCalibStagedAt = 0;
+async function _ndPollPendingCalibration() {
+    try {
+        const resp = await fetch('/api/plugins/note_detect/calibration', { cache: 'no-store' });
+        if (!resp.ok) return;
+        const body = await resp.json();
+        if (body.micLatencyMs === null || body.micLatencyMs === undefined) return;
+        if (!body.stagedAt || body.stagedAt <= _ndLastAppliedCalibStagedAt) return;
+        const newValue = Number(body.micLatencyMs);
+        if (!isFinite(newValue) || newValue < 0) return;
+        if (newValue === _ndMicLatencyMs) {
+            // Already applied locally (e.g. user pasted manually); just record
+            // that we've seen this stagedAt so we don't re-emit the event.
+            _ndLastAppliedCalibStagedAt = body.stagedAt;
+            return;
+        }
+        _ndMicLatencyMs = newValue;
+        _ndLastAppliedCalibStagedAt = body.stagedAt;
+        _ndSaveSettings();
+        console.log(`[note_detect] Mic latency applied via server staging: ${newValue} ms`);
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: newValue });
+        }
+    } catch (e) {
+        // Network/parse errors are silent — this is a background poll.
+    }
+}
+_ndPollPendingCalibration();
+setInterval(_ndPollPendingCalibration, 30_000);
+
 // Strictness presets. Each level pins pitch + timing tolerance and the
 // dirty-hit threshold (max fraction of off-target frames before a hit
 // downgrades to DIRTY_HIT).
