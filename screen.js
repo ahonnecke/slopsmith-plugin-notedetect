@@ -5044,35 +5044,91 @@ function _ndWizComputeRun(beats, detections, mode) {
         return { beatT, dt: pickedDt, detection: picked };
     });
 
-    // Two-stage outlier rejection. Pure-σ alone fails on bimodal data.
-    // Stage 1: hard cap at ±_ND_WIZ_HARD_CAP_MS — drops half-beat aliases
-    // and reaction-time responses. Stage 2: 2σ on the survivors.
+    // Bimodal estimator. Humans land in one of two stable strategies when
+    // asked to play on a click: (a) anticipate — pluck on/near the beat;
+    // (b) react — pluck full reaction-time after the beat. Either yields
+    // the calibration value; we just have to know which mode the user
+    // was in for each pluck.
+    //
+    //   Anticipation cluster:  dt in (-150, +150) ms — pluck near beat.
+    //   Reaction cluster:      dt in (+150/+200, +350/+400) ms (mode-dep)
+    //                          → adjusted = median - reaction_time_const
+    //   Out-of-range:          everything else (off-beat, half-beat alias).
+    //
+    // When BOTH clusters are populated and their estimates agree within
+    // 60 ms we declare convergent and confidence is high — the answer is
+    // encoded twice and matches. When only one cluster has data, we use
+    // it; reaction-only is medium confidence (depends on the constant).
+    //
+    // Reaction-time constants: typical real-world simple reaction time is
+    // ~200 ms for auditory stimuli, ~250 ms for visual (Welford 1980,
+    // Kosinski 2008 surveys). User-tunable later if data warrants it.
     const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
-    const HARD_CAP_MS = _ND_WIZ_HARD_CAP_MS;
-    const inCap = dts.filter(dt => Math.abs(dt) <= HARD_CAP_MS);
-    const droppedHardCap = dts.length - inCap.length;
+    const REACTION_TIME_MS = mode === 'visual' ? 250 : 200;
+    const ANTI_LO = -150, ANTI_HI = 150;
+    const REACT_LO = mode === 'visual' ? 200 : 150;
+    const REACT_HI = mode === 'visual' ? 400 : 350;
 
-    let used = inCap;
-    let droppedOutliers = 0;
-    if (inCap.length >= 4) {
-        const mean = inCap.reduce((s, x) => s + x, 0) / inCap.length;
-        const variance = inCap.reduce((s, x) => s + (x - mean) * (x - mean), 0) / inCap.length;
-        const std = Math.sqrt(variance);
-        used = inCap.filter(x => Math.abs(x - mean) <= 2 * std);
-        droppedOutliers = inCap.length - used.length;
+    const anticipation = dts.filter(d => d >= ANTI_LO && d <= ANTI_HI);
+    const reaction = dts.filter(d => d > REACT_LO && d <= REACT_HI);
+    const outOfRange = dts.length - anticipation.length - reaction.length;
+
+    const median = arr => {
+        if (!arr.length) return null;
+        const s = arr.slice().sort((a, b) => a - b);
+        return s[Math.floor(s.length / 2)];
+    };
+    const anticipationMedian = median(anticipation);
+    const reactionMedian = median(reaction);
+    const reactionAdjusted = reactionMedian !== null
+        ? reactionMedian - REACTION_TIME_MS
+        : null;
+
+    let medianDt = null;
+    let usedCluster = 'none';
+    let confidence = 'low';
+    let convergent = false;
+
+    if (anticipationMedian !== null) {
+        medianDt = anticipationMedian;
+        usedCluster = 'anticipation';
+        confidence = anticipation.length >= 3 ? 'high' : 'medium';
+        if (reactionAdjusted !== null
+            && Math.abs(anticipationMedian - reactionAdjusted) < 60) {
+            convergent = true;
+            confidence = 'high';
+            usedCluster = 'both';
+            // Sample-weighted mean of the two estimates.
+            const total = anticipation.length + reaction.length;
+            medianDt = Math.round(
+                (anticipationMedian * anticipation.length
+                 + reactionAdjusted * reaction.length) / total
+            );
+        }
+    } else if (reactionAdjusted !== null) {
+        medianDt = reactionAdjusted;
+        usedCluster = 'reaction';
+        confidence = reaction.length >= 3 ? 'medium' : 'low';
     }
-    const sorted = used.slice().sort((a, b) => a - b);
-    const medianDt = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
 
-    const minUsable = Math.max(4, Math.floor(perBeat.length * 0.4));
-    const lowQuality = used.length < minUsable;
+    const lowQuality = medianDt === null;
 
     return {
-        perBeat, medianDt, droppedOutliers, droppedHardCap,
+        perBeat, medianDt,
+        anticipationMedian, anticipationCount: anticipation.length,
+        reactionMedian, reactionAdjusted, reactionCount: reaction.length,
+        outOfRangeCount: outOfRange,
+        convergent, confidence, usedCluster,
+        reactionTimeConstMs: REACTION_TIME_MS,
+        antiBounds: [ANTI_LO, ANTI_HI],
+        reactBounds: [REACT_LO, REACT_HI],
+        // Legacy field names preserved so existing UI / tests don't break.
+        droppedHardCap: outOfRange,
+        droppedOutliers: 0,
         droppedNoDetection: perBeat.length - dts.length,
-        usedCount: used.length,
+        usedCount: anticipation.length + reaction.length,
         lowQuality,
-        hardCapMs: HARD_CAP_MS,
+        hardCapMs: _ND_WIZ_HARD_CAP_MS,  // legacy, no longer the actual cap
         mode,
     };
 }
@@ -5254,8 +5310,8 @@ function _ndWizRender() {
         const latApplied = Math.max(0, latRaw);
 
         const warnings = [];
-        if (v !== null && v < -40) warnings.push(`Visual run median is ${Math.round(v)} ms — detection landed before the flash on most beats. You're likely anticipating the beat rather than playing on it.`);
-        if (a !== null && a < -40) warnings.push(`Audio run median is ${Math.round(a)} ms — same pattern.`);
+        if (vRun && !v && v !== 0) warnings.push('Visual run produced no usable cluster — every pluck was off-beat (outside both anticipation and reaction windows).');
+        if (aRun && !a && a !== 0) warnings.push('Audio run produced no usable cluster — every pluck was off-beat.');
         if (latRaw < 0) warnings.push(`Plugin Audio Latency clamped from ${latRaw} to <strong>${latApplied}</strong> (physical latency can't be negative).`);
         if (avRaw !== avApplied) warnings.push(`A/V Sync Offset clamped from ${avRaw} to <strong>${avApplied}</strong> (out of ±1000 ms range).`);
 
@@ -5268,31 +5324,22 @@ function _ndWizRender() {
 
         const perBeatTable = (run, label) => {
             if (!run) return '';
-            const cap = run.hardCapMs || _ND_WIZ_HARD_CAP_MS;
-            // Recompute the inCap → used pipeline so we can tag each row
-            // exactly as it was tagged at finishRun time.
-            const dts = run.perBeat.filter(x => x.dt !== null).map(x => x.dt);
-            const inCap = dts.filter(dt => Math.abs(dt) <= cap);
-            let mean = 0, std = 0;
-            if (inCap.length >= 4) {
-                mean = inCap.reduce((s, x) => s + x, 0) / inCap.length;
-                std = Math.sqrt(inCap.reduce((s, x) => s + (x - mean) * (x - mean), 0) / inCap.length);
-            }
+            const [antiLo, antiHi] = run.antiBounds || [-150, 150];
+            const [reactLo, reactHi] = run.reactBounds || [150, 350];
             const tag = (dt) => {
                 if (dt === null) return { kind: 'none', label: '' };
-                if (Math.abs(dt) > cap) return { kind: 'cap', label: 'off-beat / reacted' };
-                if (inCap.length >= 4 && Math.abs(dt - mean) > 2 * std) {
-                    return { kind: 'sigma', label: 'outlier' };
-                }
-                return { kind: 'used', label: '' };
+                if (dt >= antiLo && dt <= antiHi) return { kind: 'anti', label: 'anticipation' };
+                if (dt > reactLo && dt <= reactHi) return { kind: 'react', label: 'reaction' };
+                return { kind: 'out', label: 'off-beat' };
             };
             const rows = run.perBeat.map((b, i) => {
                 const dtTxt = b.dt === null ? '<span class="text-gray-600">no detection</span>'
                     : `<span class="text-gray-200 font-mono">${b.dt >= 0 ? '+' : ''}${Math.round(b.dt)} ms</span>`;
                 const note = b.detection ? noteName(b.detection.midi) : '—';
                 const t = tag(b.dt);
-                const rowCls = t.kind === 'cap' ? 'text-orange-400'
-                             : t.kind === 'sigma' ? 'text-yellow-400'
+                const rowCls = t.kind === 'anti' ? 'text-green-300'
+                             : t.kind === 'react' ? 'text-blue-300'
+                             : t.kind === 'out' ? 'text-orange-400'
                              : '';
                 return `
                     <tr class="${rowCls}">
@@ -5302,29 +5349,58 @@ function _ndWizRender() {
                         <td class="py-0.5 text-[10px]">${t.label}</td>
                     </tr>`;
             }).join('');
-            const warning = run.lowQuality
-                ? `<p class="text-[11px] text-orange-400 mt-2 leading-tight"><strong>Low-quality run:</strong> only ${run.usedCount} of ${run.perBeat.length} beats survived filtering. Most plucks landed >${cap} ms off the click — you may have been reacting to clicks instead of anticipating, or off by half a beat. Consider re-running.</p>`
-                : '';
+            const clusterSummary = `${run.anticipationCount || 0} anticipation · ${run.reactionCount || 0} reaction · ${run.outOfRangeCount || 0} off-beat · ${run.droppedNoDetection} no-detection`;
+            const reasoning = (() => {
+                if (!run.medianDt && run.medianDt !== 0) {
+                    return `<p class="text-[11px] text-orange-400 mt-2 leading-tight"><strong>No usable data.</strong> Every pluck landed outside both the anticipation window (${antiLo} to ${antiHi} ms) and the reaction window (${reactLo} to ${reactHi} ms). You may be off by a half-beat — listen for the count, then play on the GO.</p>`;
+                }
+                const aMed = run.anticipationMedian;
+                const rMed = run.reactionMedian;
+                const rAdj = run.reactionAdjusted;
+                const rt = run.reactionTimeConstMs;
+                if (run.usedCluster === 'both') {
+                    return `<p class="text-[11px] text-green-300 mt-2 leading-tight"><strong>Convergent.</strong> Anticipation cluster median = ${Math.round(aMed)} ms; reaction cluster median = ${Math.round(rMed)} ms (− ${rt} ms typical reaction = ${Math.round(rAdj)} ms). Both estimates agree → final = ${Math.round(run.medianDt)} ms.</p>`;
+                }
+                if (run.usedCluster === 'anticipation') {
+                    const reactBlurb = rMed !== null ? ` Reaction cluster gave ${Math.round(rAdj)} ms (median ${Math.round(rMed)} − ${rt}); divergent, so we trusted the anticipation measurement.` : '';
+                    return `<p class="text-[11px] text-gray-400 mt-2 leading-tight"><strong>Anticipation cluster:</strong> median of ${run.anticipationCount} clean pluck(s) on the beat = ${Math.round(aMed)} ms.${reactBlurb}</p>`;
+                }
+                if (run.usedCluster === 'reaction') {
+                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms typical reaction = ${Math.round(rAdj)} ms. Medium confidence — depends on the reaction-time constant being right for you.</p>`;
+                }
+                return '';
+            })();
             return `
                 <details class="mb-3 bg-dark-800 rounded-xl p-3 text-xs">
-                    <summary class="cursor-pointer text-gray-300 font-semibold">${label} · per-beat data (${run.usedCount} of ${run.perBeat.length} used)</summary>
+                    <summary class="cursor-pointer text-gray-300 font-semibold">${label} · per-beat data (${run.usedCount} of ${run.perBeat.length} clustered)</summary>
                     <table class="mt-2 w-full text-xs">
                         <thead class="text-gray-500 text-left">
                             <tr><th class="pr-2">#</th><th class="pr-2">dt</th><th class="pr-2">detected</th><th></th></tr>
                         </thead>
                         <tbody>${rows}</tbody>
                     </table>
-                    <p class="text-[10px] text-gray-600 mt-2 leading-tight">
-                        ${run.droppedNoDetection} no detection · ${run.droppedHardCap || 0} dropped as off-beat (>±${cap} ms) · ${run.droppedOutliers} dropped as ${'σ'} outliers · median of the remaining is the run's value.
-                    </p>
-                    ${warning}
+                    <p class="text-[10px] text-gray-600 mt-2 leading-tight">${clusterSummary}</p>
+                    ${reasoning}
                 </details>`;
+        };
+
+        const confLabel = (run) => {
+            if (!run || !run.confidence) return '';
+            const c = run.confidence;
+            const tag = c === 'high' ? 'text-green-300'
+                      : c === 'medium' ? 'text-yellow-300'
+                      : 'text-orange-400';
+            const src = run.usedCluster === 'both' ? 'convergent'
+                      : run.usedCluster === 'anticipation' ? 'anticipation'
+                      : run.usedCluster === 'reaction' ? 'reaction-adj'
+                      : '—';
+            return `<span class="${tag} text-[10px] uppercase tracking-wide">${c}</span> <span class="text-gray-500 text-[10px]">${src}</span>`;
         };
 
         modal.innerHTML = wrap(`
             <div class="bg-dark-800 rounded-xl p-3 mb-3 space-y-2 text-sm">
-                <div class="flex justify-between"><span class="text-gray-400">Visual run (dt_v, n=${vRun ? vRun.usedCount : 0})</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
-                <div class="flex justify-between"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0})</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
+                <div class="flex justify-between items-baseline"><span class="text-gray-400">Visual run (dt_v, n=${vRun ? vRun.usedCount : 0}) ${confLabel(vRun)}</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
+                <div class="flex justify-between items-baseline"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0}) ${confLabel(aRun)}</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
                 <hr class="border-gray-700">
                 <div class="flex justify-between"><span class="text-gray-300">A/V Sync Offset (= V − A)</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
                 <div class="flex justify-between"><span class="text-gray-300">Plugin Audio Latency</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
@@ -5335,7 +5411,7 @@ function _ndWizRender() {
                 <div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-[11px] text-yellow-200 leading-tight space-y-1">
                     ${warnings.map(w => `<div>${w}</div>`).join('')}
                 </div>` : ''}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight"><span class="text-orange-400">Orange</span> rows = off-beat (&gt;±${_ND_WIZ_HARD_CAP_MS} ms) — half-beat aliases or reaction-time responses. <span class="text-yellow-400">Yellow</span> rows = σ outliers among what survived the cap. Both are dropped before computing the median. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if the number still feels off.</p>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight"><span class="text-green-300">Green</span> rows = anticipation (pluck on/near the beat). <span class="text-blue-300">Blue</span> rows = reaction-cluster (pluck ~reaction-time after the click — adjusted by subtracting typical reaction time). <span class="text-orange-400">Orange</span> rows = off-beat / half-beat alias, discarded. Both clusters carry the calibration signal; when both are populated and agree we declare convergent. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if it still feels off.</p>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
                 <button onclick="_ndWizStep='intro'; _ndWizRender()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Re-run</button>
