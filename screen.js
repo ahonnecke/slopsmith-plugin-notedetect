@@ -5872,16 +5872,26 @@ function _ndCoachingLabel(v, total) {
 }
 
 async function _ndUpdateCoachingPanel() {
-    const loop = (typeof window.getActiveLoop === 'function') ? window.getActiveLoop() : null;
     const songId = _ndCurrentSongId();
-    if (!loop || !songId) {
+    if (!songId) {
         const existing = document.getElementById('nd-coaching-panel');
         if (existing) existing.remove();
         return;
     }
+    const loop = (typeof window.getActiveLoop === 'function') ? window.getActiveLoop() : null;
     try {
         const plays = await _ndFetchPlays(songId);
-        const items = _ndPerNoteCoaching(plays, loop.startSec, loop.endSec);
+        if (!plays || plays.length < 2) {
+            // Need at least 2 plays for any meaningful per-note coaching.
+            const existing = document.getElementById('nd-coaching-panel');
+            if (existing) existing.remove();
+            return;
+        }
+        const items = _ndPerNoteCoaching(
+            plays,
+            loop ? loop.startSec : undefined,
+            loop ? loop.endSec : undefined,
+        );
         _ndRenderCoachingPanel(items, loop);
     } catch (e) {
         console.warn('[note_detect] Coaching update failed:', e);
@@ -5901,15 +5911,21 @@ function _ndRenderCoachingPanel(items, loop) {
         panel.style.top = '120px';
         document.body.appendChild(panel);
     }
-    const startMmSs = `${Math.floor(loop.startSec / 60)}:${String(Math.floor(loop.startSec % 60)).padStart(2, '0')}`;
-    const endMmSs = `${Math.floor(loop.endSec / 60)}:${String(Math.floor(loop.endSec % 60)).padStart(2, '0')}`;
+    let scopeText;
+    if (loop) {
+        const startMmSs = `${Math.floor(loop.startSec / 60)}:${String(Math.floor(loop.startSec % 60)).padStart(2, '0')}`;
+        const endMmSs = `${Math.floor(loop.endSec / 60)}:${String(Math.floor(loop.endSec % 60)).padStart(2, '0')}`;
+        scopeText = `Loop ${startMmSs}–${endMmSs}`;
+    } else {
+        scopeText = `Whole song · top ${Math.min(items.length, 8)} of ${items.length}`;
+    }
     const top = items.slice(0, 8);
     panel.innerHTML = `
         <div class="flex items-center justify-between mb-2 pb-1 border-b border-gray-700">
             <div class="text-gray-300 font-semibold">Practice coaching</div>
             <button id="nd-coaching-close" class="text-gray-500 hover:text-gray-300 text-base leading-none">×</button>
         </div>
-        <div class="text-gray-500 text-[10px] mb-2">Loop ${startMmSs}–${endMmSs}</div>
+        <div class="text-gray-500 text-[10px] mb-2">${scopeText}</div>
         <div class="space-y-1.5">
             ${top.map(it => {
                 const tStr = `${Math.floor(it.chartT / 60)}:${String(Math.floor(it.chartT % 60)).padStart(2, '0')}.${String(Math.floor((it.chartT % 1) * 10))}`;
@@ -6750,6 +6766,10 @@ async function _ndToggle() {
         // player missed last time glow as they approach. Fire-and-forget;
         // glow renders only after the fetch resolves.
         _ndLoadTroubleFromDisk();
+        // Also surface the per-note coaching panel for this song's history
+        // even before the user starts a loop. Whole-song view shows top
+        // problem notes; useful for "what should I focus on?" during play.
+        _ndUpdateCoachingPanel();
     } else {
         _ndStopAudio();
         _ndStopHUD();
@@ -11589,6 +11609,8 @@ setInterval(() => {
         // Switching songs while detect is on left the user with no glow
         // until they completed a full loop.
         _ndLoadTroubleFromDisk();
+        // Refresh coaching panel for the new song. Auto-hides if no history.
+        _ndUpdateCoachingPanel();
     };
 })();
 
