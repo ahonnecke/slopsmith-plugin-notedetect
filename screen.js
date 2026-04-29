@@ -888,11 +888,11 @@ function _ndSnapshotPlay(reason) {
         // overwrite uses all recent plays, so notes consistently missed
         // across multiple loops glow harder than one-off mistakes.
         if (reason === 'loop_restart') {
-            _ndLoadTroubleFromDisk();
-            _ndMaybeSuggestPracticeLoop();
-            _ndUpdateCoachingPanel();
-            _ndUpdateTimeline();
-            _ndUpdateFretboardHeatmap();
+            // Sequence the panel updates instead of firing concurrently.
+            // Concurrent fetch + heavy compute + DOM rebuilds were
+            // hard-freezing Firefox. Awaiting each lets the event loop
+            // breathe between expensive renders.
+            _ndRunPracticePanelUpdates();
         }
     })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
@@ -6186,7 +6186,52 @@ function _ndComputeTimelineBins(plays, binCount, minT, maxT) {
 let _ndTimelineState = null;   // {minT, maxT, bins} cached between renders
 let _ndTimelineRaf = null;
 
+// In-flight locks to prevent re-entrant panel updates. Triggers fire
+// concurrently on loop_restart (coaching + timeline + heatmap + practice
+// banner all on the same hook), and on Firefox the combined fetch + heavy
+// compute + DOM rebuild was hard-freezing the tab. Each update fn checks
+// its lock at entry and skips if already running.
+let _ndUpdatingTimeline = false;
+let _ndUpdatingHeatmap = false;
+let _ndUpdatingCoaching = false;
+let _ndUpdatingPracticeLoop = false;
+let _ndRunningPracticePanels = false;
+let _ndPracticePanelsPending = false;
+
+// Run the four practice-related panel updates sequentially, with a
+// requestAnimationFrame yield between each so the event loop stays
+// responsive. Coalesces rapid triggers: if updates are already running,
+// the next call sets a "do another pass when current finishes" flag.
+async function _ndRunPracticePanelUpdates() {
+    if (_ndRunningPracticePanels) {
+        _ndPracticePanelsPending = true;
+        return;
+    }
+    _ndRunningPracticePanels = true;
+    try {
+        do {
+            _ndPracticePanelsPending = false;
+            await _ndMaybeSuggestPracticeLoop();
+            await new Promise(r => requestAnimationFrame(r));
+            await _ndUpdateCoachingPanel();
+            await new Promise(r => requestAnimationFrame(r));
+            await _ndUpdateTimeline();
+            await new Promise(r => requestAnimationFrame(r));
+            await _ndUpdateFretboardHeatmap();
+        } while (_ndPracticePanelsPending);
+    } catch (e) {
+        console.warn('[note_detect] Practice panels update failed:', e);
+    } finally {
+        _ndRunningPracticePanels = false;
+    }
+}
+
 async function _ndUpdateTimeline() {
+    if (_ndUpdatingTimeline) return;
+    _ndUpdatingTimeline = true;
+    try { return await _ndUpdateTimelineInner(); } finally { _ndUpdatingTimeline = false; }
+}
+async function _ndUpdateTimelineInner() {
     const songId = _ndCurrentSongId();
     if (!songId) {
         _ndRemoveTimeline();
@@ -6370,6 +6415,11 @@ function _ndComputeFretboardHeatmap(plays, opts) {
 }
 
 async function _ndUpdateFretboardHeatmap() {
+    if (_ndUpdatingHeatmap) return;
+    _ndUpdatingHeatmap = true;
+    try { return await _ndUpdateFretboardHeatmapInner(); } finally { _ndUpdatingHeatmap = false; }
+}
+async function _ndUpdateFretboardHeatmapInner() {
     const songId = _ndCurrentSongId();
     if (!songId) {
         _ndRemoveFretboardHeatmap();
@@ -6474,6 +6524,11 @@ function _ndRenderFretboardHeatmap(grid, stringCount, maxFret) {
 }
 
 async function _ndUpdateCoachingPanel() {
+    if (_ndUpdatingCoaching) return;
+    _ndUpdatingCoaching = true;
+    try { return await _ndUpdateCoachingPanelInner(); } finally { _ndUpdatingCoaching = false; }
+}
+async function _ndUpdateCoachingPanelInner() {
     const songId = _ndCurrentSongId();
     if (!songId) {
         const existing = document.getElementById('nd-coaching-panel');
@@ -6594,6 +6649,11 @@ function _ndRenderCoachingPanel(items, loop) {
 // covers it — re-suggesting the same hotspot during the loop they just
 // set up would be obnoxious.
 async function _ndMaybeSuggestPracticeLoop() {
+    if (_ndUpdatingPracticeLoop) return;
+    _ndUpdatingPracticeLoop = true;
+    try { return await _ndMaybeSuggestPracticeLoopInner(); } finally { _ndUpdatingPracticeLoop = false; }
+}
+async function _ndMaybeSuggestPracticeLoopInner() {
     const songId = _ndCurrentSongId();
     if (!songId) return;
     try {
@@ -7408,9 +7468,7 @@ async function _ndToggle() {
         // this song's history even before the user starts a loop. Whole-song
         // views show problem zones; useful for "what should I focus on?"
         // during play.
-        _ndUpdateCoachingPanel();
-        _ndUpdateTimeline();
-        _ndUpdateFretboardHeatmap();
+        _ndRunPracticePanelUpdates();
     } else {
         _ndStopAudio();
         _ndStopHUD();
@@ -12252,9 +12310,7 @@ setInterval(() => {
         _ndLoadTroubleFromDisk();
         // Refresh coaching panel + timeline + fretboard heatmap for the
         // new song. All auto-hide if no history exists.
-        _ndUpdateCoachingPanel();
-        _ndUpdateTimeline();
-        _ndUpdateFretboardHeatmap();
+        _ndRunPracticePanelUpdates();
     };
 })();
 
