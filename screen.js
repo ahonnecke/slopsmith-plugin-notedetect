@@ -965,11 +965,21 @@ function _ndAggregatePlays(plays) {
         return bx - ax;
     });
     const playMeta = plays.map((p, i) => {
-        const ts = (p.noteResults || []).map(r => r.chartT).filter(t => Number.isFinite(t));
+        // Manual min/max instead of Math.min(...ts) — spread on large
+        // arrays risks call-stack exhaustion. Defensive against songs
+        // with thousands of notes.
+        let chartTMin = Infinity, chartTMax = -Infinity, count = 0;
+        for (const r of (p.noteResults || [])) {
+            const t = r.chartT;
+            if (!Number.isFinite(t)) continue;
+            if (t < chartTMin) chartTMin = t;
+            if (t > chartTMax) chartTMax = t;
+            count++;
+        }
         return {
             idx: i, playId: p.playId, startedAt: p.startedAt, reason: p.reason,
-            chartTMin: ts.length ? Math.min(...ts) : null,
-            chartTMax: ts.length ? Math.max(...ts) : null,
+            chartTMin: count ? chartTMin : null,
+            chartTMax: count ? chartTMax : null,
             count: (p.noteResults || []).length,
         };
     });
@@ -1021,8 +1031,11 @@ function _ndSuggestLoops(rows, opts = {}) {
             minTroubleNotes = 2, maxLoops = 5, padHeadSec = 0.5, padTailSec = 1.0 } = opts;
     const noteList = rows.map(r => ({ ...r, ...(_ndStatsForRow(r)) })).filter(r => r.nAttempts >= 2);
     if (noteList.length === 0) return [];
-    const minT = Math.min(...noteList.map(n => n.chartT));
-    const maxT = Math.max(...noteList.map(n => n.chartT));
+    let minT = Infinity, maxT = -Infinity;
+    for (const n of noteList) {
+        if (n.chartT < minT) minT = n.chartT;
+        if (n.chartT > maxT) maxT = n.chartT;
+    }
     const candidates = [];
     for (let start = minT - windowSec / 2; start <= maxT + windowSec / 2; start += slideSec) {
         const end = start + windowSec;
@@ -5794,7 +5807,14 @@ function _ndShowIterationBanner(noteResults) {
 // Pure compute fn so it's testable. Returns array of:
 //   { chartT, s, f, attempts, hits, miss, label, severity }
 // sorted by severity desc, then chartT asc.
-function _ndPerNoteCoaching(plays, loopStart, loopEnd) {
+function _ndPerNoteCoaching(plays, loopStart, loopEnd, opts) {
+    opts = opts || {};
+    // Coaching's "off-time" threshold should match the user's strictness
+    // preset. Hard-coded 50 ms made the coaching panel angry at 80 ms
+    // hits even when rocksmith mode considered them perfectly fine.
+    const timingThresholdMs = opts.timingThresholdMs
+        || (typeof _ndPerfectTimingMs === 'number' && _ndPerfectTimingMs > 0
+            ? _ndPerfectTimingMs : 50);
     const byKey = new Map();
     for (const play of (plays || [])) {
         for (const r of (play.noteResults || [])) {
@@ -5836,7 +5856,7 @@ function _ndPerNoteCoaching(plays, loopStart, loopEnd) {
         const total = v.attempts;
         const hitCount = v.hits + v.dirtyHits;
         const missCount = v.missNo + v.missWrong;
-        const label = _ndCoachingLabel(v, total);
+        const label = _ndCoachingLabel(v, total, timingThresholdMs);
         if (!label) continue;
         out.push({
             chartT: v.chartT, s: v.s, f: v.f,
@@ -5849,7 +5869,8 @@ function _ndPerNoteCoaching(plays, loopStart, loopEnd) {
     return out;
 }
 
-function _ndCoachingLabel(v, total) {
+function _ndCoachingLabel(v, total, timingThresholdMs) {
+    if (timingThresholdMs === undefined) timingThresholdMs = 50;
     // Failure-dominant first.
     if (v.missNo === total) return `Never registered (${v.missNo}/${total})`;
     if (v.missNo / total >= 0.5) return `Not playing (${v.missNo}/${total})`;
@@ -5861,10 +5882,13 @@ function _ndCoachingLabel(v, total) {
             ? `Wrong fret (${meanCents > 0 ? '+' : ''}${meanCents}¢, ${v.missWrong}/${total})`
             : `Wrong pitch (${v.missWrong}/${total})`;
     }
-    // Mostly hits — coach on timing if there's a consistent pattern.
+    // Mostly hits — coach on timing only when off-time exceeds the
+    // strictness preset's "perfect" threshold (200ms in rocksmith mode,
+    // 50ms in default, 25ms in strict). Otherwise the panel scolds the
+    // user about timings their selected difficulty considers fine.
     if (v.timingErrors.length >= 2) {
         const mean = v.timingErrors.reduce((s, x) => s + x, 0) / v.timingErrors.length;
-        if (Math.abs(mean) >= 50) {
+        if (Math.abs(mean) >= timingThresholdMs) {
             return mean > 0
                 ? `Late ~${Math.round(mean)} ms (${v.hits + v.dirtyHits}/${total})`
                 : `Early ~${Math.round(-mean)} ms (${v.hits + v.dirtyHits}/${total})`;
@@ -6070,13 +6094,22 @@ async function _ndUpdateTimeline() {
             _ndRemoveTimeline();
             return;
         }
-        const ts = notes.map(n => n.t).filter(t => isFinite(t));
-        if (!ts.length) {
+        // Manual min/max — Math.min(...arr) blows the call stack on large
+        // arrays (Firefox crash territory at ~500k args, but we're being
+        // defensive at any size). Songs with thousands of notes are real.
+        let minT = Infinity, maxT = -Infinity;
+        let count = 0;
+        for (const n of notes) {
+            const t = n.t;
+            if (!isFinite(t)) continue;
+            if (t < minT) minT = t;
+            if (t > maxT) maxT = t;
+            count++;
+        }
+        if (!count) {
             _ndRemoveTimeline();
             return;
         }
-        const minT = Math.min(...ts);
-        const maxT = Math.max(...ts);
         const binCount = 100;
         const bins = _ndComputeTimelineBins(plays, binCount, minT, maxT);
         _ndTimelineState = { minT, maxT, bins };
@@ -6139,9 +6172,16 @@ function _ndRenderTimelineStrip() {
 
 function _ndStartTimelinePlayheadLoop() {
     if (_ndTimelineRaf) return;
+    let lastFrac = -1;
     const tick = () => {
         if (!_ndTimelineState) {
             _ndTimelineRaf = null;
+            return;
+        }
+        // Skip the DOM write when tab is hidden — Firefox throttles RAF
+        // but doesn't stop it, and the queued style writes accumulate.
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+            _ndTimelineRaf = requestAnimationFrame(tick);
             return;
         }
         const head = document.getElementById('nd-timeline-playhead');
@@ -6151,7 +6191,13 @@ function _ndStartTimelinePlayheadLoop() {
             const span = maxT - minT;
             if (span > 0) {
                 const frac = Math.max(0, Math.min(1, (t - minT) / span));
-                head.style.left = `${(frac * 100).toFixed(2)}%`;
+                // Avoid touching the DOM if the playhead hasn't moved a
+                // visible pixel. Cuts ~60 layout invalidations/sec to
+                // roughly match real song-time changes.
+                if (Math.abs(frac - lastFrac) > 0.0005) {
+                    head.style.left = `${(frac * 100).toFixed(2)}%`;
+                    lastFrac = frac;
+                }
             }
         }
         _ndTimelineRaf = requestAnimationFrame(tick);
@@ -6333,6 +6379,7 @@ async function _ndUpdateCoachingPanel() {
             plays,
             loop ? loop.startSec : undefined,
             loop ? loop.endSec : undefined,
+            { timingThresholdMs: _ndPerfectTimingMs },
         );
         _ndRenderCoachingPanel(items, loop);
     } catch (e) {

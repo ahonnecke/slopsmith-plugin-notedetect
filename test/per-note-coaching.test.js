@@ -188,3 +188,42 @@ test('jitter around zero: not flagged as late or early', () => {
     const items = core.perNoteCoaching(plays);
     assert.equal(items.length, 0);
 });
+
+// ── Strictness threshold ────────────────────────────────────────────────
+
+test('80ms late: flagged in default mode (50ms threshold)', () => {
+    const plays = [
+        play(note({ primary: 'HIT', timingError: 80 })),
+        play(note({ primary: 'HIT', timingError: 85 })),
+    ];
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 50 });
+    assert.equal(items.length, 1);
+    assert.match(items[0].label, /Late/);
+});
+
+test('80ms late: NOT flagged in rocksmith mode (200ms threshold)', () => {
+    const plays = [
+        play(note({ primary: 'HIT', timingError: 80 })),
+        play(note({ primary: 'HIT', timingError: 85 })),
+    ];
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 200 });
+    assert.equal(items.length, 0);
+});
+
+test('250ms late: flagged even in rocksmith mode', () => {
+    const plays = [
+        play(note({ primary: 'HIT', timingError: 240 })),
+        play(note({ primary: 'HIT', timingError: 260 })),
+    ];
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 200 });
+    assert.equal(items.length, 1);
+});
+
+test('40ms late: flagged in strict mode (25ms threshold)', () => {
+    const plays = [
+        play(note({ primary: 'HIT', timingError: 40 })),
+        play(note({ primary: 'HIT', timingError: 35 })),
+    ];
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 25 });
+    assert.equal(items.length, 1);
+});
