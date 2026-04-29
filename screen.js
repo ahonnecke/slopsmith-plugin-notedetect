@@ -5354,33 +5354,46 @@ function _ndWizOnDetection() {
     }
 }
 
-async function _ndWizApplyMetro() {
-    const visualMs = _ndWizVisualOffsetMs !== null ? Math.round(_ndWizVisualOffsetMs) : null;
-    const audioMs  = _ndWizAudioOffsetMs  !== null ? Math.round(_ndWizAudioOffsetMs)  : null;
+// Each side of the wizard (mic latency, A/V offset) writes only when its
+// source run is solid enough to back the value. A high-confidence audio
+// run still applies the mic latency even if the visual run was sparse;
+// we don't drag the audio win down with bad visual data. Returns the
+// applied/skipped breakdown so the UI can show the user what changed.
+function _ndWizRunIsApplyable(run) {
+    if (!run || run.medianDt === null || run.medianDt === undefined) return false;
+    if (run.confidence === 'high') return true;
+    if (run.confidence === 'medium' && run.usedCount >= 3) return true;
+    return false;
+}
 
-    // Mic capture latency = audio run median dt (time from metronome click
-    // to onset detection). This IS the structural lateness baked into
-    // every live timingError — the gap between speaker output and the
-    // moment the mic chunk reaches the onset detector. Subtracted from
-    // highway labels and the prescription engine so the player sees
-    // their actual offset, not the hardware-stack delay.
-    if (audioMs !== null) {
-        const applied = Math.max(0, audioMs);
-        _ndMicLatencyMs = applied;
+async function _ndWizApplyMetro() {
+    const vRun = _ndWizVisualRun;
+    const aRun = _ndWizAudioRun;
+    const visualMs = vRun && vRun.medianDt !== null ? Math.round(vRun.medianDt) : null;
+    const audioMs  = aRun && aRun.medianDt !== null ? Math.round(aRun.medianDt)  : null;
+
+    const applied = [];
+    const skipped = [];
+
+    // Mic capture latency = audio run median dt. Apply only when the audio
+    // run is high confidence (convergent or thick anticipation cluster) or
+    // medium confidence with a usable sample count. Single-sample medium
+    // confidence is too noisy to commit.
+    if (_ndWizRunIsApplyable(aRun)) {
+        const value = Math.max(0, audioMs);
+        _ndMicLatencyMs = value;
         _ndSaveSettings();
-        console.log(`[note_detect] Mic latency calibrated: ${applied} ms (audio run median)`);
-        // Notify the system-settings panel so its mic-latency readout
-        // updates without a page reload.
+        applied.push(`mic latency = ${value} ms (audio run ${aRun.confidence}/${aRun.usedCluster}, n=${aRun.usedCount})`);
         if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
-            window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: applied });
+            window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: value });
         }
+    } else if (aRun) {
+        skipped.push(`mic latency (audio run too thin: confidence=${aRun.confidence}, n=${aRun.usedCount})`);
     }
 
-    // Slopsmith core A/V sync offset = (visual run − audio run). The
-    // direction: if dt_visual > dt_audio, your visual feedback is arriving
-    // later than your audio feedback, so visuals need to shift FORWARD —
-    // positive avOffset. If dt_audio > dt_visual, opposite (negative).
-    if (audioMs !== null && visualMs !== null) {
+    // A/V offset = visual_dt - audio_dt. Both sides need to be solid; this
+    // is a derivative of two measurements, so noise compounds. Strict gate.
+    if (_ndWizRunIsApplyable(aRun) && _ndWizRunIsApplyable(vRun)) {
         const raw = visualMs - audioMs;
         const avMs = Math.max(-1000, Math.min(1000, raw));
         try {
@@ -5390,8 +5403,18 @@ async function _ndWizApplyMetro() {
                 body: JSON.stringify({ av_offset_ms: avMs }),
             });
             if (typeof setAvOffsetMs === 'function') setAvOffsetMs(avMs);
-        } catch (e) { console.warn('A/V offset save failed:', e); }
+            applied.push(`A/V offset = ${avMs} ms`);
+        } catch (e) {
+            console.warn('A/V offset save failed:', e);
+            skipped.push(`A/V offset (network error: ${e.message || e})`);
+        }
+    } else if (vRun || aRun) {
+        const why = !_ndWizRunIsApplyable(vRun) ? 'visual' : 'audio';
+        skipped.push(`A/V offset (${why} run not high enough confidence)`);
     }
+
+    if (applied.length) console.log(`[note_detect] Calibration applied: ${applied.join('; ')}`);
+    if (skipped.length) console.log(`[note_detect] Calibration skipped: ${skipped.join('; ')}`);
 
     _ndResetScoring();
     _ndCloseWizard();
@@ -5603,13 +5626,20 @@ function _ndWizRender() {
             return `<span class="${tag} text-[10px] uppercase tracking-wide">${c}</span> <span class="text-gray-500 text-[10px]">${src}</span>`;
         };
 
+        const audioApplyable = _ndWizRunIsApplyable(aRun);
+        const visualApplyable = _ndWizRunIsApplyable(vRun);
+        const avApplyable = audioApplyable && visualApplyable;
+        const applyTag = (ok, why) => ok
+            ? '<span class="text-green-400 text-[10px] uppercase tracking-wide ml-2">will apply</span>'
+            : `<span class="text-orange-400 text-[10px] ml-2">skipped — ${why}</span>`;
+
         modal.innerHTML = wrap(`
             <div class="bg-dark-800 rounded-xl p-3 mb-3 space-y-2 text-sm">
                 <div class="flex justify-between items-baseline"><span class="text-gray-400">Visual run (dt_v, n=${vRun ? vRun.usedCount : 0}) ${confLabel(vRun)}</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
                 <div class="flex justify-between items-baseline"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0}) ${confLabel(aRun)}</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
                 <hr class="border-gray-700">
-                <div class="flex justify-between"><span class="text-gray-300">A/V Sync Offset (= V − A)</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
-                <div class="flex justify-between"><span class="text-gray-300">Plugin Audio Latency</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
+                <div class="flex justify-between items-baseline"><span class="text-gray-300">Plugin Audio Latency ${applyTag(audioApplyable, aRun ? `audio ${aRun.confidence}` : 'no run')}</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
+                <div class="flex justify-between items-baseline"><span class="text-gray-300">A/V Sync Offset (= V − A) ${applyTag(avApplyable, audioApplyable ? 'visual run too thin' : 'audio run too thin')}</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
             </div>
             ${perBeatTable(vRun, 'Visual')}
             ${perBeatTable(aRun, 'Audio')}

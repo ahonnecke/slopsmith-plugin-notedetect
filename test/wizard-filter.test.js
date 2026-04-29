@@ -362,3 +362,38 @@ test('keyboard: keypress after timeout window discarded', () => {
     assert.equal(result.dropped, 1);
     assert.equal(result.medianMs, null);
 });
+
+// ── Apply gate (which calibration values get committed) ────────────────
+
+test('apply gate: high confidence → applyable', () => {
+    const run = { medianDt: 22, confidence: 'high', usedCount: 4 };
+    assert.equal(core.wizRunIsApplyable(run), true);
+});
+
+test('apply gate: medium confidence with thick cluster → applyable', () => {
+    const run = { medianDt: 35, confidence: 'medium', usedCount: 4 };
+    assert.equal(core.wizRunIsApplyable(run), true);
+});
+
+test('apply gate: medium confidence with single sample → NOT applyable', () => {
+    // The user's exact case — visual medium with N=1 should not propagate
+    // to A/V offset. Test 17's data ran fine but applying its value would
+    // pollute slopsmith's state.
+    const run = { medianDt: -94, confidence: 'medium', usedCount: 1 };
+    assert.equal(core.wizRunIsApplyable(run), false);
+});
+
+test('apply gate: low confidence → NOT applyable', () => {
+    const run = { medianDt: 50, confidence: 'low', usedCount: 2 };
+    assert.equal(core.wizRunIsApplyable(run), false);
+});
+
+test('apply gate: null medianDt → NOT applyable', () => {
+    const run = { medianDt: null, confidence: 'low', usedCount: 0 };
+    assert.equal(core.wizRunIsApplyable(run), false);
+});
+
+test('apply gate: missing run → NOT applyable', () => {
+    assert.equal(core.wizRunIsApplyable(null), false);
+    assert.equal(core.wizRunIsApplyable(undefined), false);
+});
