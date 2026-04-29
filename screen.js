@@ -441,6 +441,17 @@ let _ndUserReactionAuditoryMs = 0;
 // than auditory for the same person, but the gap varies — measuring
 // directly avoids that error compounding into A/V offset.
 let _ndUserReactionVisualMs = 0;
+
+// Calibration history. Each wizard run appends one entry; stability is
+// computed over the last N high-confidence audio entries to decide whether
+// the rig is "locked" (further wizard runs are verification only) or
+// "drifting" (more data needed before trusting any single value). Entry
+// shape: { t, mode, medianMs, confidence, cluster, rtUsed }.
+let _ndCalibHistory = [];
+const _ND_CALIB_HISTORY_MAX = 20;   // soft cap on persisted entries
+const _ND_CALIB_LOCK_RUNS = 3;      // need 3 high-conf runs to lock
+const _ND_CALIB_LOCK_TOL_MS = 10;   // spread within ±this to lock
+const _ND_CALIB_DRIFT_TOL_MS = 10;  // newer run beyond this from locked → drift
 // Off by default — recording produces files (POSTed to the server, then to
 // /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
 // alongside the per-iteration play snapshots, e.g. for offline classifier
@@ -2133,6 +2144,7 @@ function _ndSaveSettings() {
             micLatencyMs: _ndMicLatencyMs,
             userReactionAuditoryMs: _ndUserReactionAuditoryMs,
             userReactionVisualMs: _ndUserReactionVisualMs,
+            calibHistory: _ndCalibHistory.slice(-_ND_CALIB_HISTORY_MAX),
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -2175,6 +2187,9 @@ function _ndLoadSettings() {
         }
         if (s.userReactionVisualMs !== undefined && isFinite(Number(s.userReactionVisualMs))) {
             _ndUserReactionVisualMs = Number(s.userReactionVisualMs);
+        }
+        if (Array.isArray(s.calibHistory)) {
+            _ndCalibHistory = s.calibHistory.slice(-_ND_CALIB_HISTORY_MAX);
         }
         // clickTrackOnly intentionally NOT loaded — it's a per-session
         // training toggle, not a persistent default. Reload starts with
@@ -5370,8 +5385,109 @@ function _ndWizFinishRun(mode) {
     if (mode === 'visual') _ndWizVisualRun = runResult;
     else if (mode === 'audio') _ndWizAudioRun = runResult;
 
+    _ndCalibAppendRun(mode, runResult);
+
     _ndWizStep = 'intro';
     _ndWizRender();
+}
+
+function _ndCalibAppendRun(mode, run) {
+    if (!run) return;
+    const entry = {
+        t: Date.now(),
+        mode,
+        medianMs: run.medianDt !== null && run.medianDt !== undefined ? Math.round(run.medianDt) : null,
+        confidence: run.confidence || 'low',
+        cluster: run.usedCluster || 'none',
+        rtUsed: mode === 'visual' ? _ndUserReactionVisualMs : _ndUserReactionAuditoryMs,
+    };
+    _ndCalibHistory.push(entry);
+    if (_ndCalibHistory.length > _ND_CALIB_HISTORY_MAX) {
+        _ndCalibHistory = _ndCalibHistory.slice(-_ND_CALIB_HISTORY_MAX);
+    }
+    _ndSaveSettings();
+}
+
+// Pure: stability over a calibration history. Filters by mode (default
+// 'audio' since that's what locks mic latency), picks high-confidence
+// runs only, returns one of:
+//   { status: 'insufficient', count, requiredCount, recentValues }
+//   { status: 'locked', lockedValue, stddev, recentValues }
+//   { status: 'drifting', stddev, recentValues, spread }
+//   { status: 'drift-warning', lockedValue, latestValue, recentValues }
+//
+// Status meanings:
+//   insufficient — fewer than _ND_CALIB_LOCK_RUNS high-conf runs. Keep
+//                  calibrating.
+//   locked       — last N runs are within tolerance. Calibration is
+//                  done; subsequent wizard runs are verification.
+//   drifting     — last N runs spread > tolerance. Either the rig is
+//                  unstable or playing variance dominates; more data
+//                  won't help, investigate.
+//   drift-warning — was previously locked at a stable value, latest run
+//                   moved beyond the drift tolerance. Setup may have
+//                   changed (different audio interface, OS update, etc).
+function _ndCalibComputeStability(history, opts) {
+    opts = opts || {};
+    const mode = opts.mode || 'audio';
+    const lockRuns = opts.lockRuns || _ND_CALIB_LOCK_RUNS;
+    const lockTol = opts.lockTolMs !== undefined ? opts.lockTolMs : _ND_CALIB_LOCK_TOL_MS;
+    const driftTol = opts.driftTolMs !== undefined ? opts.driftTolMs : _ND_CALIB_DRIFT_TOL_MS;
+
+    const highConf = (history || []).filter(e =>
+        e.mode === mode
+        && e.confidence === 'high'
+        && e.medianMs !== null
+        && e.medianMs !== undefined
+    );
+    if (highConf.length < lockRuns) {
+        return {
+            status: 'insufficient',
+            count: highConf.length,
+            requiredCount: lockRuns,
+            recentValues: highConf.map(e => e.medianMs),
+        };
+    }
+    const recent = highConf.slice(-lockRuns);
+    const values = recent.map(e => e.medianMs);
+    const mean = values.reduce((s, v) => s + v, 0) / values.length;
+    const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length;
+    const stddev = Math.sqrt(variance);
+    const spread = Math.max(...values) - Math.min(...values);
+
+    // If there's earlier history beyond `recent`, check whether the
+    // pre-latest window was locked and the latest entry diverges from it.
+    if (highConf.length > lockRuns) {
+        const earlier = highConf.slice(-lockRuns - 1, -1);
+        const earlierVals = earlier.map(e => e.medianMs);
+        const earlierMean = earlierVals.reduce((s, v) => s + v, 0) / earlierVals.length;
+        const earlierSpread = Math.max(...earlierVals) - Math.min(...earlierVals);
+        const latest = highConf[highConf.length - 1].medianMs;
+        if (earlierSpread <= lockTol && Math.abs(latest - earlierMean) > driftTol) {
+            return {
+                status: 'drift-warning',
+                lockedValue: Math.round(earlierMean),
+                latestValue: latest,
+                recentValues: values,
+                stddev: Math.round(stddev),
+            };
+        }
+    }
+
+    if (spread <= lockTol) {
+        return {
+            status: 'locked',
+            lockedValue: Math.round(mean),
+            stddev: Math.round(stddev * 10) / 10,
+            recentValues: values,
+        };
+    }
+    return {
+        status: 'drifting',
+        stddev: Math.round(stddev * 10) / 10,
+        spread,
+        recentValues: values,
+    };
 }
 
 // Wizard detections are sourced from two paths to maximise coverage:
@@ -5507,7 +5623,32 @@ function _ndWizRender() {
         const rtVis = _ndUserReactionVisualMs;
         const rtAudDone = rtAud > 0;
         const rtVisDone = rtVis > 0;
+        const stab = _ndCalibComputeStability(_ndCalibHistory, { mode: 'audio' });
+        const stabBlock = (() => {
+            if (stab.status === 'locked') {
+                return `<div class="bg-green-900/30 border border-green-800/50 rounded-xl p-3 mb-3 text-xs text-green-200 leading-tight">
+                    <strong>🔒 Calibration locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms ±${stab.stddev} ms</strong> · last 3 runs: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.
+                    <span class="text-gray-400">Further runs are verification — only re-run if your audio rig changed.</span>
+                </div>`;
+            }
+            if (stab.status === 'drift-warning') {
+                return `<div class="bg-orange-900/40 border border-orange-700/50 rounded-xl p-3 mb-3 text-xs text-orange-200 leading-tight">
+                    <strong>⚠ Drift detected</strong> · was locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms; latest run ${stab.latestValue >= 0 ? '+' : ''}${stab.latestValue} ms (Δ ${Math.abs(stab.latestValue - stab.lockedValue)} ms).
+                    Did your audio interface change? If not, re-run to confirm.
+                </div>`;
+            }
+            if (stab.status === 'drifting') {
+                return `<div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-xs text-yellow-200 leading-tight">
+                    <strong>Calibrating</strong> · last ${stab.recentValues.length} runs spread ${stab.spread} ms (σ ${stab.stddev}). Need 3 high-confidence runs within ±${_ND_CALIB_LOCK_TOL_MS} ms to lock.<br>
+                    <span class="text-gray-400">Recent: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.</span>
+                </div>`;
+            }
+            return `<div class="bg-dark-800/60 border border-gray-800 rounded-xl p-3 mb-3 text-xs text-gray-300 leading-tight">
+                <strong>Calibrating</strong> · ${stab.count} of ${stab.requiredCount} high-confidence audio runs collected.${stab.recentValues.length ? ` Recent: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.` : ''}
+            </div>`;
+        })();
         modal.innerHTML = wrap(`
+            ${stabBlock}
             <p class="text-sm text-gray-300 mb-2">Two reaction-time baselines (no instrument), then two bass tests.</p>
             <p class="text-[11px] text-gray-500 mb-4 leading-tight">Steps 1a/1b measure how fast you respond to a stimulus. Steps 2/3 measure your bass-pluck timing. Subtracting the personal reaction time isolates the mic pipeline from your reflexes.</p>
             <div class="space-y-2 mb-4">

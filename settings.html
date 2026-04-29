@@ -9,6 +9,7 @@
             <span class="text-sm text-gray-300 font-semibold">Mic capture latency</span>
             <span id="nd-settings-mic-latency-readout" class="text-sm font-mono text-gray-400">—</span>
         </div>
+        <div id="nd-settings-calib-status" class="text-[11px] mb-3 leading-tight"></div>
         <p class="text-[11px] text-gray-500 mb-3 leading-tight">
             Round-trip from speaker to onset detection. Hardware-dependent (USB ADC, OS audio stack, browser MediaStream).
             Subtracted from highway timing labels so what you see is your real offset, not the hardware delay.
@@ -19,8 +20,8 @@
             Calibrate latency
         </button>
         <p class="text-[10px] text-gray-500 mt-2 leading-tight">
-            Two phases: visual (count + GO dot) measures visual reaction, audio (count + GO tone) measures mic capture.
-            ~22 seconds per phase. Mic permission required.
+            Four phases: two reaction-time baselines (no instrument), then visual + audio bass tests.
+            Calibration locks after 3 high-confidence audio runs converge within ±10 ms.
         </p>
     </div>
 </div>
@@ -34,12 +35,33 @@
     const readoutEl = document.getElementById('nd-settings-mic-latency-readout');
     if (!readoutEl) return;
 
+    const statusEl = document.getElementById('nd-settings-calib-status');
+
+    function renderStatus(history) {
+        if (!statusEl) return;
+        if (typeof _ndCalibComputeStability !== 'function' || !Array.isArray(history)) {
+            statusEl.innerHTML = '';
+            return;
+        }
+        const stab = _ndCalibComputeStability(history, { mode: 'audio' });
+        if (stab.status === 'locked') {
+            statusEl.innerHTML = `<span class="text-green-300">🔒 Locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms ±${stab.stddev} ms</span> <span class="text-gray-500">(last 3: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms — verification only).</span>`;
+        } else if (stab.status === 'drift-warning') {
+            statusEl.innerHTML = `<span class="text-orange-300">⚠ Drift detected</span> <span class="text-gray-500">— was locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms, latest run ${stab.latestValue >= 0 ? '+' : ''}${stab.latestValue} ms.</span>`;
+        } else if (stab.status === 'drifting') {
+            statusEl.innerHTML = `<span class="text-yellow-300">Calibrating</span> <span class="text-gray-500">— ${stab.recentValues.length} runs spread ${stab.spread} ms (σ ${stab.stddev}).</span>`;
+        } else {
+            statusEl.innerHTML = `<span class="text-gray-400">${stab.count}/${stab.requiredCount} high-confidence runs collected — keep calibrating to lock.</span>`;
+        }
+    }
+
     function refresh() {
         try {
             const raw = localStorage.getItem('slopsmith_notedetect');
             if (!raw) {
                 readoutEl.textContent = 'not calibrated';
                 readoutEl.className = 'text-sm font-mono text-gray-500 italic';
+                if (statusEl) statusEl.innerHTML = '';
                 return;
             }
             const s = JSON.parse(raw);
@@ -51,6 +73,7 @@
                 readoutEl.textContent = `${Math.round(ms)} ms`;
                 readoutEl.className = 'text-sm font-mono text-green-400';
             }
+            renderStatus(s.calibHistory);
         } catch (e) {
             readoutEl.textContent = '—';
         }

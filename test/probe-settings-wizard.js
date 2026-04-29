@@ -213,7 +213,57 @@ async function main() {
         console.log(`[ok] button label would now read: "✓ ${Math.round(runResult.visualRun.medianDt)} ms"`);
     }
 
-    // Step 7: relevant console output
+    // Step 7: synthesize 3 high-confidence audio runs and assert the
+    // calibration history locks. Bypasses the bass-pluck pipeline by
+    // pushing detections directly — this validates the lock-state UI
+    // path without needing real audio input across multiple runs.
+    console.log('[step] simulating 3 convergent audio runs to test lock detection...');
+    const lockResult = await page.evaluate(async () => {
+        // Clear any existing history for a clean test.
+        _ndCalibHistory = [];
+        for (let runIdx = 0; runIdx < 3; runIdx++) {
+            _ndWizStartRun('audio');
+            const startedAt = performance.now();
+            let lastSeen = 0;
+            while (_ndWizStep === 'running-audio' && performance.now() - startedAt < 60000) {
+                const n = _ndWizBeats.length;
+                if (n > lastSeen) {
+                    const beatT = _ndWizBeats[n - 1];
+                    // Inject 6 beats × (anticipation + reaction) with
+                    // small jitter so confidence comes back 'high'
+                    // (convergent both-cluster).
+                    setTimeout(() => {
+                        _ndWizDetections.push({ time: beatT - 5 + runIdx, midi: 28 });
+                    }, 30);
+                    setTimeout(() => {
+                        _ndWizDetections.push({ time: beatT + 215 + runIdx, midi: 28 });
+                    }, 35);
+                    lastSeen = n;
+                }
+                await new Promise(r => setTimeout(r, 20));
+            }
+        }
+        const stab = _ndCalibComputeStability(_ndCalibHistory, { mode: 'audio' });
+        return {
+            historyLength: _ndCalibHistory.length,
+            audioEntries: _ndCalibHistory.filter(e => e.mode === 'audio').length,
+            highConfAudio: _ndCalibHistory.filter(e => e.mode === 'audio' && e.confidence === 'high').length,
+            recent: _ndCalibHistory.slice(-3).map(e => ({ mode: e.mode, m: e.medianMs, c: e.confidence })),
+            stability: stab,
+        };
+    });
+    console.log(`[info] history: total=${lockResult.historyLength} audio=${lockResult.audioEntries} high-conf=${lockResult.highConfAudio}`);
+    console.log(`[info] recent entries: ${JSON.stringify(lockResult.recent)}`);
+    console.log(`[info] stability: status=${lockResult.stability.status}${lockResult.stability.lockedValue !== undefined ? ` value=${lockResult.stability.lockedValue} σ=${lockResult.stability.stddev}` : ''}`);
+    const lockOk = lockResult.stability.status === 'locked'
+        && lockResult.highConfAudio >= 3;
+    if (!lockOk) {
+        console.log(`[FAIL] expected 3 high-conf audio runs to lock, got status=${lockResult.stability.status}, highConfAudio=${lockResult.highConfAudio}`);
+    } else {
+        console.log(`[ok] calibration locked at ${lockResult.stability.lockedValue >= 0 ? '+' : ''}${lockResult.stability.lockedValue} ms ±${lockResult.stability.stddev} after 3 convergent runs`);
+    }
+
+    // Step 8: relevant console output
     const ndLines = consoleLines.filter(l => /note_detect/i.test(l));
     if (ndLines.length) {
         console.log('--- plugin console output ---');
@@ -221,7 +271,7 @@ async function main() {
     }
 
     await browser.close();
-    process.exit(micUp && cardPresent && modalUp && runOk && kbdOk ? 0 : 1);
+    process.exit(micUp && cardPresent && modalUp && runOk && kbdOk && lockOk ? 0 : 1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

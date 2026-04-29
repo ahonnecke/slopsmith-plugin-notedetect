@@ -135,6 +135,7 @@ function loadDetectionCore() {
         wizComputeRun: sandbox._ndWizComputeRun,
         wizComputeKeyboardReaction: sandbox._ndWizComputeKeyboardReaction,
         wizRunIsApplyable: sandbox._ndWizRunIsApplyable,
+        calibComputeStability: sandbox._ndCalibComputeStability,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,
