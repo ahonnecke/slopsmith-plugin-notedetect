@@ -5873,6 +5873,81 @@ function _ndCoachingLabel(v, total) {
     return null;
 }
 
+// ── Detector-failure filter ────────────────────────────────────────────
+// The plugin's onset detector + YIN can fail in specific regimes that
+// look like "user missed the note" in the snapshot but are really
+// detection limitations:
+//
+//   1. Fast-repeat NO_DETECTION — previous chart note < 400 ms before;
+//      sustain-bleed and refractory window prevent fresh-pluck onset.
+//      Documented in docs/SUSTAIN_BLEED_WALL.md.
+//
+//   2. WRONG_PITCH with onTargetRatio=0 + contaminants — YIN locked on
+//      a different pitch during the matching window. The previous
+//      note's sustain dominated; the user's actual pluck was masked.
+//
+//   3. WRONG_PITCH with detected pitch >= 4 semitones below expected —
+//      almost always sustain from a lower-register prior note bleeding
+//      through. Real finger-slip errors stay within 1-3 semitones.
+//
+// These cases shouldn't drive practice recommendations — drilling a
+// position because the *detector* is failing wastes the user's time.
+//
+// Pure: takes one play's noteResults, returns Set of keys flagged as
+// likely detector failures.
+function _ndLikelyDetectorFailures(noteResults) {
+    const flagged = new Set();
+    if (!noteResults) return flagged;
+    const sorted = noteResults.slice().sort((a, b) => (a.chartT || 0) - (b.chartT || 0));
+    for (let i = 0; i < sorted.length; i++) {
+        const r = sorted[i];
+        if (!r || !r.key) continue;
+
+        if (r.primary === 'MISSED_NO_DETECTION') {
+            const prev = i > 0 ? sorted[i - 1] : null;
+            const gap = prev ? (r.chartT - prev.chartT) : Infinity;
+            if (gap > 0 && gap < 0.4) {
+                flagged.add(r.key);
+                continue;
+            }
+        }
+
+        if (r.primary === 'MISSED_WRONG_PITCH') {
+            const hyg = r.hygiene;
+            if (hyg
+                && (hyg.onTargetRatio === 0 || hyg.onTargetRatio === undefined)
+                && Array.isArray(hyg.contaminants)
+                && hyg.contaminants.length > 0) {
+                flagged.add(r.key);
+                continue;
+            }
+            const semiOff = (typeof r.pitchError === 'number')
+                ? Math.round(r.pitchError / 100) : null;
+            if (semiOff !== null && semiOff <= -4) {
+                flagged.add(r.key);
+                continue;
+            }
+        }
+    }
+    return flagged;
+}
+
+// Convenience: strip detector failures from a set of plays. Returns a
+// new array of plays where each noteResults has detector-failure entries
+// removed. Hits are always retained; only misses caused by detection
+// limitations are dropped.
+function _ndFilterDetectorFailures(plays) {
+    if (!plays) return [];
+    return plays.map(p => {
+        const flagged = _ndLikelyDetectorFailures(p.noteResults || []);
+        if (flagged.size === 0) return p;
+        return {
+            ...p,
+            noteResults: (p.noteResults || []).filter(r => !flagged.has(r.key)),
+        };
+    });
+}
+
 // ── Hotspot timeline ────────────────────────────────────────────────────
 // Horizontal strip mapping song time → screen position, color-coded by
 // miss density across recent plays. Lets the user see at a glance "where
@@ -5921,11 +5996,12 @@ async function _ndUpdateTimeline() {
         return;
     }
     try {
-        const plays = await _ndFetchPlays(songId);
-        if (!plays || plays.length < 2) {
+        const rawPlays = await _ndFetchPlays(songId);
+        if (!rawPlays || rawPlays.length < 2) {
             _ndRemoveTimeline();
             return;
         }
+        const plays = _ndFilterDetectorFailures(rawPlays);
         // Use the chart's note range for the timeline bounds — same as
         // what the highway shows. Robust to whatever loop or seek state
         // the user is in.
@@ -6074,11 +6150,12 @@ async function _ndUpdateFretboardHeatmap() {
         return;
     }
     try {
-        const plays = await _ndFetchPlays(songId);
-        if (!plays || plays.length < 2) {
+        const rawPlays = await _ndFetchPlays(songId);
+        if (!rawPlays || rawPlays.length < 2) {
             _ndRemoveFretboardHeatmap();
             return;
         }
+        const plays = _ndFilterDetectorFailures(rawPlays);
         const stringCount = _ndCurrentArrangement === 'bass' ? 4 : 6;
         // Find the highest fret used across plays so we don't render a bunch
         // of empty cells past fret 12 for a song that lives in the open
@@ -6175,13 +6252,14 @@ async function _ndUpdateCoachingPanel() {
     }
     const loop = (typeof window.getActiveLoop === 'function') ? window.getActiveLoop() : null;
     try {
-        const plays = await _ndFetchPlays(songId);
-        if (!plays || plays.length < 2) {
+        const rawPlays = await _ndFetchPlays(songId);
+        if (!rawPlays || rawPlays.length < 2) {
             // Need at least 2 plays for any meaningful per-note coaching.
             const existing = document.getElementById('nd-coaching-panel');
             if (existing) existing.remove();
             return;
         }
+        const plays = _ndFilterDetectorFailures(rawPlays);
         const items = _ndPerNoteCoaching(
             plays,
             loop ? loop.startSec : undefined,
