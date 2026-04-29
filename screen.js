@@ -3369,6 +3369,13 @@ function _ndProcessAudioChunk(input) {
         _ndLastOnsetPerfNow = nowPerfSec;
         _ndReattackArmed = false; // disarm until next release
         _ndOnsetCount++;
+        // Calibration wizard tap: each onset = one pluck. Hooking here (not
+        // _ndProcessFrame) means the wizard sees re-attacks during sustain
+        // — the onset detector has the rearm/refractory logic to identify a
+        // new pluck on top of a still-ringing string. The YIN-frame path
+        // missed those because the time-gap freshness filter saw no silence
+        // between the previous note's sustain and the new attack.
+        if (typeof _ndWizOnOnset === 'function') _ndWizOnOnset();
         // Flush the YIN buffers AND drop this trigger chunk. The trigger
         // chunk itself is half pre-attack (previous note's sustain) and half
         // post-attack — when previous sustain is louder than the new attack
@@ -5017,28 +5024,24 @@ function _ndWizFireBeat(b, mode, scheduledTime) {
 // record (perBeat, medianDt, drop counts, lowQuality flag). No side effects,
 // no DOM, no module-state writes — fully testable offline. The wrapper
 // (_ndWizFinishRun) handles the imperative parts.
+//
+// Detection events are now onset-driven (one entry per pluck, populated by
+// _ndWizOnOnset and enriched with pitch by _ndWizOnDetection). Earlier
+// versions sourced from raw YIN frames and pre-filtered with a 120 ms
+// time-gap "freshness" rule; that collapsed sustained pitch frames into
+// one but ALSO collapsed legitimate re-attacks during sustain (pluck
+// note 2 while note 1 is still ringing — no silence gap, dropped). The
+// onset detector handles sustain re-attacks via its release/rearm gate,
+// so each entry here is already a fresh pluck.
 function _ndWizComputeRun(beats, detections, mode) {
-    // Pre-filter detections to "fresh" ones — the first detection after a
-    // silence gap. YIN's pitch jitters during the attack transient of each
-    // pluck (5-6 different midi values in the first 100 ms before settling);
-    // counting each jitter as a "fresh pluck" pollutes the beat-to-pluck
-    // assignment.
-    const _ND_FRESH_GAP_MS = 120;
-    const fresh = [];
-    let lastTime = -Infinity;
-    for (const det of detections) {
-        if (det.time - lastTime > _ND_FRESH_GAP_MS) {
-            fresh.push(det);
-        }
-        lastTime = det.time;
-    }
-
-    // Assignment: for each beat, find the fresh detection within the beat
-    // window closest in time.
+    // Assignment: for each beat, find the detection within the beat window
+    // closest in time. Defensive: if the same detection lands inside two
+    // adjacent beat windows (75 BPM = 800 ms; window = ±400 ms), each beat
+    // looks at it independently. The hard-cap stage drops the bad match.
     const perBeat = beats.map(beatT => {
         let picked = null;
         let pickedDt = null;
-        for (const det of fresh) {
+        for (const det of detections) {
             const dt = det.time - beatT;
             if (Math.abs(dt) > _ND_METRO_BEAT_WINDOW_MS) continue;
             if (picked === null || Math.abs(dt) < Math.abs(pickedDt)) {
@@ -5091,16 +5094,39 @@ function _ndWizFinishRun(mode) {
     _ndWizRender();
 }
 
-// Hook called from _ndProcessFrame on every detection event. Captures the
-// detected MIDI value alongside the timestamp so the review screen can show
-// per-beat pitch info (helpful for diagnosing why a beat was skipped — YIN
-// locked on a harmonic, fingered a different note, etc.).
+// Wizard detections are sourced from two paths to maximise coverage:
+//   (1) Onset detector fires — most precise timing, catches re-attacks
+//       during sustain (the case the old time-gap freshness filter
+//       missed). Pushes with midi=-1; YIN enriches later when it locks.
+//   (2) YIN-frame fallback — when the onset detector misses a soft
+//       pluck whose RMS doesn't cross _ND_ONSET_LEVEL but YIN still
+//       finds confident pitch. Pushed only on a real silence-to-pitch
+//       transition (120 ms gap from the last entry), to avoid every
+//       sustained frame becoming a separate pluck.
+const _ND_WIZ_ENRICH_WINDOW_MS = 200;
+const _ND_WIZ_FRAME_GAP_MS = 120;
+
+function _ndWizOnOnset() {
+    if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') return;
+    _ndWizDetections.push({
+        time: performance.now(),
+        midi: -1,
+    });
+}
+
 function _ndWizOnDetection() {
-    if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
-        _ndWizDetections.push({
-            time: performance.now(),
-            midi: _ndDetectedMidi,
-        });
+    if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') return;
+    const now = performance.now();
+    const last = _ndWizDetections[_ndWizDetections.length - 1];
+    // Recent onset awaiting pitch — enrich rather than push.
+    if (last && last.midi === -1 && (now - last.time) < _ND_WIZ_ENRICH_WINDOW_MS) {
+        last.midi = _ndDetectedMidi;
+        return;
+    }
+    // No recent onset. Push only if past the silence-gap threshold so
+    // sustained frames don't each register as a separate pluck.
+    if (!last || (now - last.time) >= _ND_WIZ_FRAME_GAP_MS) {
+        _ndWizDetections.push({ time: now, midi: _ndDetectedMidi });
     }
 }
 
