@@ -4790,6 +4790,11 @@ async function _ndOpenWizardFromSettings() {
                 alert('Mic permission required to calibrate. Please grant access and try again.');
                 return;
             }
+            // _ndProcessAudioChunk gates on _ndEnabled — without flipping it,
+            // the ScriptProcessor receives chunks and discards them, YIN never
+            // runs, the wizard collects zero detections, and the run finishes
+            // with medianDt=null (button stays "Start →").
+            _ndEnabled = true;
             _ndWizardOwnsMic = true;
         } catch (e) {
             alert('Failed to open mic: ' + (e?.message || e));
@@ -4806,8 +4811,10 @@ function _ndCloseWizard() {
     const m = document.getElementById('nd-wizard-modal');
     if (m) m.remove();
     // Tear down our own mic if we started it. Detect-on sessions
-    // (where _ndEnabled is true) keep the mic running.
+    // (where _ndEnabled is true entered through the toggle, not the wizard)
+    // keep the mic running.
     if (_ndWizardOwnsMic) {
+        _ndEnabled = false;
         _ndStopAudio();
         _ndWizardOwnsMic = false;
     }

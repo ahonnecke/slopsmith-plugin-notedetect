@@ -79,14 +79,75 @@ async function main() {
         sampleRate: typeof _ndAudioCtx !== 'undefined' && _ndAudioCtx ? _ndAudioCtx.sampleRate : null,
     }));
     console.log(`[ok] audio pipeline: enabled=${audioState.enabled} ctxState=${audioState.ctxState} wizardOwnsMic=${audioState.wizardOwnsMic} sampleRate=${audioState.sampleRate}`);
-    const micUp = audioState.ctxState === 'running' && audioState.wizardOwnsMic === true;
+    const micUp = audioState.ctxState === 'running'
+        && audioState.wizardOwnsMic === true
+        && audioState.enabled === true;
     if (!micUp) {
-        console.log('[FAIL] mic pipeline did not boot from settings entry');
+        console.log('[FAIL] mic pipeline did not boot from settings entry (need enabled=true ctxState=running wizardOwnsMic=true)');
     } else {
-        console.log('[ok] mic owned by wizard, ready for calibration');
+        console.log('[ok] mic enabled, owned by wizard, ready for calibration');
     }
 
-    // Step 6: relevant console output
+    // Step 6: simulate a full visual run with synthetic detections firing on
+    // every GO beat, then confirm finishRun produces a non-null medianDt.
+    // The fake mic device emits silence, so we bypass YIN and call
+    // _ndWizOnDetection directly — this validates the click→run→finish→
+    // result pipeline end-to-end without needing real bass input.
+    console.log('[step] simulating visual run with synthetic on-beat detections...');
+    const runResult = await page.evaluate(async () => {
+        // Speed: kick off a visual run, then in parallel push a synthetic
+        // detection 30ms after each scheduled GO beat fires. We hook into
+        // _ndWizFireBeat by polling _ndWizBeats.length growing.
+        _ndWizStartRun('visual');
+        const expected = (typeof _ND_METRO_CYCLES !== 'undefined') ? _ND_METRO_CYCLES : 6;
+        const intervalMs = 60000 / ((typeof _ND_METRO_BPM !== 'undefined') ? _ND_METRO_BPM : 75);
+        let lastSeen = 0;
+        // Wait until either the run completes (step → 'intro') or 60s timeout.
+        const startedAt = performance.now();
+        while (_ndWizStep === 'running-visual' && performance.now() - startedAt < 60000) {
+            const n = _ndWizBeats.length;
+            if (n > lastSeen) {
+                // A new GO beat just fired — push a synthetic detection 30ms
+                // later to simulate an on-time pluck.
+                const beatT = _ndWizBeats[n - 1];
+                setTimeout(() => {
+                    _ndWizDetections.push({ time: beatT + 30, midi: 28 });
+                }, 30);
+                lastSeen = n;
+            }
+            await new Promise(r => setTimeout(r, 20));
+        }
+        return {
+            step: _ndWizStep,
+            visualRun: _ndWizVisualRun ? {
+                medianDt: _ndWizVisualRun.medianDt,
+                usedCount: _ndWizVisualRun.usedCount,
+                droppedHardCap: _ndWizVisualRun.droppedHardCap,
+                droppedNoDetection: _ndWizVisualRun.droppedNoDetection,
+                lowQuality: _ndWizVisualRun.lowQuality,
+            } : null,
+            beatsCollected: _ndWizBeats.length,
+            detectionsCollected: _ndWizDetections.length,
+            expectedBeats: expected,
+        };
+    });
+    console.log(`[info] beats=${runResult.beatsCollected}/${runResult.expectedBeats} detections=${runResult.detectionsCollected} step=${runResult.step}`);
+    if (runResult.visualRun) {
+        const r = runResult.visualRun;
+        console.log(`[ok] visual run finished: medianDt=${r.medianDt}ms used=${r.usedCount} hardCap=${r.droppedHardCap} noDet=${r.droppedNoDetection} lowQ=${r.lowQuality}`);
+    } else {
+        console.log('[FAIL] visual run did not finish — _ndWizVisualRun is null');
+    }
+    const runOk = runResult.visualRun
+        && runResult.visualRun.medianDt !== null
+        && runResult.visualRun.usedCount > 0;
+    if (!runOk) {
+        console.log('[FAIL] visual run completed but produced no usable median');
+    } else {
+        console.log(`[ok] button label would now read: "✓ ${Math.round(runResult.visualRun.medianDt)} ms"`);
+    }
+
+    // Step 7: relevant console output
     const ndLines = consoleLines.filter(l => /note_detect/i.test(l));
     if (ndLines.length) {
         console.log('--- plugin console output ---');
@@ -94,7 +155,7 @@ async function main() {
     }
 
     await browser.close();
-    process.exit(micUp && cardPresent && modalUp ? 0 : 1);
+    process.exit(micUp && cardPresent && modalUp && runOk ? 0 : 1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
