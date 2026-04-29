@@ -433,6 +433,14 @@ let _ndMicLatencyMs = 0;
 // users, propagating straight into mic-latency error. 0 = not measured yet,
 // estimator falls back to the 200 ms default.
 let _ndUserReactionAuditoryMs = 0;
+
+// Personal visual simple reaction time. Same idea as auditory but the
+// stimulus is a flashing dot; user hits SPACE on each flash. Used as the
+// reaction-time constant for the wizard's visual run, replacing the
+// 250 ms Welford default. Visual reaction is typically ~50 ms slower
+// than auditory for the same person, but the gap varies — measuring
+// directly avoids that error compounding into A/V offset.
+let _ndUserReactionVisualMs = 0;
 // Off by default — recording produces files (POSTed to the server, then to
 // /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
 // alongside the per-iteration play snapshots, e.g. for offline classifier
@@ -2124,6 +2132,7 @@ function _ndSaveSettings() {
             clickTrackOnly: _ndClickTrackOnly,
             micLatencyMs: _ndMicLatencyMs,
             userReactionAuditoryMs: _ndUserReactionAuditoryMs,
+            userReactionVisualMs: _ndUserReactionVisualMs,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -2163,6 +2172,9 @@ function _ndLoadSettings() {
         }
         if (s.userReactionAuditoryMs !== undefined && isFinite(Number(s.userReactionAuditoryMs))) {
             _ndUserReactionAuditoryMs = Number(s.userReactionAuditoryMs);
+        }
+        if (s.userReactionVisualMs !== undefined && isFinite(Number(s.userReactionVisualMs))) {
+            _ndUserReactionVisualMs = Number(s.userReactionVisualMs);
         }
         // clickTrackOnly intentionally NOT loaded — it's a per-session
         // training toggle, not a persistent default. Reload starts with
@@ -4769,7 +4781,7 @@ const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of 
 // neither of which represent calibrated mic capture latency.
 const _ND_WIZ_HARD_CAP_MS = 200;
 
-let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-keyboard' | 'running-visual' | 'running-audio' | 'review'
+let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-keyboard-audio' | 'running-keyboard-visual' | 'running-visual' | 'running-audio' | 'review'
 let _ndWizBeats = [];             // wall times (performance.now) of measured beats
 let _ndWizDetections = [];        // [{time, midi}] of detection events during a run
 let _ndWizVisualRun = null;       // {perBeat, medianDt, droppedOutliers, dropped}
@@ -4982,44 +4994,79 @@ function _ndWizComputeKeyboardReaction(clickTimes, keyTimes) {
     };
 }
 
-function _ndWizStartKeyboardRun() {
-    _ndWizStep = 'running-keyboard';
+// Stimulus-agnostic keyboard reaction-time runner. stimulus = 'audio'
+// (audio click via AudioContext.start) or 'visual' (DOM-mutated dot
+// flash via setTimeout + rAF). Both paths capture keydown timings the
+// same way and feed the same compute function.
+function _ndWizStartKeyboardRun(stimulus) {
+    stimulus = stimulus || 'audio';
+    _ndWizStep = `running-keyboard-${stimulus}`;
     _ndWizKeyboardClicks = [];
     _ndWizKeyboardKeys = [];
+    _ndWizKeyboardStimulus = stimulus;
     _ndWizCancelTimers();
-
-    if (!_ndWizAudioCtx) {
-        _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const ctx = _ndWizAudioCtx;
-    if (ctx.state === 'suspended') ctx.resume();
+    _ndWizRender();   // render first so the flash dot exists in the DOM
 
     const startDelay = 1500;
     const startPerf = performance.now() + startDelay;
-    const startCtx = ctx.currentTime + startDelay / 1000;
-    const intervalSec = _ND_WIZ_KEYBOARD_INTERVAL_MS / 1000;
+    const intervalMs = _ND_WIZ_KEYBOARD_INTERVAL_MS;
 
-    // Pre-schedule clicks on the AudioContext clock.
-    for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
-        const ctxWhen = startCtx + i * intervalSec;
-        const perfWhen = startPerf + i * _ND_WIZ_KEYBOARD_INTERVAL_MS;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = 800;
-        osc.connect(gain).connect(ctx.destination);
-        const sustainEnd = ctxWhen + 0.06;
-        gain.gain.setValueAtTime(0, ctxWhen);
-        gain.gain.linearRampToValueAtTime(0.4, ctxWhen + 0.005);
-        gain.gain.linearRampToValueAtTime(0, sustainEnd);
-        osc.start(ctxWhen);
-        osc.stop(sustainEnd + 0.01);
-        _ndWizKeyboardClicks.push(perfWhen);
-        _ndWizTimers.push(setTimeout(() => _ndWizUpdateKeyboardCounter(i + 1), perfWhen - performance.now()));
+    if (stimulus === 'audio') {
+        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const ctx = _ndWizAudioCtx;
+        if (ctx.state === 'suspended') ctx.resume();
+        const startCtx = ctx.currentTime + startDelay / 1000;
+        const intervalSec = intervalMs / 1000;
+        for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
+            const ctxWhen = startCtx + i * intervalSec;
+            const perfWhen = startPerf + i * intervalMs;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = 800;
+            osc.connect(gain).connect(ctx.destination);
+            const sustainEnd = ctxWhen + 0.06;
+            gain.gain.setValueAtTime(0, ctxWhen);
+            gain.gain.linearRampToValueAtTime(0.4, ctxWhen + 0.005);
+            gain.gain.linearRampToValueAtTime(0, sustainEnd);
+            osc.start(ctxWhen);
+            osc.stop(sustainEnd + 0.01);
+            _ndWizKeyboardClicks.push(perfWhen);
+            _ndWizTimers.push(setTimeout(() => _ndWizUpdateKeyboardCounter(i + 1), perfWhen - performance.now()));
+        }
+    } else {
+        // Visual: setTimeout + rAF, record the actual frame paint time
+        // (not the scheduled time). This avoids the same setTimeout-jitter
+        // bias that affects the visual run's GO beat — the user reacts to
+        // the painted frame, not the scheduled DOM mutation.
+        for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
+            const perfWhen = startPerf + i * intervalMs;
+            const idx = i;
+            _ndWizTimers.push(setTimeout(() => {
+                const el = document.getElementById('nd-wiz-kbd-flash');
+                if (el) {
+                    el.style.background = '#22ff88';
+                    el.style.boxShadow = '0 0 32px 8px rgba(34,255,136,0.8)';
+                    el.style.transform = 'scale(1.4)';
+                    setTimeout(() => {
+                        if (el) {
+                            el.style.background = 'rgba(60,60,70,0.6)';
+                            el.style.boxShadow = 'none';
+                            el.style.transform = 'scale(1)';
+                        }
+                    }, 120);
+                }
+                requestAnimationFrame((frameTime) => {
+                    _ndWizKeyboardClicks[idx] = frameTime;
+                    _ndWizUpdateKeyboardCounter(idx + 1);
+                });
+            }, perfWhen - performance.now()));
+            _ndWizKeyboardClicks.push(perfWhen);  // placeholder, overwritten by rAF
+        }
     }
 
     _ndWizKeyHandler = (e) => {
-        if (_ndWizStep !== 'running-keyboard') return;
+        if (!_ndWizStep.startsWith('running-keyboard-')) return;
         if (e.code !== 'Space' && e.key !== ' ') return;
         e.preventDefault();
         _ndWizKeyboardKeys.push(performance.now());
@@ -5027,11 +5074,8 @@ function _ndWizStartKeyboardRun() {
     };
     document.addEventListener('keydown', _ndWizKeyHandler);
 
-    // Total run length + 1s grace for the last keypress.
-    const finishDelay = startDelay + _ND_WIZ_KEYBOARD_CLICKS * _ND_WIZ_KEYBOARD_INTERVAL_MS + 1000;
-    _ndWizTimers.push(setTimeout(() => _ndWizFinishKeyboardRun(), finishDelay));
-
-    _ndWizRender();
+    const finishDelay = startDelay + _ND_WIZ_KEYBOARD_CLICKS * intervalMs + 1000;
+    _ndWizTimers.push(setTimeout(() => _ndWizFinishKeyboardRun(stimulus), finishDelay));
 }
 
 function _ndWizUpdateKeyboardCounter(n) {
@@ -5039,25 +5083,33 @@ function _ndWizUpdateKeyboardCounter(n) {
     if (el) el.textContent = `${Math.min(n, _ND_WIZ_KEYBOARD_CLICKS)} / ${_ND_WIZ_KEYBOARD_CLICKS}`;
 }
 
-function _ndWizFinishKeyboardRun() {
+function _ndWizFinishKeyboardRun(stimulus) {
     if (_ndWizKeyHandler) {
         document.removeEventListener('keydown', _ndWizKeyHandler);
         _ndWizKeyHandler = null;
     }
     const result = _ndWizComputeKeyboardReaction(_ndWizKeyboardClicks, _ndWizKeyboardKeys);
     if (result.medianMs !== null && !result.lowQuality) {
-        _ndUserReactionAuditoryMs = result.medianMs;
+        if (stimulus === 'visual') {
+            _ndUserReactionVisualMs = result.medianMs;
+            console.log(`[note_detect] Personal visual reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
+        } else {
+            _ndUserReactionAuditoryMs = result.medianMs;
+            console.log(`[note_detect] Personal auditory reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
+        }
         _ndSaveSettings();
-        console.log(`[note_detect] Personal auditory reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
     } else {
-        console.warn(`[note_detect] Reaction-time test low quality (${result.dropped}/${_ND_WIZ_KEYBOARD_CLICKS} dropped) — keeping default ${_ndUserReactionAuditoryMs || 200} ms`);
+        console.warn(`[note_detect] ${stimulus} reaction-time test low quality (${result.dropped}/${_ND_WIZ_KEYBOARD_CLICKS} dropped)`);
     }
-    _ndWizKeyboardLastResult = result;
+    if (stimulus === 'visual') _ndWizKeyboardLastResultVisual = result;
+    else _ndWizKeyboardLastResult = result;
     _ndWizStep = 'intro';
     _ndWizRender();
 }
 
 let _ndWizKeyboardLastResult = null;
+let _ndWizKeyboardLastResultVisual = null;
+let _ndWizKeyboardStimulus = null;
 
 function _ndWizStartRun(mode) {
     _ndWizStep = 'running-' + mode;
@@ -5233,8 +5285,9 @@ function _ndWizComputeRun(beats, detections, mode, opts) {
     // that error propagates straight into mic-latency miscalibration.
     const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
     const personalAudioRt = (opts && opts.audioRtMs) || 0;
+    const personalVisualRt = (opts && opts.visualRtMs) || 0;
     const REACTION_TIME_MS = mode === 'visual'
-        ? 250
+        ? (personalVisualRt > 0 ? personalVisualRt : 250)
         : (personalAudioRt > 0 ? personalAudioRt : 200);
     // Cluster bounds widen with the reaction-time constant so the
     // reaction window remains centred on the expected response.
@@ -5309,7 +5362,10 @@ function _ndWizComputeRun(beats, detections, mode, opts) {
 function _ndWizFinishRun(mode) {
     const runResult = _ndWizComputeRun(
         _ndWizBeats, _ndWizDetections, mode,
-        { audioRtMs: _ndUserReactionAuditoryMs }
+        {
+            audioRtMs: _ndUserReactionAuditoryMs,
+            visualRtMs: _ndUserReactionVisualMs,
+        }
     );
     if (mode === 'visual') _ndWizVisualRun = runResult;
     else if (mode === 'audio') _ndWizAudioRun = runResult;
@@ -5447,22 +5503,28 @@ function _ndWizRender() {
     if (_ndWizStep === 'intro') {
         const vDone = _ndWizVisualOffsetMs !== null;
         const aDone = _ndWizAudioOffsetMs !== null;
-        const rtMs = _ndUserReactionAuditoryMs;
-        const rtDone = rtMs > 0;
+        const rtAud = _ndUserReactionAuditoryMs;
+        const rtVis = _ndUserReactionVisualMs;
+        const rtAudDone = rtAud > 0;
+        const rtVisDone = rtVis > 0;
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-2">Three steps: measure your personal reaction time, then run visual + audio bass tests.</p>
-            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Step 1 measures how fast you respond to a stimulus (no instrument). The audio bass test then subtracts that from your pluck timing to isolate mic-pipeline latency. No more guessing at typical-human reaction-time constants.</p>
+            <p class="text-sm text-gray-300 mb-2">Two reaction-time baselines (no instrument), then two bass tests.</p>
+            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Steps 1a/1b measure how fast you respond to a stimulus. Steps 2/3 measure your bass-pluck timing. Subtracting the personal reaction time isolates the mic pipeline from your reflexes.</p>
             <div class="space-y-2 mb-4">
-                <button onclick="_ndWizStartKeyboardRun()" class="w-full flex items-center justify-between px-4 py-2 ${rtDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>1. Reaction baseline</strong> — press SPACE on each click (~10 sec).</span>
-                    <span class="text-xs text-gray-400">${rtDone ? `✓ ${rtMs} ms` : 'Start →'}</span>
+                <button onclick="_ndWizStartKeyboardRun('audio')" class="w-full flex items-center justify-between px-4 py-2 ${rtAudDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
+                    <span><strong>1a. Auditory reaction</strong> — SPACE on click (~10s).</span>
+                    <span class="text-xs text-gray-400">${rtAudDone ? `✓ ${rtAud} ms` : 'Start →'}</span>
+                </button>
+                <button onclick="_ndWizStartKeyboardRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${rtVisDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
+                    <span><strong>1b. Visual reaction</strong> — SPACE on flash (~10s).</span>
+                    <span class="text-xs text-gray-400">${rtVisDone ? `✓ ${rtVis} ms` : 'Start →'}</span>
                 </button>
                 <button onclick="_ndWizStartRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${vDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>2. Visual</strong> — pluck on the green GO dot.</span>
+                    <span><strong>2. Visual bass</strong> — pluck on the green GO dot.</span>
                     <span class="text-xs text-gray-400">${vDone ? `✓ ${Math.round(_ndWizVisualOffsetMs)} ms` : 'Start →'}</span>
                 </button>
                 <button onclick="_ndWizStartRun('audio')" class="w-full flex items-center justify-between px-4 py-2 ${aDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>3. Audio</strong> — pluck on the lower-pitched GO tone.</span>
+                    <span><strong>3. Audio bass</strong> — pluck on the lower GO tone.</span>
                     <span class="text-xs text-gray-400">${aDone ? `✓ ${Math.round(_ndWizAudioOffsetMs)} ms` : 'Start →'}</span>
                 </button>
             </div>
@@ -5471,17 +5533,27 @@ function _ndWizRender() {
                 <button onclick="_ndWizStep='review'; _ndWizRender()" ${(vDone && aDone) ? '' : 'disabled'} class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white disabled:opacity-50">Review</button>
             </div>
         `);
-    } else if (_ndWizStep === 'running-keyboard') {
-        const result = _ndWizKeyboardLastResult;
+    } else if (_ndWizStep === 'running-keyboard-audio' || _ndWizStep === 'running-keyboard-visual') {
+        const stim = _ndWizStep === 'running-keyboard-visual' ? 'visual' : 'audio';
+        const result = stim === 'visual' ? _ndWizKeyboardLastResultVisual : _ndWizKeyboardLastResult;
         const lastInfo = result && result.medianMs !== null
             ? `<p class="text-[11px] text-gray-400 mt-2">Last run: ${result.medianMs} ms (raw ${result.rawMedianMs} − ${result.inputLagMs} input lag)</p>`
             : '';
+        const stimulus = stim === 'visual'
+            ? `<strong>Press SPACE</strong> as soon as the dot flashes green. Don't anticipate — react.`
+            : `<strong>Press SPACE</strong> as soon as you hear each click. Don't anticipate — react.`;
+        const stimArea = stim === 'visual'
+            ? `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 relative">
+                   <div id="nd-wiz-kbd-flash" class="w-16 h-16 rounded-full transition-none" style="background:rgba(60,60,70,0.6)"></div>
+                   <div id="nd-wiz-kbd-counter" class="absolute right-3 top-2 text-gray-200 text-xl font-mono">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</div>
+               </div>`
+            : `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-200 text-3xl font-mono">
+                   <span id="nd-wiz-kbd-counter">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</span>
+               </div>`;
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-3"><strong>Press SPACE</strong> as soon as you hear each click. Don't anticipate — react. ${_ND_WIZ_KEYBOARD_CLICKS} clicks at ${(_ND_WIZ_KEYBOARD_INTERVAL_MS / 1000).toFixed(1)}-sec intervals.</p>
-            <div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-200 text-3xl font-mono">
-                <span id="nd-wiz-kbd-counter">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</span>
-            </div>
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">No instrument needed. The wizard measures (keydown - click) and stores the median minus a fixed input-lag constant as your personal auditory reaction time.</p>
+            <p class="text-sm text-gray-300 mb-3">${stimulus} ${_ND_WIZ_KEYBOARD_CLICKS} stimuli at ${(_ND_WIZ_KEYBOARD_INTERVAL_MS / 1000).toFixed(1)}-sec intervals.</p>
+            ${stimArea}
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight">No instrument needed. The wizard measures (keydown − stimulus) and stores the median minus a fixed input-lag constant as your personal ${stim} reaction time.</p>
             ${lastInfo}
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndWizCancelTimers();_ndWizStep='intro';_ndWizRender()"
@@ -5580,13 +5652,14 @@ function _ndWizRender() {
                 const rMed = run.reactionMedian;
                 const rAdj = run.reactionAdjusted;
                 const rt = run.reactionTimeConstMs;
-                // For audio mode: rt is the user's measured personal value
-                // when available, otherwise the 200 ms Welford default. For
-                // visual mode it's always the 250 ms default (no per-user
-                // visual reaction measurement yet).
-                const rtSource = run.mode === 'audio' && _ndUserReactionAuditoryMs > 0
+                // rt is the user's measured personal value when the
+                // matching baseline (auditory or visual) has been run,
+                // otherwise the Welford 1980 mode-specific default.
+                const personalUsed = (run.mode === 'audio' && _ndUserReactionAuditoryMs > 0)
+                    || (run.mode === 'visual' && _ndUserReactionVisualMs > 0);
+                const rtSource = personalUsed
                     ? `your measured reaction time`
-                    : `Welford 1980 default`;
+                    : `Welford 1980 default — measure your personal reaction time in step 1 for tighter results`;
                 if (run.usedCluster === 'both') {
                     return `<p class="text-[11px] text-green-300 mt-2 leading-tight"><strong>Convergent.</strong> Anticipation cluster median = ${Math.round(aMed)} ms; reaction cluster median = ${Math.round(rMed)} ms (− ${rt} ms ${rtSource} = ${Math.round(rAdj)} ms). Both estimates agree → final = ${Math.round(run.medianDt)} ms.</p>`;
                 }
@@ -5595,7 +5668,7 @@ function _ndWizRender() {
                     return `<p class="text-[11px] text-gray-400 mt-2 leading-tight"><strong>Anticipation cluster:</strong> median of ${run.anticipationCount} clean pluck(s) on the beat = ${Math.round(aMed)} ms.${reactBlurb}</p>`;
                 }
                 if (run.usedCluster === 'reaction') {
-                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms (${rtSource}) = ${Math.round(rAdj)} ms.${run.mode === 'audio' && _ndUserReactionAuditoryMs > 0 ? ' High confidence — based on your personal measurement.' : ' Medium confidence — measure your personal reaction time in step 1 for a tighter estimate.'}</p>`;
+                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms (${rtSource}) = ${Math.round(rAdj)} ms.${personalUsed ? ' High confidence — based on your personal measurement.' : ''}</p>`;
                 }
                 return '';
             })();

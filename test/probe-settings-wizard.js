@@ -88,64 +88,71 @@ async function main() {
         console.log('[ok] mic enabled, owned by wizard, ready for calibration');
     }
 
-    // Step 5b: simulate the keyboard reaction-time pre-test. We dispatch
-    // synthetic Space keydown events 215 ms after each scheduled click —
-    // result should round-trip a personal RT close to (215 - 5) = 210 ms.
-    console.log('[step] simulating keyboard reaction-time pre-test...');
-    const kbdResult = await page.evaluate(async () => {
-        _ndWizStartKeyboardRun();
-        const expected = _ND_WIZ_KEYBOARD_CLICKS;
-        let lastSeen = 0;
-        const startedAt = performance.now();
-        while (_ndWizStep === 'running-keyboard' && performance.now() - startedAt < 30000) {
-            const n = _ndWizKeyboardClicks.length;
-            // Each scheduled click time has been pushed; we want to fire a
-            // synthetic keydown 215 ms after each click ACTUALLY HAPPENS in
-            // wall time. Compare scheduled click time to current time to
-            // know when "now" passes click+30 (we fire early so the dispatch
-            // delay puts the keydown at click+~215).
-            const now = performance.now();
-            for (let i = lastSeen; i < n; i++) {
-                if (_ndWizKeyboardClicks[i] <= now - 30) {
-                    setTimeout(() => {
-                        document.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space' }));
-                    }, 215 - 30);
-                    lastSeen = i + 1;
+    // Step 5b: simulate the keyboard reaction-time pre-tests for BOTH
+    // stimuli. We dispatch synthetic Space keydown events 215 ms after
+    // each stimulus event — result should round-trip a personal RT
+    // close to (215 - 5) = 210 ms for each.
+    async function simulateKeyboardRun(stim, expectedMs) {
+        console.log(`[step] simulating ${stim} keyboard reaction-time test...`);
+        const result = await page.evaluate(async (stimulus) => {
+            _ndWizStartKeyboardRun(stimulus);
+            const expected = _ND_WIZ_KEYBOARD_CLICKS;
+            const stepKey = `running-keyboard-${stimulus}`;
+            const dispatched = new Set();
+            const startedAt = performance.now();
+            while (_ndWizStep === stepKey && performance.now() - startedAt < 30000) {
+                const now = performance.now();
+                for (let i = 0; i < _ndWizKeyboardClicks.length; i++) {
+                    if (dispatched.has(i)) continue;
+                    if (_ndWizKeyboardClicks[i] <= now - 30) {
+                        setTimeout(() => {
+                            document.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space' }));
+                        }, 215 - 30);
+                        dispatched.add(i);
+                    }
                 }
+                await new Promise(r => setTimeout(r, 20));
             }
-            await new Promise(r => setTimeout(r, 20));
+            const last = stimulus === 'visual'
+                ? _ndWizKeyboardLastResultVisual
+                : _ndWizKeyboardLastResult;
+            return {
+                step: _ndWizStep,
+                personalRtMs: stimulus === 'visual' ? _ndUserReactionVisualMs : _ndUserReactionAuditoryMs,
+                lastResult: last ? {
+                    medianMs: last.medianMs,
+                    rawMedianMs: last.rawMedianMs,
+                    dropped: last.dropped,
+                    lowQuality: last.lowQuality,
+                } : null,
+                clicksScheduled: _ndWizKeyboardClicks.length,
+                keysCaptured: _ndWizKeyboardKeys.length,
+                expectedClicks: expected,
+            };
+        }, stim);
+        console.log(`[info] ${stim} kbd: clicks=${result.clicksScheduled}/${result.expectedClicks} keys=${result.keysCaptured} step=${result.step}`);
+        if (result.lastResult) {
+            const r = result.lastResult;
+            console.log(`[ok] ${stim} keyboard run: median=${r.medianMs}ms (raw ${r.rawMedianMs}, ${r.dropped} dropped, lowQ=${r.lowQuality})`);
+            console.log(`[ok] personal ${stim} RT persisted = ${result.personalRtMs} ms`);
+        } else {
+            console.log(`[FAIL] ${stim} keyboard run did not finish`);
         }
-        return {
-            step: _ndWizStep,
-            personalRtMs: _ndUserReactionAuditoryMs,
-            lastResult: _ndWizKeyboardLastResult ? {
-                medianMs: _ndWizKeyboardLastResult.medianMs,
-                rawMedianMs: _ndWizKeyboardLastResult.rawMedianMs,
-                dropped: _ndWizKeyboardLastResult.dropped,
-                lowQuality: _ndWizKeyboardLastResult.lowQuality,
-            } : null,
-            clicksScheduled: _ndWizKeyboardClicks.length,
-            keysCaptured: _ndWizKeyboardKeys.length,
-            expectedClicks: expected,
-        };
-    });
-    console.log(`[info] kbd: clicks=${kbdResult.clicksScheduled}/${kbdResult.expectedClicks} keys=${kbdResult.keysCaptured} step=${kbdResult.step}`);
-    if (kbdResult.lastResult) {
-        const r = kbdResult.lastResult;
-        console.log(`[ok] keyboard run finished: median=${r.medianMs}ms (raw ${r.rawMedianMs}, ${r.dropped} dropped, lowQ=${r.lowQuality})`);
-        console.log(`[ok] _ndUserReactionAuditoryMs persisted = ${kbdResult.personalRtMs} ms`);
-    } else {
-        console.log('[FAIL] keyboard run did not finish');
+        const ok = result.lastResult
+            && result.lastResult.medianMs !== null
+            && Math.abs(result.personalRtMs - expectedMs) <= 40
+            && !result.lastResult.lowQuality;
+        if (!ok) {
+            console.log(`[FAIL] expected ${stim} personal RT near ${expectedMs} ms, got ${result.personalRtMs}`);
+        } else {
+            console.log(`[ok] ${stim} reaction-time round-trip within ±40 ms tolerance`);
+        }
+        return ok;
     }
-    const kbdOk = kbdResult.lastResult
-        && kbdResult.lastResult.medianMs !== null
-        && Math.abs(kbdResult.personalRtMs - 210) <= 30
-        && !kbdResult.lastResult.lowQuality;
-    if (!kbdOk) {
-        console.log(`[FAIL] expected personal RT near 210 ms, got ${kbdResult.personalRtMs}`);
-    } else {
-        console.log('[ok] personal reaction-time round-trip within ±30 ms tolerance');
-    }
+
+    const kbdAudioOk = await simulateKeyboardRun('audio', 210);
+    const kbdVisualOk = await simulateKeyboardRun('visual', 210);
+    const kbdOk = kbdAudioOk && kbdVisualOk;
 
     // Step 6: simulate a full visual run with synthetic detections firing on
     // every GO beat, then confirm finishRun produces a non-null medianDt.

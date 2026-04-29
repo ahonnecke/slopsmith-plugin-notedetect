@@ -300,6 +300,37 @@ test('audio mode RT override widens reaction window appropriately', () => {
     assert.equal(run.medianDt, 20);   // 320 - 300
 });
 
+test('visual mode with personal visual RT override', () => {
+    // User's measured visual reaction = 290 ms; visual run plucks land
+    // at +295 ms → calibration = 5 ms (instead of 45 ms with 250 default).
+    const beats = [1000, 1800, 2600, 3400, 4200, 5000];
+    const detections = beats.map(t => ({ time: t + 295, midi: 28 }));
+    const run = core.wizComputeRun(beats, detections, 'visual', { visualRtMs: 290 });
+    assert.equal(run.reactionTimeConstMs, 290);
+    assert.equal(run.usedCluster, 'reaction');
+    assert.equal(run.medianDt, 5);   // 295 - 290
+});
+
+test('visual mode without visualRtMs override: 250 ms default', () => {
+    const beats = [1000, 1800, 2600, 3400, 4200, 5000];
+    const detections = beats.map(t => ({ time: t + 295, midi: 28 }));
+    const run = core.wizComputeRun(beats, detections, 'visual');
+    assert.equal(run.reactionTimeConstMs, 250);
+    assert.equal(run.medianDt, 45);
+});
+
+test('audioRtMs and visualRtMs are mode-scoped — no cross-contamination', () => {
+    const beats = [1000];
+    const detections = [{ time: 1290, midi: 28 }];
+    // audioRtMs only affects audio mode; visualRtMs only affects visual.
+    const audio = core.wizComputeRun(beats, detections, 'audio',
+        { audioRtMs: 285, visualRtMs: 999 });
+    assert.equal(audio.reactionTimeConstMs, 285);
+    const visual = core.wizComputeRun(beats, detections, 'visual',
+        { audioRtMs: 999, visualRtMs: 285 });
+    assert.equal(visual.reactionTimeConstMs, 285);
+});
+
 // ── Keyboard reaction-time pre-test ────────────────────────────────────
 
 test('keyboard: clean run → median - input lag', () => {
