@@ -889,6 +889,8 @@ function _ndSnapshotPlay(reason) {
     };
     // Build the trouble map from this just-completed play BEFORE clearing
     // so the next loop iteration starts with up-to-date pre-arrival glow.
+    // First-pass: just this play. The post-fetch reload below pulls in
+    // the cross-loop aggregate once the disk POST resolves.
     _ndTroubleNotes = _ndBuildTroubleMap(noteResults);
     // Per-iteration banner — quick in-page summary of just-finished pass so
     // the user gets immediate feedback without running `make loop-report`.
@@ -901,7 +903,15 @@ function _ndSnapshotPlay(reason) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(snapshot),
-    }).then(() => console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes)`))
+    }).then(() => {
+        console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes)`);
+        // Refresh the trouble map from the cross-loop aggregate now that
+        // the new snapshot is on disk. Single-play map (set above) was
+        // a stop-gap so the immediate next iteration had glow; this
+        // overwrite uses all recent plays, so notes consistently missed
+        // across multiple loops glow harder than one-off mistakes.
+        if (reason === 'loop_restart') _ndLoadTroubleFromDisk();
+    })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
 }
 
@@ -912,7 +922,7 @@ function _ndSnapshotPlay(reason) {
 async function _ndLoadTroubleFromDisk() {
     const songId = _ndCurrentSongId();
     if (!songId) {
-        console.warn('[note_detect] Trouble map: songId is null at detect-on, retrying in 1s');
+        console.warn('[note_detect] Trouble map: songId is null, retrying in 1s');
         setTimeout(() => _ndLoadTroubleFromDisk(), 1000);
         return;
     }
@@ -925,20 +935,17 @@ async function _ndLoadTroubleFromDisk() {
             console.log(`[note_detect] Trouble map empty — no prior plays for songId="${songId}".`);
             return;
         }
-        // plays[0] is newest by mtime
-        const newest = plays[0];
-        _ndTroubleNotes = _ndBuildTroubleMap(newest.noteResults || []);
-        console.log(`[note_detect] Trouble map loaded: ${_ndTroubleNotes.size} notes from playId=${newest.playId} (${(newest.noteResults || []).length} total entries)`);
-        // Sample a few keys so a key-mismatch bug is visible in console
+        // Aggregate across all available plays (newest first) so a note
+        // missed in only one of N plays gets weighted down naturally.
+        // plays[0] is newest by mtime, plays[N-1] is oldest.
+        _ndTroubleNotes = _ndAggregateTroubleAcrossPlays(plays);
+        console.log(`[note_detect] Trouble map loaded: ${_ndTroubleNotes.size} notes aggregated across ${plays.length} play(s)`);
         const sampleKeys = [];
         for (const k of _ndTroubleNotes.keys()) {
             sampleKeys.push(k);
             if (sampleKeys.length >= 5) break;
         }
         console.log(`[note_detect] Trouble keys sample: ${JSON.stringify(sampleKeys)}`);
-        // Dump the first few CHART keys we'll be matching against, so a
-        // mismatch with trouble keys above is obvious. Captured at first
-        // draw frame; logs once.
         _ndTroubleDebugDumpPending = true;
     } catch (e) {
         console.warn('[note_detect] Trouble map load failed:', e);
@@ -6706,6 +6713,61 @@ function _ndBuildTroubleMap(noteResults) {
     return m;
 }
 
+// Aggregate trouble across multiple plays of the same song. A note that's
+// been missed in 3 of 5 recent plays is much stronger trouble signal than
+// one missed once and never since. Pure: takes plays array (newest first),
+// returns a Map.
+//
+// Per-key aggregation:
+//   missCount       plays where this note had non-zero severity
+//   maxSeverity     largest single-play severity seen
+//   recencyWeight   sum of 1/(1+age) where age is play index (newest=0)
+//   score           (missCount / plays.length) × maxSeverity
+//
+// A key is kept in the trouble map if score >= MIN_SCORE. The exposed
+// severity is the score (so the highway glow intensity reflects how
+// consistently a note has been missed, not just whether one play missed).
+//
+// The "missed once long ago, hit fine since" case naturally drops out:
+// missCount stays 1 while plays.length grows, score → 0, falls below
+// threshold.
+function _ndAggregateTroubleAcrossPlays(plays) {
+    const out = new Map();
+    if (!plays || !plays.length) return out;
+    const total = plays.length;
+    const MIN_SCORE = 0.15;   // keep if missed-fraction × maxSev >= this
+
+    const accum = new Map(); // key → {missCount, maxSeverity, recencyWeight, latestPrimary}
+    plays.forEach((play, ageIdx) => {
+        const recencyWeight = 1 / (1 + ageIdx);
+        for (const r of (play.noteResults || [])) {
+            if (!r || typeof r.severity !== 'number' || r.severity <= 0) continue;
+            const key = _ndTroubleKey(r.s, r.f, r.chartT);
+            const cur = accum.get(key) || { missCount: 0, maxSeverity: 0, recencyWeight: 0, latestPrimary: null };
+            cur.missCount += 1;
+            cur.maxSeverity = Math.max(cur.maxSeverity, r.severity);
+            cur.recencyWeight += recencyWeight;
+            // First time we see this key, the play list is newest-first so
+            // ageIdx 0 = the most recent miss → record its primary.
+            if (cur.latestPrimary === null) cur.latestPrimary = r.primary;
+            accum.set(key, cur);
+        }
+    });
+
+    for (const [key, v] of accum) {
+        const missFraction = v.missCount / total;
+        const score = missFraction * v.maxSeverity;
+        if (score < MIN_SCORE) continue;
+        out.set(key, {
+            severity: score,
+            primary: v.latestPrimary,
+            missCount: v.missCount,
+            totalPlays: total,
+        });
+    }
+    return out;
+}
+
 // Per-iteration banner toast — fixed-position summary that fades after a
 // few seconds. Replaces (or supplements) the post-play `make loop-report`
 // step for the basic per-iteration feedback case. Counts the four primary
@@ -12280,6 +12342,11 @@ setInterval(() => {
             _ndEnabled = false;
         }
         _ndResetScoring();
+        // Clear stale trouble map from previous song before the new chart
+        // loads — leftover keys from the old song would render glow at
+        // wrong positions until the new map loads.
+        _ndTroubleNotes = new Map();
+        _ndPlaysCacheSongId = null;
         await origPlaySong(filename, arrangement);
         _ndInjectButton();
         _ndAttachAutoDetectListener();
@@ -12306,6 +12373,12 @@ setInterval(() => {
         if (info && info.arrangement) {
             _ndSetArrangement(info.arrangement);
         }
+        // Load the trouble map for the NEW song's history. Without this,
+        // the glow only re-populates if the user toggles detect-on (which
+        // calls _ndLoadTroubleFromDisk via the detect-toggle path).
+        // Switching songs while detect is on left the user with no glow
+        // until they completed a full loop.
+        _ndLoadTroubleFromDisk();
     };
 })();
 
