@@ -887,6 +887,7 @@ function _ndSnapshotPlay(reason) {
             _ndLoadTroubleFromDisk();
             _ndMaybeSuggestPracticeLoop();
             _ndUpdateCoachingPanel();
+            _ndUpdateTimeline();
         }
     })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
@@ -5871,6 +5872,156 @@ function _ndCoachingLabel(v, total) {
     return null;
 }
 
+// ── Hotspot timeline ────────────────────────────────────────────────────
+// Horizontal strip mapping song time → screen position, color-coded by
+// miss density across recent plays. Lets the user see at a glance "where
+// in this song do I struggle?" alongside the highway view.
+//
+// Pure binning fn: takes plays and the chart time bounds, returns one
+// entry per bin with miss-rate + sample count.
+
+function _ndComputeTimelineBins(plays, binCount, minT, maxT) {
+    const bins = new Array(binCount);
+    for (let i = 0; i < binCount; i++) bins[i] = { hits: 0, miss: 0, total: 0 };
+    if (!plays || maxT <= minT || binCount <= 0) return bins;
+    const span = maxT - minT;
+    for (const play of plays) {
+        for (const r of (play.noteResults || [])) {
+            if (!r) continue;
+            if (typeof r.chartT !== 'number' || !isFinite(r.chartT)) continue;
+            if (r.chartT < minT || r.chartT > maxT) continue;
+            const isHit = r.primary === 'HIT' || r.primary === 'DIRTY_HIT';
+            const isMiss = r.primary === 'MISSED_NO_DETECTION'
+                || r.primary === 'MISSED_WRONG_PITCH';
+            // Skip records with unknown/unclassifiable primary so total
+            // accurately equals (hits + miss) and missRate is meaningful.
+            if (!isHit && !isMiss) continue;
+            const idx = Math.min(binCount - 1,
+                Math.max(0, Math.floor(((r.chartT - minT) / span) * binCount)));
+            const bin = bins[idx];
+            bin.total++;
+            if (isHit) bin.hits++;
+            else bin.miss++;
+        }
+    }
+    for (const b of bins) {
+        b.missRate = b.total > 0 ? b.miss / b.total : null;
+    }
+    return bins;
+}
+
+let _ndTimelineState = null;   // {minT, maxT, bins} cached between renders
+let _ndTimelineRaf = null;
+
+async function _ndUpdateTimeline() {
+    const songId = _ndCurrentSongId();
+    if (!songId) {
+        _ndRemoveTimeline();
+        return;
+    }
+    try {
+        const plays = await _ndFetchPlays(songId);
+        if (!plays || plays.length < 2) {
+            _ndRemoveTimeline();
+            return;
+        }
+        // Use the chart's note range for the timeline bounds — same as
+        // what the highway shows. Robust to whatever loop or seek state
+        // the user is in.
+        const notes = (typeof highway !== 'undefined' && highway.getNotes) ? highway.getNotes() : [];
+        if (!notes.length) {
+            _ndRemoveTimeline();
+            return;
+        }
+        const ts = notes.map(n => n.t).filter(t => isFinite(t));
+        if (!ts.length) {
+            _ndRemoveTimeline();
+            return;
+        }
+        const minT = Math.min(...ts);
+        const maxT = Math.max(...ts);
+        const binCount = 100;
+        const bins = _ndComputeTimelineBins(plays, binCount, minT, maxT);
+        _ndTimelineState = { minT, maxT, bins };
+        _ndRenderTimelineStrip();
+        _ndStartTimelinePlayheadLoop();
+    } catch (e) {
+        console.warn('[note_detect] Timeline update failed:', e);
+    }
+}
+
+function _ndRemoveTimeline() {
+    if (_ndTimelineRaf) {
+        cancelAnimationFrame(_ndTimelineRaf);
+        _ndTimelineRaf = null;
+    }
+    _ndTimelineState = null;
+    const el = document.getElementById('nd-timeline');
+    if (el) el.remove();
+}
+
+function _ndRenderTimelineStrip() {
+    if (!_ndTimelineState) return;
+    let bar = document.getElementById('nd-timeline');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'nd-timeline';
+        bar.className = 'fixed left-1/2 -translate-x-1/2 z-[140] bg-dark-800 border border-gray-700 rounded-lg shadow-2xl';
+        bar.style.bottom = '6rem';
+        bar.style.width = 'min(80vw, 960px)';
+        bar.style.height = '24px';
+        bar.style.padding = '0';
+        bar.style.overflow = 'hidden';
+        bar.title = 'Hotspot timeline — miss density across recent plays. Red = miss-heavy, green = clean. Vertical line is the playhead.';
+        document.body.appendChild(bar);
+    }
+    const { bins } = _ndTimelineState;
+    const cellWidth = 100 / bins.length;
+    // Color scheme: missRate null → dim grey (no data); 0 → green; 1 → red.
+    const cellHtml = bins.map((b, i) => {
+        let bg;
+        if (b.missRate === null) bg = 'rgba(60,60,70,0.4)';
+        else {
+            // Smooth gradient: green (0) → yellow (0.5) → red (1)
+            const r = Math.round(b.missRate * 255);
+            const g = Math.round((1 - b.missRate) * 220);
+            bg = `rgba(${r}, ${g}, 60, 0.85)`;
+        }
+        const tip = b.total > 0
+            ? `${b.miss}/${b.total} miss${b.miss === 1 ? '' : 'es'}`
+            : 'no data';
+        return `<div style="position:absolute;left:${(i * cellWidth).toFixed(3)}%;width:${cellWidth.toFixed(3)}%;top:0;bottom:0;background:${bg}" title="${tip}"></div>`;
+    }).join('');
+    bar.innerHTML = `
+        <div style="position:relative;width:100%;height:100%;">
+            ${cellHtml}
+            <div id="nd-timeline-playhead" style="position:absolute;top:0;bottom:0;width:2px;background:#22d3ee;box-shadow:0 0 4px #22d3ee;pointer-events:none;left:0;"></div>
+        </div>
+    `;
+}
+
+function _ndStartTimelinePlayheadLoop() {
+    if (_ndTimelineRaf) return;
+    const tick = () => {
+        if (!_ndTimelineState) {
+            _ndTimelineRaf = null;
+            return;
+        }
+        const head = document.getElementById('nd-timeline-playhead');
+        if (head && typeof highway !== 'undefined' && highway.getTime) {
+            const t = highway.getTime();
+            const { minT, maxT } = _ndTimelineState;
+            const span = maxT - minT;
+            if (span > 0) {
+                const frac = Math.max(0, Math.min(1, (t - minT) / span));
+                head.style.left = `${(frac * 100).toFixed(2)}%`;
+            }
+        }
+        _ndTimelineRaf = requestAnimationFrame(tick);
+    };
+    _ndTimelineRaf = requestAnimationFrame(tick);
+}
+
 async function _ndUpdateCoachingPanel() {
     const songId = _ndCurrentSongId();
     if (!songId) {
@@ -6766,10 +6917,12 @@ async function _ndToggle() {
         // player missed last time glow as they approach. Fire-and-forget;
         // glow renders only after the fetch resolves.
         _ndLoadTroubleFromDisk();
-        // Also surface the per-note coaching panel for this song's history
-        // even before the user starts a loop. Whole-song view shows top
-        // problem notes; useful for "what should I focus on?" during play.
+        // Also surface the per-note coaching panel + hotspot timeline for
+        // this song's history even before the user starts a loop. Whole-song
+        // views show problem zones; useful for "what should I focus on?"
+        // during play.
         _ndUpdateCoachingPanel();
+        _ndUpdateTimeline();
     } else {
         _ndStopAudio();
         _ndStopHUD();
@@ -11609,8 +11762,10 @@ setInterval(() => {
         // Switching songs while detect is on left the user with no glow
         // until they completed a full loop.
         _ndLoadTroubleFromDisk();
-        // Refresh coaching panel for the new song. Auto-hides if no history.
+        // Refresh coaching panel + timeline for the new song.
+        // Both auto-hide if no history exists.
         _ndUpdateCoachingPanel();
+        _ndUpdateTimeline();
     };
 })();
 
