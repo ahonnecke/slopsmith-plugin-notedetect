@@ -138,6 +138,7 @@ function loadDetectionCore() {
         calibComputeStability: sandbox._ndCalibComputeStability,
         calibFromHistory: sandbox._ndCalibFromHistory,
         aggregateTroubleAcrossPlays: sandbox._ndAggregateTroubleAcrossPlays,
+        perNoteCoaching: sandbox._ndPerNoteCoaching,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,

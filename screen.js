@@ -913,6 +913,7 @@ function _ndSnapshotPlay(reason) {
         if (reason === 'loop_restart') {
             _ndLoadTroubleFromDisk();
             _ndMaybeSuggestPracticeLoop();
+            _ndUpdateCoachingPanel();
         }
     })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
@@ -6817,6 +6818,152 @@ function _ndShowIterationBanner(noteResults) {
     }, 4000);
 }
 
+// ── Per-note coaching panel ─────────────────────────────────────────────
+// During a practice loop, surface specific feedback per problem note:
+// "late ~80 ms (3/4 plays)", "wrong fret (5/5)", etc. Only notes inside
+// the active loop range, only ones with a usable signal (>= 2 attempts).
+//
+// Pure compute fn so it's testable. Returns array of:
+//   { chartT, s, f, attempts, hits, miss, label, severity }
+// sorted by severity desc, then chartT asc.
+function _ndPerNoteCoaching(plays, loopStart, loopEnd) {
+    const byKey = new Map();
+    for (const play of (plays || [])) {
+        for (const r of (play.noteResults || [])) {
+            if (!r) continue;
+            if (typeof loopStart === 'number' && r.chartT < loopStart - 0.05) continue;
+            if (typeof loopEnd === 'number' && r.chartT > loopEnd + 0.05) continue;
+            const k = r.key || `${r.s}|${r.f}|${r.chartT}`;
+            const cur = byKey.get(k) || {
+                chartT: r.chartT, s: r.s, f: r.f, expectedMidi: r.expectedMidi,
+                attempts: 0, hits: 0, dirtyHits: 0, missNo: 0, missWrong: 0,
+                timingErrors: [], pitchErrors: [],
+            };
+            cur.attempts++;
+            if (r.primary === 'HIT') {
+                cur.hits++;
+                if (typeof r.timingError === 'number' && isFinite(r.timingError)) {
+                    cur.timingErrors.push(r.timingError);
+                }
+            } else if (r.primary === 'DIRTY_HIT') {
+                cur.dirtyHits++;
+                if (typeof r.timingError === 'number' && isFinite(r.timingError)) {
+                    cur.timingErrors.push(r.timingError);
+                }
+            } else if (r.primary === 'MISSED_NO_DETECTION') {
+                cur.missNo++;
+            } else if (r.primary === 'MISSED_WRONG_PITCH') {
+                cur.missWrong++;
+                if (typeof r.pitchError === 'number' && isFinite(r.pitchError)) {
+                    cur.pitchErrors.push(r.pitchError);
+                }
+            }
+            byKey.set(k, cur);
+        }
+    }
+
+    const out = [];
+    for (const v of byKey.values()) {
+        if (v.attempts < 2) continue;
+        const total = v.attempts;
+        const hitCount = v.hits + v.dirtyHits;
+        const missCount = v.missNo + v.missWrong;
+        const label = _ndCoachingLabel(v, total);
+        if (!label) continue;
+        out.push({
+            chartT: v.chartT, s: v.s, f: v.f,
+            attempts: total, hits: hitCount, miss: missCount,
+            label,
+            severity: missCount / total + Math.max(0, hitCount > 0 ? 0 : 0.5),
+        });
+    }
+    out.sort((a, b) => b.severity - a.severity || a.chartT - b.chartT);
+    return out;
+}
+
+function _ndCoachingLabel(v, total) {
+    // Failure-dominant first.
+    if (v.missNo === total) return `Never registered (${v.missNo}/${total})`;
+    if (v.missNo / total >= 0.5) return `Not playing (${v.missNo}/${total})`;
+    if (v.missWrong / total >= 0.5) {
+        const meanCents = v.pitchErrors.length
+            ? Math.round(v.pitchErrors.reduce((s, x) => s + x, 0) / v.pitchErrors.length)
+            : null;
+        return meanCents !== null
+            ? `Wrong fret (${meanCents > 0 ? '+' : ''}${meanCents}¢, ${v.missWrong}/${total})`
+            : `Wrong pitch (${v.missWrong}/${total})`;
+    }
+    // Mostly hits — coach on timing if there's a consistent pattern.
+    if (v.timingErrors.length >= 2) {
+        const mean = v.timingErrors.reduce((s, x) => s + x, 0) / v.timingErrors.length;
+        if (Math.abs(mean) >= 50) {
+            return mean > 0
+                ? `Late ~${Math.round(mean)} ms (${v.hits + v.dirtyHits}/${total})`
+                : `Early ~${Math.round(-mean)} ms (${v.hits + v.dirtyHits}/${total})`;
+        }
+    }
+    return null;
+}
+
+async function _ndUpdateCoachingPanel() {
+    const loop = (typeof window.getActiveLoop === 'function') ? window.getActiveLoop() : null;
+    const songId = _ndCurrentSongId();
+    if (!loop || !songId) {
+        const existing = document.getElementById('nd-coaching-panel');
+        if (existing) existing.remove();
+        return;
+    }
+    try {
+        const plays = await _ndFetchPlays(songId);
+        const items = _ndPerNoteCoaching(plays, loop.startSec, loop.endSec);
+        _ndRenderCoachingPanel(items, loop);
+    } catch (e) {
+        console.warn('[note_detect] Coaching update failed:', e);
+    }
+}
+
+function _ndRenderCoachingPanel(items, loop) {
+    let panel = document.getElementById('nd-coaching-panel');
+    if (!items.length) {
+        if (panel) panel.remove();
+        return;
+    }
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.id = 'nd-coaching-panel';
+        panel.className = 'fixed right-4 z-[150] bg-dark-800 border border-gray-600 rounded-xl px-3 py-2 shadow-2xl text-xs max-w-xs';
+        panel.style.top = '120px';
+        document.body.appendChild(panel);
+    }
+    const startMmSs = `${Math.floor(loop.startSec / 60)}:${String(Math.floor(loop.startSec % 60)).padStart(2, '0')}`;
+    const endMmSs = `${Math.floor(loop.endSec / 60)}:${String(Math.floor(loop.endSec % 60)).padStart(2, '0')}`;
+    const top = items.slice(0, 8);
+    panel.innerHTML = `
+        <div class="flex items-center justify-between mb-2 pb-1 border-b border-gray-700">
+            <div class="text-gray-300 font-semibold">Practice coaching</div>
+            <button id="nd-coaching-close" class="text-gray-500 hover:text-gray-300 text-base leading-none">×</button>
+        </div>
+        <div class="text-gray-500 text-[10px] mb-2">Loop ${startMmSs}–${endMmSs}</div>
+        <div class="space-y-1.5">
+            ${top.map(it => {
+                const tStr = `${Math.floor(it.chartT / 60)}:${String(Math.floor(it.chartT % 60)).padStart(2, '0')}.${String(Math.floor((it.chartT % 1) * 10))}`;
+                const tag = /Never|Not playing/.test(it.label) ? 'text-red-400'
+                          : /Wrong/.test(it.label) ? 'text-orange-400'
+                          : /Late/.test(it.label) ? 'text-yellow-300'
+                          : /Early/.test(it.label) ? 'text-blue-300'
+                          : 'text-gray-300';
+                return `<div class="flex items-baseline gap-2">
+                    <span class="text-gray-500 text-[10px] font-mono w-12 shrink-0">${tStr}</span>
+                    <span class="text-gray-400 text-[10px] font-mono w-10 shrink-0">s${it.s}/f${it.f}</span>
+                    <span class="${tag} text-[11px]">${it.label}</span>
+                </div>`;
+            }).join('')}
+        </div>
+        ${items.length > 8 ? `<div class="text-gray-600 text-[10px] mt-2">+${items.length - 8} more</div>` : ''}
+    `;
+    panel.querySelector('#nd-coaching-close').onclick = () => panel.remove();
+}
+
 // ── Hotspot practice banner ─────────────────────────────────────────────
 // After each loop_restart, look at recent plays for the current song,
 // find the worst hotspot, and surface a banner offering to set the live
@@ -6833,7 +6980,11 @@ async function _ndMaybeSuggestPracticeLoop() {
         const plays = await _ndFetchPlays(songId);
         if (plays.length < 2) return;
         const { rows } = _ndAggregatePlays(plays);
-        const loops = _ndSuggestLoops(rows, { maxLoops: 3 });
+        // Larger head pad for practice loops than the default. Default 0.5s
+        // is too short — the loop restart drops the player into the first
+        // miss with no anticipation time, so they miss it again. 2s gives
+        // a count's worth of lead-in.
+        const loops = _ndSuggestLoops(rows, { maxLoops: 3, padHeadSec: 2.0, padTailSec: 1.0 });
         if (!loops.length) return;
         const top = loops[0];
         if (top.noteCount < 2) return;   // not enough evidence
