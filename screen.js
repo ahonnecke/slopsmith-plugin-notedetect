@@ -537,6 +537,10 @@ let _ndNoteResults = new Map(); // key -> 'hit'|'pitch_miss'|'timing_miss'
 // "practice these" ranking: miss_count × avg_severity surfaces notes that
 // are missed often AND missed badly.
 function _ndSeverity(primary, timingError, pitchError) {
+    // Detector-failure entries are not the player's fault and shouldn't
+    // contribute to trouble-note severity. Returns 0 so they fall below
+    // any threshold the practice features use.
+    if (primary === 'IGNORED_DETECTOR_FAILURE') return 0;
     if (primary === 'MISSED_NO_DETECTION') return 1.0;
     if (primary === 'MISSED_WRONG_PITCH') {
         const cents = pitchError == null ? 200 : Math.abs(pitchError);
@@ -5089,9 +5093,58 @@ function _ndCheckMisses() {
                     siblingClaimed = true; break;
                 }
             }
-            const primary = hadDetection && !siblingClaimed
+            let primary = hadDetection && !siblingClaimed
                 ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
             const pitchErrForResult = (primary === 'MISSED_WRONG_PITCH') ? bestPitchErr : null;
+
+            // Detector-failure demotion. The score should reflect playing
+            // quality, not detector limitations. Two patterns demote a
+            // miss to IGNORED_DETECTOR_FAILURE (still recorded in the
+            // snapshot for analysis, but not counted against the score):
+            //
+            //   1. Fast-repeat NO_DETECTION — chart note < 400 ms after
+            //      the previous one. Onset detector can't fire fresh on
+            //      the re-attack while sustain is dominant.
+            //   2. WRONG_PITCH with hygiene.onTargetRatio = 0 +
+            //      contaminants — YIN locked on a different pitch
+            //      (sustain bleed from prior note dominated the window).
+            //   3. WRONG_PITCH detected ≥ 4 semitones below expected —
+            //      finger slips stay 1-3 semitones; bigger errors are
+            //      almost always sustain bleed from a low prior note.
+            //
+            // Same heuristics as _ndLikelyDetectorFailures (the offline
+            // filter applied to play-history aggregates) so live and
+            // post-hoc analysis agree on what's "really" a miss.
+            let detectorFailure = false;
+            const hyg = _ndComputeHygieneSummary(key);
+            if (primary === 'MISSED_NO_DETECTION') {
+                // Find the most recent prior chart note across all
+                // _ndNoteResults entries already finalised for this play.
+                let prevChartT = -Infinity;
+                for (const v of _ndNoteResults.values()) {
+                    if (v.chartT < noteTime && v.chartT > prevChartT) {
+                        prevChartT = v.chartT;
+                    }
+                }
+                if (prevChartT > -Infinity && (noteTime - prevChartT) < 0.4) {
+                    detectorFailure = true;
+                }
+            } else if (primary === 'MISSED_WRONG_PITCH') {
+                if (hyg
+                    && (hyg.onTargetRatio === 0 || hyg.onTargetRatio === undefined)
+                    && Array.isArray(hyg.contaminants)
+                    && hyg.contaminants.length > 0) {
+                    detectorFailure = true;
+                }
+                const semiOff = (typeof pitchErrForResult === 'number')
+                    ? Math.round(pitchErrForResult / 100) : null;
+                if (semiOff !== null && semiOff <= -4) {
+                    detectorFailure = true;
+                }
+            }
+
+            if (detectorFailure) primary = 'IGNORED_DETECTOR_FAILURE';
+
             _ndNoteResults.set(key, {
                 primary,
                 labels: [],
@@ -5110,12 +5163,15 @@ function _ndCheckMisses() {
                 // SIBLING_CLAIMED separately from NO_PLUCK_OR_ONSET so the
                 // user gets accurate "what to fix" advice.
                 siblingClaimed,
+                detectorFailure,
             });
-            _ndMisses++;
-            if (primary === 'MISSED_WRONG_PITCH') _ndPitchMisses++;
-            else _ndTimingMisses++;
-            _ndStreak = 0;
-            _ndUpdateSectionStat('miss');
+            if (!detectorFailure) {
+                _ndMisses++;
+                if (primary === 'MISSED_WRONG_PITCH') _ndPitchMisses++;
+                else _ndTimingMisses++;
+                _ndStreak = 0;
+                _ndUpdateSectionStat('miss');
+            }
             _ndRecordNowlineJudgment(s, f, _ndNoteResults.get(key));
         }
         if (gainNode) {
@@ -5598,12 +5654,19 @@ function _ndUpdateHUD() {
         // Breakdown line 2: among the hits, how many were off-axis on each
         //   side (early/late, sharp/flat). Lets the user see "most of my hits
         //   are late and sharp — I need to work on dragging and tuning up."
+        // Count ignored detector-failure entries so the user knows the score
+        // excludes them (vs. silently dropping them and looking confused).
+        let ignored = 0;
+        for (const v of _ndNoteResults.values()) {
+            if (v.primary === 'IGNORED_DETECTOR_FAILURE') ignored++;
+        }
         const offAxis = (_ndEarly + _ndLate + _ndSharp + _ndFlat) > 0
             ? `  ↑${_ndEarly} ↓${_ndLate} ♯${_ndSharp} ♭${_ndFlat}`
             : '';
         countsEl.innerHTML =
             `${_ndHits} / ${total}` +
             (_ndPitchMisses || _ndTimingMisses ? `  (p:${_ndPitchMisses} t:${_ndTimingMisses})` : '') +
+            (ignored > 0 ? ` <span class="text-[9px] text-gray-500" title="Notes excluded from score because the detector likely failed (sustain bleed, fast-repeat). Not your fault.">[${ignored} ign]</span>` : '') +
             (offAxis ? `<br><span class="text-[9px] text-gray-500">${offAxis}</span>` : '');
     }
 
