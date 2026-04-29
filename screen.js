@@ -4747,9 +4747,8 @@ const _ND_METRO_BPM = 75;
 // anticipate every beat — a continuous task that produced 6/16 usable data
 // points because most plucks ended up reactive (post-click) or off-beat
 // half-aliased. Discrete prep + GO gives the user a clear cue moment.
-const _ND_METRO_PREP_BEATS = 3;       // silent/quiet count beats per cycle
+const _ND_METRO_PREP_BEATS = 3;       // count beats per cycle (3 ticks → GO)
 const _ND_METRO_CYCLES = 6;           // GO beats per run = data points per run
-const _ND_METRO_LEAD_IN = 3;          // initial prep before first cycle
 const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of a beat
 // Hard cap for the wizard's outlier rejection. Entries beyond this are
 // dropped before any further median/σ math because they're either half-beat
@@ -4907,17 +4906,15 @@ function _ndWizStartRun(mode) {
     const origin = performance.now() + startDelay;
     _ndWizBallOrigin = origin;
 
-    // Build the beat schedule: lead-in, then N cycles of (3 prep + 1 GO).
-    // Each beat is tagged so the cue layer can render different visuals
-    // and play different tones. Only GO beats become measurement points
-    // (entered into _ndWizBeats); prep beats are pure cue.
-    const totalBeats = _ND_METRO_LEAD_IN + _ND_METRO_CYCLES * (_ND_METRO_PREP_BEATS + 1);
+    // Build the beat schedule: N identical cycles of (3 prep + 1 GO). The
+    // first cycle's prep doubles as the lead-in — no separate pre-cycle
+    // ticks. Every round the user hears 3 ticks then plays on the 4th, no
+    // exceptions. Only GO beats become measurement points (entered into
+    // _ndWizBeats); prep beats are pure cue.
+    const totalBeats = _ND_METRO_CYCLES * (_ND_METRO_PREP_BEATS + 1);
     const beatPlan = [];
-    for (let i = 0; i < _ND_METRO_LEAD_IN; i++) {
-        beatPlan.push({ index: i, kind: 'lead', cycle: -1, prepNum: i + 1 });
-    }
     for (let c = 0; c < _ND_METRO_CYCLES; c++) {
-        const baseI = _ND_METRO_LEAD_IN + c * (_ND_METRO_PREP_BEATS + 1);
+        const baseI = c * (_ND_METRO_PREP_BEATS + 1);
         for (let p = 0; p < _ND_METRO_PREP_BEATS; p++) {
             beatPlan.push({ index: baseI + p, kind: 'prep', cycle: c, prepNum: p + 1 });
         }
@@ -4937,9 +4934,9 @@ function _ndWizStartRun(mode) {
             const osc = ctx.createOscillator();
             const gain = ctx.createGain();
             osc.type = 'sine';
-            // Lead-in and prep ticks: 1200 Hz, quiet, very short (40 ms
-            // sustain). The GO tone: 500 Hz, louder, longer (130 ms),
-            // distinctly different so the user can't miss the cue moment.
+            // Prep ticks: 1200 Hz, quiet, very short (40 ms sustain). The
+            // GO tone: 500 Hz, louder, longer (130 ms), distinctly different
+            // so the user can't miss the cue moment.
             const isGo = b.kind === 'go';
             osc.frequency.value = isGo ? 500 : 1200;
             osc.connect(gain).connect(ctx.destination);
@@ -5001,11 +4998,6 @@ function _ndWizFireBeat(b, mode, scheduledTime) {
                 goDot.style.transform = 'scale(1.4)';
             }
             if (goEl) goEl.style.opacity = '1';
-        }
-        // lead-in beats keep all dots dim, just a subtle pulse on dot 1
-        if (b.kind === 'lead') {
-            const el = document.getElementById('nd-wiz-dot-1');
-            if (el) el.style.background = 'rgba(80, 80, 90, 0.7)';
         }
     }
 
