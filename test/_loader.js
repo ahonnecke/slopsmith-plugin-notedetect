@@ -139,6 +139,7 @@ function loadDetectionCore() {
         computeFretboardHeatmap: sandbox._ndComputeFretboardHeatmap,
         likelyDetectorFailures: sandbox._ndLikelyDetectorFailures,
         filterDetectorFailures: sandbox._ndFilterDetectorFailures,
+        detectTuningMismatch: sandbox._ndDetectTuningMismatch,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,

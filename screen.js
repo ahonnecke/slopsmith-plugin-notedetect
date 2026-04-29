@@ -5873,6 +5873,59 @@ function _ndCoachingLabel(v, total) {
     return null;
 }
 
+// ── Tuning-mismatch detector ────────────────────────────────────────────
+// If the chart was authored for one tuning (e.g. standard E) but the
+// instrument is in a different tuning (e.g. Eb), every note will be
+// classified as "wrong pitch" with a consistent semitone offset. The
+// signal: pitch errors cluster tightly around a non-zero semitone
+// boundary (e.g. ~-100¢ for Eb tuning).
+//
+// Practice features use this to suppress recommendations on songs where
+// the data is contaminated by tuning mismatch — drilling positions
+// because every note reads as wrong pitch wastes the user's time.
+//
+// Pure: takes plays, returns { likely, median, semitoneOffset, ... }.
+function _ndDetectTuningMismatch(plays) {
+    const errors = [];
+    for (const p of (plays || [])) {
+        for (const r of (p.noteResults || [])) {
+            if (typeof r.pitchError !== 'number' || !isFinite(r.pitchError)) continue;
+            errors.push(r.pitchError);
+        }
+    }
+    if (errors.length < 20) {
+        return { likely: false, reason: 'insufficient', n: errors.length };
+    }
+    const sorted = errors.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    // Cluster fraction: how many samples are within ±50¢ of the median.
+    // High cluster fraction means a systematic shift (uniform mismatch),
+    // not random pitch errors from finger slips.
+    const clusterCount = errors.filter(e => Math.abs(e - median) < 50).length;
+    const clusterFraction = clusterCount / errors.length;
+    const semitoneOffset = Math.round(median / 100);
+    const distanceToSemitone = Math.abs(median - semitoneOffset * 100);
+    // Likely mismatch when:
+    //   1. median pitch error > 50¢ from zero (significant systematic shift)
+    //   2. >= 70% of samples cluster within ±50¢ of the median (tight)
+    //   3. cluster centre lands within ±30¢ of a semitone boundary
+    //      (rules out random tuning-knob detuning that's not a real
+    //      half-step shift)
+    //   4. semitoneOffset != 0 (already at zero = no mismatch)
+    const likely = Math.abs(median) > 50
+        && clusterFraction >= 0.7
+        && distanceToSemitone < 30
+        && semitoneOffset !== 0;
+    return {
+        likely,
+        median: Math.round(median),
+        clusterFraction: Math.round(clusterFraction * 100) / 100,
+        semitoneOffset,
+        distanceToSemitone: Math.round(distanceToSemitone),
+        n: errors.length,
+    };
+}
+
 // ── Detector-failure filter ────────────────────────────────────────────
 // The plugin's onset detector + YIN can fail in specific regimes that
 // look like "user missed the note" in the snapshot but are really
@@ -5998,6 +6051,13 @@ async function _ndUpdateTimeline() {
     try {
         const rawPlays = await _ndFetchPlays(songId);
         if (!rawPlays || rawPlays.length < 2) {
+            _ndRemoveTimeline();
+            return;
+        }
+        // Tuning mismatch: every miss is "wrong pitch" by design. Hiding
+        // the timeline is more honest than showing a sea of red that
+        // tells the user they're missing the whole song.
+        if (_ndDetectTuningMismatch(rawPlays).likely) {
             _ndRemoveTimeline();
             return;
         }
@@ -6155,6 +6215,10 @@ async function _ndUpdateFretboardHeatmap() {
             _ndRemoveFretboardHeatmap();
             return;
         }
+        if (_ndDetectTuningMismatch(rawPlays).likely) {
+            _ndRemoveFretboardHeatmap();
+            return;
+        }
         const plays = _ndFilterDetectorFailures(rawPlays);
         const stringCount = _ndCurrentArrangement === 'bass' ? 4 : 6;
         // Find the highest fret used across plays so we don't render a bunch
@@ -6259,6 +6323,11 @@ async function _ndUpdateCoachingPanel() {
             if (existing) existing.remove();
             return;
         }
+        const tuning = _ndDetectTuningMismatch(rawPlays);
+        if (tuning.likely) {
+            _ndRenderCoachingMismatchNotice(tuning);
+            return;
+        }
         const plays = _ndFilterDetectorFailures(rawPlays);
         const items = _ndPerNoteCoaching(
             plays,
@@ -6269,6 +6338,35 @@ async function _ndUpdateCoachingPanel() {
     } catch (e) {
         console.warn('[note_detect] Coaching update failed:', e);
     }
+}
+
+function _ndRenderCoachingMismatchNotice(tuning) {
+    let panel = document.getElementById('nd-coaching-panel');
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.id = 'nd-coaching-panel';
+        panel.className = 'fixed right-4 z-[150] bg-orange-900/30 border border-orange-700 rounded-xl px-3 py-2 shadow-2xl text-xs max-w-xs';
+        panel.style.top = '120px';
+        document.body.appendChild(panel);
+    }
+    const sign = tuning.semitoneOffset > 0 ? '+' : '';
+    const tuneHint = tuning.semitoneOffset === -1 ? ' (Eb tuning?)'
+                   : tuning.semitoneOffset === -2 ? ' (D tuning?)'
+                   : tuning.semitoneOffset === 1 ? ' (F tuning?)'
+                   : '';
+    panel.innerHTML = `
+        <div class="flex items-center justify-between mb-1">
+            <div class="text-orange-300 font-semibold">⚠ Tuning mismatch</div>
+            <button id="nd-coaching-close" class="text-orange-400 hover:text-orange-200 text-base leading-none">×</button>
+        </div>
+        <div class="text-orange-200 text-[11px] leading-tight">
+            Pitch errors cluster at <strong>${sign}${tuning.median}¢</strong> (${tuning.semitoneOffset > 0 ? '+' : ''}${tuning.semitoneOffset} semitone${Math.abs(tuning.semitoneOffset) === 1 ? '' : 's'})${tuneHint}.<br>
+            Practice items suppressed — recommendations would be wrong-pitch noise, not real playing issues.
+        </div>
+        <div class="text-orange-400/70 text-[10px] mt-1">${tuning.n} samples · ${Math.round(tuning.clusterFraction * 100)}% cluster fraction</div>
+    `;
+    const closer = panel.querySelector('#nd-coaching-close');
+    if (closer) closer.onclick = () => panel.remove();
 }
 
 function _ndRenderCoachingPanel(items, loop) {
