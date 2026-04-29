@@ -888,6 +888,7 @@ function _ndSnapshotPlay(reason) {
             _ndMaybeSuggestPracticeLoop();
             _ndUpdateCoachingPanel();
             _ndUpdateTimeline();
+            _ndUpdateFretboardHeatmap();
         }
     })
       .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
@@ -6022,6 +6023,149 @@ function _ndStartTimelinePlayheadLoop() {
     _ndTimelineRaf = requestAnimationFrame(tick);
 }
 
+// ── Fretboard heatmap ──────────────────────────────────────────────────
+// Per-(string, fret) miss-rate grid. Same data as the timeline, but
+// indexed by physical position on the instrument instead of song time.
+// Useful for spotting muscle-memory issues: "always missing the 5th fret
+// on the E string" is a position problem, not a timing problem.
+//
+// Pure: builds a stringCount × (maxFret+1) grid from plays. Cells with
+// no data have missRate=null (rendered dim).
+
+function _ndComputeFretboardHeatmap(plays, opts) {
+    opts = opts || {};
+    const stringCount = opts.stringCount || 4;
+    const maxFret = opts.maxFret || 24;
+    const grid = [];
+    for (let s = 0; s < stringCount; s++) {
+        grid[s] = [];
+        for (let f = 0; f <= maxFret; f++) {
+            grid[s][f] = { hits: 0, miss: 0, total: 0, missRate: null };
+        }
+    }
+    for (const play of (plays || [])) {
+        for (const r of (play.noteResults || [])) {
+            if (!r) continue;
+            if (typeof r.s !== 'number' || r.s < 0 || r.s >= stringCount) continue;
+            if (typeof r.f !== 'number' || r.f < 0 || r.f > maxFret) continue;
+            const isHit = r.primary === 'HIT' || r.primary === 'DIRTY_HIT';
+            const isMiss = r.primary === 'MISSED_NO_DETECTION'
+                || r.primary === 'MISSED_WRONG_PITCH';
+            if (!isHit && !isMiss) continue;
+            const cell = grid[r.s][r.f];
+            cell.total++;
+            if (isHit) cell.hits++;
+            else cell.miss++;
+        }
+    }
+    for (let s = 0; s < stringCount; s++) {
+        for (let f = 0; f <= maxFret; f++) {
+            const c = grid[s][f];
+            c.missRate = c.total > 0 ? c.miss / c.total : null;
+        }
+    }
+    return grid;
+}
+
+async function _ndUpdateFretboardHeatmap() {
+    const songId = _ndCurrentSongId();
+    if (!songId) {
+        _ndRemoveFretboardHeatmap();
+        return;
+    }
+    try {
+        const plays = await _ndFetchPlays(songId);
+        if (!plays || plays.length < 2) {
+            _ndRemoveFretboardHeatmap();
+            return;
+        }
+        const stringCount = _ndCurrentArrangement === 'bass' ? 4 : 6;
+        // Find the highest fret used across plays so we don't render a bunch
+        // of empty cells past fret 12 for a song that lives in the open
+        // position. Cap at 24.
+        let maxFret = 0;
+        for (const play of plays) {
+            for (const r of (play.noteResults || [])) {
+                if (typeof r.f === 'number' && r.f > maxFret) maxFret = r.f;
+            }
+        }
+        maxFret = Math.min(24, Math.max(12, maxFret));
+        const grid = _ndComputeFretboardHeatmap(plays, { stringCount, maxFret });
+        _ndRenderFretboardHeatmap(grid, stringCount, maxFret);
+    } catch (e) {
+        console.warn('[note_detect] Heatmap update failed:', e);
+    }
+}
+
+function _ndRemoveFretboardHeatmap() {
+    const el = document.getElementById('nd-fretboard-heatmap');
+    if (el) el.remove();
+}
+
+function _ndRenderFretboardHeatmap(grid, stringCount, maxFret) {
+    let any = false;
+    for (let s = 0; s < stringCount; s++) {
+        for (let f = 0; f <= maxFret; f++) {
+            if (grid[s][f].total > 0) { any = true; break; }
+        }
+        if (any) break;
+    }
+    if (!any) {
+        _ndRemoveFretboardHeatmap();
+        return;
+    }
+    let panel = document.getElementById('nd-fretboard-heatmap');
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.id = 'nd-fretboard-heatmap';
+        panel.className = 'fixed left-4 z-[140] bg-dark-800 border border-gray-700 rounded-lg shadow-2xl p-2';
+        panel.style.bottom = '6rem';
+        panel.style.fontSize = '10px';
+        panel.title = 'Fretboard heatmap — miss rate per (string, fret) across recent plays. Hover cells for stats.';
+        document.body.appendChild(panel);
+    }
+    // Rows: highest string at top (string index 0 = lowest note for bass,
+    // highest pitch for guitar — slopsmith uses string 0 = highest pitch).
+    // Width per cell: target ~16px each but cap total so it fits the layout.
+    const cellPx = 14;
+    const labelCol = 18;
+    const totalWidth = labelCol + (maxFret + 1) * cellPx;
+    let body = `<div class="flex items-center justify-between mb-1">
+        <div class="text-gray-400 font-semibold text-[10px]">Fretboard heatmap</div>
+        <button id="nd-heatmap-close" class="text-gray-500 hover:text-gray-300 text-base leading-none">×</button>
+    </div>`;
+    body += `<div style="display:grid;grid-template-columns:${labelCol}px repeat(${maxFret + 1}, ${cellPx}px);gap:1px;">`;
+    // Header row: fret numbers
+    body += `<div></div>`;
+    for (let f = 0; f <= maxFret; f++) {
+        const showLabel = f === 0 || f === 3 || f === 5 || f === 7 || f === 9 || f === 12 || f === 15 || f === 17 || f === 19 || f === 24;
+        body += `<div class="text-gray-600 text-center" style="line-height:${cellPx}px">${showLabel ? f : ''}</div>`;
+    }
+    // Body rows
+    for (let s = 0; s < stringCount; s++) {
+        body += `<div class="text-gray-500 text-right pr-1" style="line-height:${cellPx}px">s${s}</div>`;
+        for (let f = 0; f <= maxFret; f++) {
+            const c = grid[s][f];
+            let bg, content = '';
+            if (c.missRate === null) {
+                bg = 'rgba(60,60,70,0.3)';
+            } else {
+                const r = Math.round(c.missRate * 240);
+                const g = Math.round((1 - c.missRate) * 200);
+                bg = `rgba(${r}, ${g}, 60, 0.85)`;
+                if (c.total >= 3) content = c.total >= 10 ? '●' : '·';
+            }
+            const tip = c.total > 0
+                ? `s${s}/f${f}: ${c.miss}/${c.total} miss`
+                : `s${s}/f${f}: no data`;
+            body += `<div title="${tip}" style="background:${bg};text-align:center;color:#fff;line-height:${cellPx}px;font-size:8px">${content}</div>`;
+        }
+    }
+    body += `</div>`;
+    panel.innerHTML = body;
+    panel.querySelector('#nd-heatmap-close').onclick = () => panel.remove();
+}
+
 async function _ndUpdateCoachingPanel() {
     const songId = _ndCurrentSongId();
     if (!songId) {
@@ -6923,6 +7067,7 @@ async function _ndToggle() {
         // during play.
         _ndUpdateCoachingPanel();
         _ndUpdateTimeline();
+        _ndUpdateFretboardHeatmap();
     } else {
         _ndStopAudio();
         _ndStopHUD();
@@ -11762,10 +11907,11 @@ setInterval(() => {
         // Switching songs while detect is on left the user with no glow
         // until they completed a full loop.
         _ndLoadTroubleFromDisk();
-        // Refresh coaching panel + timeline for the new song.
-        // Both auto-hide if no history exists.
+        // Refresh coaching panel + timeline + fretboard heatmap for the
+        // new song. All auto-hide if no history exists.
         _ndUpdateCoachingPanel();
         _ndUpdateTimeline();
+        _ndUpdateFretboardHeatmap();
     };
 })();
 

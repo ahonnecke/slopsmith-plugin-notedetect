@@ -136,6 +136,7 @@ function loadDetectionCore() {
         aggregateTroubleAcrossPlays: sandbox._ndAggregateTroubleAcrossPlays,
         perNoteCoaching: sandbox._ndPerNoteCoaching,
         computeTimelineBins: sandbox._ndComputeTimelineBins,
+        computeFretboardHeatmap: sandbox._ndComputeFretboardHeatmap,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,
