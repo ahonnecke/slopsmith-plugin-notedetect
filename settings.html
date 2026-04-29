@@ -15,13 +15,13 @@
             Subtracted from highway timing labels so what you see is your real offset, not the hardware delay.
             Calibrate once per setup; the value persists across sessions and songs.
         </p>
-        <button onclick="_ndOpenWizardFromSettings()"
+        <button onclick="_ndOpenCalibrationFromSettings()"
                 class="px-4 py-2 bg-blue-900/40 hover:bg-blue-900/70 rounded-xl text-sm text-blue-200 font-semibold">
             Calibrate latency
         </button>
         <p class="text-[10px] text-gray-500 mt-2 leading-tight">
-            Four phases: two reaction-time baselines (no instrument), then visual + audio bass tests.
-            Calibration locks after 3 high-confidence audio runs converge within ±10 ms.
+            Computes the bias from your accumulated play snapshots (HIT timing errors)
+            and applies it on click. Need 5+ HITs in the play history of the currently-loaded song.
         </p>
     </div>
 </div>

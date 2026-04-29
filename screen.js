@@ -425,33 +425,6 @@ let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable 
 // setup. No way to derive offline — has to be measured for each user's rig.
 let _ndMicLatencyMs = 0;
 
-// Personal auditory simple reaction time — measured by the wizard's keyboard
-// pre-test. User presses SPACE on each click; median (keydown - scheduled
-// click time) is their personal latency. Subtracted from the audio run when
-// the user plays in reaction-mode (no anticipation cluster). The previous
-// hard-coded 200 ms (Welford 1980 typical) was off by 30-50 ms for individual
-// users, propagating straight into mic-latency error. 0 = not measured yet,
-// estimator falls back to the 200 ms default.
-let _ndUserReactionAuditoryMs = 0;
-
-// Personal visual simple reaction time. Same idea as auditory but the
-// stimulus is a flashing dot; user hits SPACE on each flash. Used as the
-// reaction-time constant for the wizard's visual run, replacing the
-// 250 ms Welford default. Visual reaction is typically ~50 ms slower
-// than auditory for the same person, but the gap varies — measuring
-// directly avoids that error compounding into A/V offset.
-let _ndUserReactionVisualMs = 0;
-
-// Calibration history. Each wizard run appends one entry; stability is
-// computed over the last N high-confidence audio entries to decide whether
-// the rig is "locked" (further wizard runs are verification only) or
-// "drifting" (more data needed before trusting any single value). Entry
-// shape: { t, mode, medianMs, confidence, cluster, rtUsed }.
-let _ndCalibHistory = [];
-const _ND_CALIB_HISTORY_MAX = 20;   // soft cap on persisted entries
-const _ND_CALIB_LOCK_RUNS = 3;      // need 3 high-conf runs to lock
-const _ND_CALIB_LOCK_TOL_MS = 10;   // spread within ±this to lock
-const _ND_CALIB_DRIFT_TOL_MS = 10;  // newer run beyond this from locked → drift
 // Off by default — recording produces files (POSTed to the server, then to
 // /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
 // alongside the per-iteration play snapshots, e.g. for offline classifier
@@ -2153,9 +2126,6 @@ function _ndSaveSettings() {
             dirtyHitMaxOffRatio: _ndDirtyHitMaxOffRatio,
             clickTrackOnly: _ndClickTrackOnly,
             micLatencyMs: _ndMicLatencyMs,
-            userReactionAuditoryMs: _ndUserReactionAuditoryMs,
-            userReactionVisualMs: _ndUserReactionVisualMs,
-            calibHistory: _ndCalibHistory.slice(-_ND_CALIB_HISTORY_MAX),
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -2192,15 +2162,6 @@ function _ndLoadSettings() {
         if (s.dirtyHitMaxOffRatio !== undefined) _ndDirtyHitMaxOffRatio = s.dirtyHitMaxOffRatio;
         if (s.micLatencyMs !== undefined && isFinite(Number(s.micLatencyMs))) {
             _ndMicLatencyMs = Number(s.micLatencyMs);
-        }
-        if (s.userReactionAuditoryMs !== undefined && isFinite(Number(s.userReactionAuditoryMs))) {
-            _ndUserReactionAuditoryMs = Number(s.userReactionAuditoryMs);
-        }
-        if (s.userReactionVisualMs !== undefined && isFinite(Number(s.userReactionVisualMs))) {
-            _ndUserReactionVisualMs = Number(s.userReactionVisualMs);
-        }
-        if (Array.isArray(s.calibHistory)) {
-            _ndCalibHistory = s.calibHistory.slice(-_ND_CALIB_HISTORY_MAX);
         }
         // clickTrackOnly intentionally NOT loaded — it's a per-session
         // training toggle, not a persistent default. Reload starts with
@@ -3420,13 +3381,6 @@ function _ndProcessAudioChunk(input) {
         _ndLastOnsetPerfNow = nowPerfSec;
         _ndReattackArmed = false; // disarm until next release
         _ndOnsetCount++;
-        // Calibration wizard tap: each onset = one pluck. Hooking here (not
-        // _ndProcessFrame) means the wizard sees re-attacks during sustain
-        // — the onset detector has the rearm/refractory logic to identify a
-        // new pluck on top of a still-ringing string. The YIN-frame path
-        // missed those because the time-gap freshness filter saw no silence
-        // between the previous note's sustain and the new attack.
-        if (typeof _ndWizOnOnset === 'function') _ndWizOnOnset();
         // Flush the YIN buffers AND drop this trigger chunk. The trigger
         // chunk itself is half pre-attack (previous note's sustain) and half
         // post-attack — when previous sustain is louder than the new attack
@@ -4277,12 +4231,6 @@ async function _ndProcessFrame(buffer) {
         if (playT >= 0) _ndUpdateNoteHygiene(playT);
     }
 
-    // If the Calibration Wizard is armed on the mic step, this detection is
-    // the response to the on-screen flash — record the sample and unarm.
-    // Wizard uses the RAW detection timestamp so its latency measurement
-    // doesn't include stability-voting delay.
-    if (typeof _ndWizOnDetection === 'function') _ndWizOnDetection();
-
     // If the tuner modal is open, route the detection through the tuner's
     // string-assignment logic instead of chart matching. Tuner also uses
     // raw pitch since it shows live tuning and already has its own 1.5s
@@ -4765,1117 +4713,140 @@ function _ndStats() {
     };
 }
 
-// ── Calibration Wizard (metronome) ─────────────────────────────────────────
-// Plays a metronome at 75 BPM; user plays bass in time with each beat
-// (anticipated, not reactive — that's the whole point). For each measured
-// beat, we find the closest detection event and record the time offset.
-// Median across 8 measured beats gives the real, user-independent system
-// latency:
+// ── Mic-latency calibration from play history ────────────────────────────
+// The metronome wizard (visual + audio bass runs, keyboard reaction-time
+// pre-tests, lock-state UI) was retired. Per-run noise was ~50-70 ms
+// while play-history aggregation gives ±4 ms SE at N=1000+ HITs. The
+// wizard's auto-applied A/V offset clobbered manual settings on every
+// run because (visual_dt - audio_dt) compounded ~100 ms of measurement
+// noise.
 //
-//   Visual run: flash only. dt = detection_time − flash_time. This isolates
-//   MIC INPUT LAG (plus a tiny render delay, ~16 ms).
+// The replacement: each loop's snapshot already contains raw timingError
+// per HIT. _ndCalibFromHistory aggregates across recent plays, subtracts
+// the current mic_latency, and reports whether the post-cal median is
+// biased beyond the resolution window. Single-click apply on the
+// recommendation. No mic boot, no synthetic clicks, no false precision.
 //
-//   Audio run: click (1 kHz burst) + flash. dt = detection_time − click_emit.
-//   This is MIC LAG + AUDIO OUTPUT LAG (user plays when they HEAR the click,
-//   and the click has to go through the audio output pipeline before being
-//   audible).
-//
-//   audio_run − visual_run ≈ audio output lag alone.
-//
-// Reaction-time subtraction isn't needed because the user is anticipating
-// each beat (that's the difference from a flash-then-react design).
-//
-// Applies to:
-//   _ndDetectionLatencySec  ← audio_run (total round-trip; correct for scoring)
-//   core av_offset_ms ← audio_run − visual_run (audio output lag; correct
-//                       for shifting the highway so visuals match what you
-//                       hear)
+// A/V sync offset is no longer derived. The user adjusts it manually
+// via slopsmith's [/] keys — it's a one-time perceptual-sync knob, not
+// something to re-derive on every calibration.
 
-const _ND_METRO_BPM = 75;
-// Ready-set-GO pattern: each cycle is 3 prep beats followed by 1 PLAY beat.
-// User plucks ONLY on the PLAY beat (cycle 4 of every 4). This replaces the
-// earlier "tap continuously to a metronome" paradigm where the user had to
-// anticipate every beat — a continuous task that produced 6/16 usable data
-// points because most plucks ended up reactive (post-click) or off-beat
-// half-aliased. Discrete prep + GO gives the user a clear cue moment.
-const _ND_METRO_PREP_BEATS = 3;       // count beats per cycle (3 ticks → GO)
-const _ND_METRO_CYCLES = 6;           // GO beats per run = data points per run
-const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of a beat
-// Hard cap for the wizard's outlier rejection. Entries beyond this are
-// dropped before any further median/σ math because they're either half-beat
-// aliases (±400 ms at 75 BPM) or reaction-time responses (+150-300 ms),
-// neither of which represent calibrated mic capture latency.
-const _ND_WIZ_HARD_CAP_MS = 200;
-
-let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-keyboard-audio' | 'running-keyboard-visual' | 'running-visual' | 'running-audio' | 'review'
-let _ndWizBeats = [];             // wall times (performance.now) of measured beats
-let _ndWizDetections = [];        // [{time, midi}] of detection events during a run
-let _ndWizVisualRun = null;       // {perBeat, medianDt, droppedOutliers, dropped}
-let _ndWizAudioRun = null;
-let _ndWizTimers = [];
-let _ndWizAudioCtx = null;
-let _ndWizBallRaf = null;
-let _ndWizBallOrigin = 0;        // performance.now() at which ball == center for first beat
-// Keyboard reaction-time pre-test state. _ndWizKeyboardClicks holds scheduled
-// click times (performance.now ms), _ndWizKeyboardKeys holds keydown times
-// observed during the run. Compute pairs them by nearest-time and reports the
-// median delay as the user's personal auditory reaction time.
-let _ndWizKeyboardClicks = [];
-let _ndWizKeyboardKeys = [];
-let _ndWizKeyHandler = null;
-
-// Back-compat accessors so callers that still read the old variables work.
-Object.defineProperty(globalThis, '_ndWizVisualOffsetMs', { get: () => _ndWizVisualRun ? _ndWizVisualRun.medianDt : null, configurable: true });
-Object.defineProperty(globalThis, '_ndWizAudioOffsetMs',  { get: () => _ndWizAudioRun  ? _ndWizAudioRun.medianDt  : null, configurable: true });
-
-// Tracks whether the wizard started its own audio capture (true when
-// opened from system settings without Detect already on). Set on open,
-// checked on close so we tear down only what we started — don't kill an
-// in-game Detect session that the user wants to keep running.
-let _ndWizardOwnsMic = false;
-
-function _ndOpenWizard() {
-    _ndWizStep = 'intro';
-    _ndWizVisualRun = null;
-    _ndWizAudioRun = null;
-    _ndWizRender();
-}
-
-// Entry point from the system Settings panel (settings.html). Calibration
-// is hardware-dependent, not song-dependent, so this lets the user run it
-// without loading a song. If Detect isn't already on, we boot the mic
-// capture pipeline ourselves (covers the system-settings path) and tear
-// it down on close.
-async function _ndOpenWizardFromSettings() {
-    if (!_ndEnabled && !_ndAudioCtx) {
-        try {
-            const ok = await _ndStartAudio();
-            if (!ok) {
-                alert('Mic permission required to calibrate. Please grant access and try again.');
-                return;
-            }
-            // _ndProcessAudioChunk gates on _ndEnabled — without flipping it,
-            // the ScriptProcessor receives chunks and discards them, YIN never
-            // runs, the wizard collects zero detections, and the run finishes
-            // with medianDt=null (button stays "Start →").
-            _ndEnabled = true;
-            _ndWizardOwnsMic = true;
-        } catch (e) {
-            alert('Failed to open mic: ' + (e?.message || e));
-            return;
-        }
-    }
-    _ndOpenWizard();
-}
-
-function _ndCloseWizard() {
-    _ndWizCancelTimers();
-    _ndWizStopBall();
-    _ndWizStep = 'closed';
-    const m = document.getElementById('nd-wizard-modal');
-    if (m) m.remove();
-    // Tear down our own mic if we started it. Detect-on sessions
-    // (where _ndEnabled is true entered through the toggle, not the wizard)
-    // keep the mic running.
-    if (_ndWizardOwnsMic) {
-        _ndEnabled = false;
-        _ndStopAudio();
-        _ndWizardOwnsMic = false;
+async function _ndOpenCalibrationFromSettings() {
+    _ndRenderCalibrationModal({ loading: true });
+    try {
+        const songId = _ndCurrentSongId();
+        const plays = songId ? await _ndFetchPlays(songId) : [];
+        const scope = songId
+            ? `${songId} (${plays.length} play${plays.length === 1 ? '' : 's'})`
+            : 'no song loaded — load a song with play history';
+        const verdict = _ndCalibFromHistory(plays, _ndMicLatencyMs);
+        _ndRenderCalibrationModal({ verdict, scope });
+    } catch (e) {
+        _ndRenderCalibrationModal({ error: e?.message || String(e) });
     }
 }
 
-function _ndWizCancelTimers() {
-    for (const t of _ndWizTimers) clearTimeout(t);
-    _ndWizTimers = [];
-    if (_ndWizKeyHandler) {
-        document.removeEventListener('keydown', _ndWizKeyHandler);
-        _ndWizKeyHandler = null;
-    }
-}
-
-// Bouncing-ball metronome animation. Ball crosses the centre line on EVERY
-// beat and reaches the edges at the halfway point between beats, so the
-// trajectory gives the user anticipation — they can see the ball approaching
-// centre and play exactly when it arrives, rather than trying to react to a
-// point-in-time cue (flash/click) they can't anticipate.
-function _ndWizStartBall() {
-    _ndWizStopBall();
-    const intervalMs = 60000 / _ND_METRO_BPM;
-    const tick = () => {
-        if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') {
-            _ndWizBallRaf = null;
-            return;
-        }
-        const ball = document.getElementById('nd-wiz-ball');
-        const flash = document.getElementById('nd-wiz-metro-flash');
-        if (ball && _ndWizBallOrigin > 0) {
-            // Linear (triangle-wave) motion at constant velocity. Period =
-            // 2 beats: centre on every beat, ±edge on every half-beat. The
-            // earlier sine-wave variant accelerated through the centre,
-            // making the exact line-crossing moment hard to time — high
-            // variance in tap timing because the ball is moving fastest
-            // exactly when the user needs to read the position.
-            const elapsedBeats = (performance.now() - _ndWizBallOrigin) / intervalMs;
-            const p2 = ((elapsedBeats % 2) + 2) % 2;  // [0, 2)
-            // Triangle wave: 0 → +1 (peak at p2=0.5) → 0 (at p2=1) → −1
-            // (trough at p2=1.5) → 0 (at p2=2). Constant slope between
-            // breakpoints.
-            let v;
-            if (p2 < 0.5)      v = 2 * p2;
-            else if (p2 < 1.5) v = 2 - 2 * p2;
-            else               v = -4 + 2 * p2;
-            const x = 0.5 + 0.5 * v;
-            // 12% ball width → calc offset = 6% so centre tracks x exactly
-            ball.style.left = `calc(${(x * 100).toFixed(2)}% - 24px)`;
-
-            // Centre-line pulse: bright flash on the beat moment so the
-            // user gets a redundant "tap NOW" cue alongside the ball
-            // position. Decays over 150ms.
-            if (flash) {
-                const beatProximity = Math.min(p2 % 1, 1 - (p2 % 1));
-                const beatMs = beatProximity * intervalMs;
-                if (beatMs < 150) {
-                    const intensity = 1 - beatMs / 150;
-                    flash.style.background = `rgba(140, 220, 255, ${(0.3 + 0.6 * intensity).toFixed(2)})`;
-                    flash.style.boxShadow = `0 0 ${(8 + 14 * intensity).toFixed(0)}px rgba(140, 220, 255, ${(0.4 * intensity).toFixed(2)})`;
-                } else {
-                    flash.style.background = 'rgba(120, 120, 120, 0.5)';
-                    flash.style.boxShadow = 'none';
-                }
-            }
-        }
-        _ndWizBallRaf = requestAnimationFrame(tick);
-    };
-    _ndWizBallRaf = requestAnimationFrame(tick);
-}
-
-function _ndWizStopBall() {
-    if (_ndWizBallRaf) {
-        cancelAnimationFrame(_ndWizBallRaf);
-        _ndWizBallRaf = null;
-    }
-}
-
-// ── Keyboard reaction-time pre-test ────────────────────────────────────
-// Plays N audio clicks at evenly-spaced intervals; user presses SPACE on
-// each one. We record both scheduled click times and keydown times, then
-// pair them and take the median delay. That delay (minus a small fixed
-// keyboard input lag) IS the user's personal auditory simple reaction
-// time — used in lieu of the Welford-survey 200 ms default when the audio
-// run lands fully in reaction-cluster.
-const _ND_WIZ_KEYBOARD_CLICKS = 6;
-const _ND_WIZ_KEYBOARD_INTERVAL_MS = 1500;   // long enough that the user
-                                             // can fully release before
-                                             // the next click; short
-                                             // enough to keep the run
-                                             // brief (~10 sec).
-const _ND_WIZ_KEYBOARD_INPUT_LAG_MS = 5;     // typical browser keydown
-                                             // event lag (well-characterised
-                                             // ~3-8 ms across modern UAs).
-
-// Pure: pair scheduled click times with keypress times by nearest match,
-// compute the median delay, subtract the input-lag constant. Returns
-// {medianMs, perClick: [{scheduledMs, keyMs, dt}], dropped} where dt is
-// the raw keydown-minus-click delay (input lag still included). The final
-// reaction time = medianMs - input lag, clamped to a sane range.
-function _ndWizComputeKeyboardReaction(clickTimes, keyTimes) {
-    // Pair each click with the closest later keypress within a window.
-    // Window: 50-700 ms. Anything outside is "missed" or "anticipated"
-    // (false start) and discarded.
-    const MIN_DT = 50, MAX_DT = 700;
-    const usedKeys = new Set();
-    const perClick = clickTimes.map(c => {
-        let best = null, bestDt = null;
-        for (let i = 0; i < keyTimes.length; i++) {
-            if (usedKeys.has(i)) continue;
-            const dt = keyTimes[i] - c;
-            if (dt < MIN_DT || dt > MAX_DT) continue;
-            if (bestDt === null || dt < bestDt) {
-                best = i;
-                bestDt = dt;
-            }
-        }
-        if (best !== null) usedKeys.add(best);
-        return { scheduledMs: c, keyMs: best !== null ? keyTimes[best] : null, dt: bestDt };
-    });
-
-    const dts = perClick.map(p => p.dt).filter(d => d !== null);
-    const dropped = perClick.length - dts.length;
-    if (!dts.length) {
-        return {
-            perClick, medianMs: null, rawMedianMs: null, dropped,
-            inputLagMs: _ND_WIZ_KEYBOARD_INPUT_LAG_MS,
-            lowQuality: true,
-        };
-    }
-    const sorted = dts.slice().sort((a, b) => a - b);
-    const rawMedian = sorted[Math.floor(sorted.length / 2)];
-    const medianMs = Math.max(50, Math.round(rawMedian - _ND_WIZ_KEYBOARD_INPUT_LAG_MS));
-    return {
-        perClick, medianMs, rawMedianMs: rawMedian, dropped,
-        inputLagMs: _ND_WIZ_KEYBOARD_INPUT_LAG_MS,
-        // Stricter than "half made it" so that exactly 3-of-6 (border-
-        // line; user is hitting clicks but missing too many) gets flagged.
-        lowQuality: dts.length <= Math.floor(clickTimes.length / 2),
-    };
-}
-
-// Stimulus-agnostic keyboard reaction-time runner. stimulus = 'audio'
-// (audio click via AudioContext.start) or 'visual' (DOM-mutated dot
-// flash via setTimeout + rAF). Both paths capture keydown timings the
-// same way and feed the same compute function.
-function _ndWizStartKeyboardRun(stimulus) {
-    stimulus = stimulus || 'audio';
-    _ndWizStep = `running-keyboard-${stimulus}`;
-    _ndWizKeyboardClicks = [];
-    _ndWizKeyboardKeys = [];
-    _ndWizKeyboardStimulus = stimulus;
-    _ndWizCancelTimers();
-    _ndWizRender();   // render first so the flash dot exists in the DOM
-
-    const startDelay = 1500;
-    const startPerf = performance.now() + startDelay;
-    const intervalMs = _ND_WIZ_KEYBOARD_INTERVAL_MS;
-
-    if (stimulus === 'audio') {
-        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const ctx = _ndWizAudioCtx;
-        if (ctx.state === 'suspended') ctx.resume();
-        const startCtx = ctx.currentTime + startDelay / 1000;
-        const intervalSec = intervalMs / 1000;
-        for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
-            const ctxWhen = startCtx + i * intervalSec;
-            const perfWhen = startPerf + i * intervalMs;
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = 'sine';
-            osc.frequency.value = 800;
-            osc.connect(gain).connect(ctx.destination);
-            const sustainEnd = ctxWhen + 0.06;
-            gain.gain.setValueAtTime(0, ctxWhen);
-            gain.gain.linearRampToValueAtTime(0.4, ctxWhen + 0.005);
-            gain.gain.linearRampToValueAtTime(0, sustainEnd);
-            osc.start(ctxWhen);
-            osc.stop(sustainEnd + 0.01);
-            _ndWizKeyboardClicks.push(perfWhen);
-            _ndWizTimers.push(setTimeout(() => _ndWizUpdateKeyboardCounter(i + 1), perfWhen - performance.now()));
-        }
-    } else {
-        // Visual: setTimeout + rAF, record the actual frame paint time
-        // (not the scheduled time). This avoids the same setTimeout-jitter
-        // bias that affects the visual run's GO beat — the user reacts to
-        // the painted frame, not the scheduled DOM mutation.
-        for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
-            const perfWhen = startPerf + i * intervalMs;
-            const idx = i;
-            _ndWizTimers.push(setTimeout(() => {
-                const el = document.getElementById('nd-wiz-kbd-flash');
-                if (el) {
-                    el.style.background = '#22ff88';
-                    el.style.boxShadow = '0 0 32px 8px rgba(34,255,136,0.8)';
-                    el.style.transform = 'scale(1.4)';
-                    setTimeout(() => {
-                        if (el) {
-                            el.style.background = 'rgba(60,60,70,0.6)';
-                            el.style.boxShadow = 'none';
-                            el.style.transform = 'scale(1)';
-                        }
-                    }, 120);
-                }
-                requestAnimationFrame((frameTime) => {
-                    _ndWizKeyboardClicks[idx] = frameTime;
-                    _ndWizUpdateKeyboardCounter(idx + 1);
-                });
-            }, perfWhen - performance.now()));
-            _ndWizKeyboardClicks.push(perfWhen);  // placeholder, overwritten by rAF
-        }
-    }
-
-    _ndWizKeyHandler = (e) => {
-        if (!_ndWizStep.startsWith('running-keyboard-')) return;
-        if (e.code !== 'Space' && e.key !== ' ') return;
-        e.preventDefault();
-        _ndWizKeyboardKeys.push(performance.now());
-        _ndWizUpdateKeyboardCounter(_ndWizKeyboardKeys.length);
-    };
-    document.addEventListener('keydown', _ndWizKeyHandler);
-
-    const finishDelay = startDelay + _ND_WIZ_KEYBOARD_CLICKS * intervalMs + 1000;
-    _ndWizTimers.push(setTimeout(() => _ndWizFinishKeyboardRun(stimulus), finishDelay));
-}
-
-function _ndWizUpdateKeyboardCounter(n) {
-    const el = document.getElementById('nd-wiz-kbd-counter');
-    if (el) el.textContent = `${Math.min(n, _ND_WIZ_KEYBOARD_CLICKS)} / ${_ND_WIZ_KEYBOARD_CLICKS}`;
-}
-
-function _ndWizFinishKeyboardRun(stimulus) {
-    if (_ndWizKeyHandler) {
-        document.removeEventListener('keydown', _ndWizKeyHandler);
-        _ndWizKeyHandler = null;
-    }
-    const result = _ndWizComputeKeyboardReaction(_ndWizKeyboardClicks, _ndWizKeyboardKeys);
-    if (result.medianMs !== null && !result.lowQuality) {
-        if (stimulus === 'visual') {
-            _ndUserReactionVisualMs = result.medianMs;
-            console.log(`[note_detect] Personal visual reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
-        } else {
-            _ndUserReactionAuditoryMs = result.medianMs;
-            console.log(`[note_detect] Personal auditory reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
-        }
-        _ndSaveSettings();
-    } else {
-        console.warn(`[note_detect] ${stimulus} reaction-time test low quality (${result.dropped}/${_ND_WIZ_KEYBOARD_CLICKS} dropped)`);
-    }
-    if (stimulus === 'visual') _ndWizKeyboardLastResultVisual = result;
-    else _ndWizKeyboardLastResult = result;
-    _ndWizStep = 'intro';
-    _ndWizRender();
-}
-
-let _ndWizKeyboardLastResult = null;
-let _ndWizKeyboardLastResultVisual = null;
-let _ndWizKeyboardStimulus = null;
-
-function _ndWizStartRun(mode) {
-    _ndWizStep = 'running-' + mode;
-    _ndWizBeats = [];
-    _ndWizDetections = [];
-    _ndWizCancelTimers();
-
-    const intervalMs = 60000 / _ND_METRO_BPM;
-    const intervalSec = intervalMs / 1000;
-    const startDelay = 1200;
-    const origin = performance.now() + startDelay;
-    _ndWizBallOrigin = origin;
-
-    // Build the beat schedule: N identical cycles of (3 prep + 1 GO). The
-    // first cycle's prep doubles as the lead-in — no separate pre-cycle
-    // ticks. Every round the user hears 3 ticks then plays on the 4th, no
-    // exceptions. Only GO beats become measurement points (entered into
-    // _ndWizBeats); prep beats are pure cue.
-    const totalBeats = _ND_METRO_CYCLES * (_ND_METRO_PREP_BEATS + 1);
-    const beatPlan = [];
-    for (let c = 0; c < _ND_METRO_CYCLES; c++) {
-        const baseI = c * (_ND_METRO_PREP_BEATS + 1);
-        for (let p = 0; p < _ND_METRO_PREP_BEATS; p++) {
-            beatPlan.push({ index: baseI + p, kind: 'prep', cycle: c, prepNum: p + 1 });
-        }
-        beatPlan.push({ index: baseI + _ND_METRO_PREP_BEATS, kind: 'go', cycle: c });
-    }
-
-    // Pre-schedule audio cues on the AudioContext clock — deterministic
-    // regardless of setTimeout jitter. Prep beats are quiet high-pitched
-    // ticks; GO beat is a louder, distinct lower tone.
-    if (mode === 'audio') {
-        if (!_ndWizAudioCtx) _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const ctx = _ndWizAudioCtx;
-        if (ctx.state === 'suspended') ctx.resume();
-        const audioStartT = ctx.currentTime + startDelay / 1000;
-        for (const b of beatPlan) {
-            const when = audioStartT + b.index * intervalSec;
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = 'sine';
-            // Prep ticks: 1200 Hz, quiet, very short (40 ms sustain). The
-            // GO tone: 500 Hz, louder, longer (130 ms), distinctly different
-            // so the user can't miss the cue moment.
-            const isGo = b.kind === 'go';
-            osc.frequency.value = isGo ? 500 : 1200;
-            osc.connect(gain).connect(ctx.destination);
-            const peak = isGo ? 0.45 : 0.15;
-            const sustainEnd = when + (isGo ? 0.13 : 0.04);
-            gain.gain.setValueAtTime(0, when);
-            gain.gain.linearRampToValueAtTime(peak, when + 0.005);
-            gain.gain.linearRampToValueAtTime(0, sustainEnd);
-            osc.start(when);
-            osc.stop(sustainEnd + 0.01);
-        }
-    }
-
-    for (const b of beatPlan) {
-        const when = origin + b.index * intervalMs;
-        const delay = Math.max(0, when - performance.now());
-        _ndWizTimers.push(setTimeout(() => _ndWizFireBeat(b, mode, when), delay));
-    }
-    const finishDelay = startDelay + totalBeats * intervalMs + 500;
-    _ndWizTimers.push(setTimeout(() => _ndWizFinishRun(mode), finishDelay));
-
-    _ndWizRender();
-}
-
-function _ndWizFireBeat(b, mode, scheduledTime) {
-    // Visual cue: light up the appropriate dot in the row of 4 indicators.
-    // For lead-in (very first beats before any cycle), light a small
-    // "preparing..." indicator. For prep beats inside a cycle, light dot
-    // 1/2/3. For the GO beat, light the GO dot prominently with a flash.
-    if (mode === 'visual') {
-        // Reset all dots to dim
-        for (let k = 1; k <= 4; k++) {
-            const el = document.getElementById(`nd-wiz-dot-${k}`);
-            if (!el) continue;
-            el.style.background = 'rgba(60, 60, 70, 0.6)';
-            el.style.boxShadow = 'none';
-            el.style.transform = 'scale(1)';
-        }
-        const goEl = document.getElementById('nd-wiz-go-text');
-        if (goEl) goEl.style.opacity = '0';
-
-        if (b.kind === 'prep') {
-            // Light dot 1/2/3 in sequence as prep beats fire
-            const el = document.getElementById(`nd-wiz-dot-${b.prepNum}`);
-            if (el) {
-                el.style.background = 'rgba(180, 180, 200, 0.85)';
-                el.style.boxShadow = '0 0 12px 3px rgba(180,180,200,0.4)';
-            }
-        } else if (b.kind === 'go') {
-            // Light all three prep dots faded + the GO dot bright + show "PLAY"
-            for (let k = 1; k <= 3; k++) {
-                const el = document.getElementById(`nd-wiz-dot-${k}`);
-                if (el) el.style.background = 'rgba(120, 120, 140, 0.5)';
-            }
-            const goDot = document.getElementById('nd-wiz-dot-4');
-            if (goDot) {
-                goDot.style.background = '#22ff88';
-                goDot.style.boxShadow = '0 0 32px 8px rgba(34,255,136,0.8)';
-                goDot.style.transform = 'scale(1.4)';
-            }
-            if (goEl) goEl.style.opacity = '1';
-        }
-    }
-
-    // Use the SCHEDULED beat time (not performance.now() at firing) so dt
-    // calculation reflects deterministic schedule, not setTimeout jitter.
-    // Only GO beats are measurement points.
-    if (b.kind === 'go') _ndWizBeats.push(scheduledTime);
-
-    const counter = document.getElementById('nd-wiz-counter');
-    if (counter) {
-        counter.textContent = `${_ndWizBeats.length} / ${_ND_METRO_CYCLES}`;
-    }
-}
-
-// Pure: take the wizard's beat schedule + detection events, return the run
-// record (perBeat, medianDt, drop counts, lowQuality flag). No side effects,
-// no DOM, no module-state writes — fully testable offline. The wrapper
-// (_ndWizFinishRun) handles the imperative parts.
-//
-// Detection events are now onset-driven (one entry per pluck, populated by
-// _ndWizOnOnset and enriched with pitch by _ndWizOnDetection). Earlier
-// versions sourced from raw YIN frames and pre-filtered with a 120 ms
-// time-gap "freshness" rule; that collapsed sustained pitch frames into
-// one but ALSO collapsed legitimate re-attacks during sustain (pluck
-// note 2 while note 1 is still ringing — no silence gap, dropped). The
-// onset detector handles sustain re-attacks via its release/rearm gate,
-// so each entry here is already a fresh pluck.
-function _ndWizComputeRun(beats, detections, mode, opts) {
-    // Assignment: for each beat, find the detection within the beat window
-    // closest in time. Defensive: if the same detection lands inside two
-    // adjacent beat windows (75 BPM = 800 ms; window = ±400 ms), each beat
-    // looks at it independently. The hard-cap stage drops the bad match.
-    const perBeat = beats.map(beatT => {
-        let picked = null;
-        let pickedDt = null;
-        for (const det of detections) {
-            const dt = det.time - beatT;
-            if (Math.abs(dt) > _ND_METRO_BEAT_WINDOW_MS) continue;
-            if (picked === null || Math.abs(dt) < Math.abs(pickedDt)) {
-                picked = det;
-                pickedDt = dt;
-            }
-        }
-        return { beatT, dt: pickedDt, detection: picked };
-    });
-
-    // Bimodal estimator. Humans land in one of two stable strategies when
-    // asked to play on a click: (a) anticipate — pluck on/near the beat;
-    // (b) react — pluck full reaction-time after the beat. Either yields
-    // the calibration value; we just have to know which mode the user
-    // was in for each pluck.
-    //
-    //   Anticipation cluster:  dt in (-150, +150) ms — pluck near beat.
-    //   Reaction cluster:      dt in (+150/+200, +350/+400) ms (mode-dep)
-    //                          → adjusted = median - reaction_time_const
-    //   Out-of-range:          everything else (off-beat, half-beat alias).
-    //
-    // When BOTH clusters are populated and their estimates agree within
-    // 60 ms we declare convergent and confidence is high — the answer is
-    // encoded twice and matches. When only one cluster has data, we use
-    // it; reaction-only is medium confidence (depends on the constant).
-    //
-    // Reaction-time constants. Default surveys put auditory simple
-    // reaction at ~200 ms, visual at ~250 ms (Welford 1980, Kosinski
-    // 2008). The audio path overrides the default with the user's
-    // personal measurement from the keyboard pre-test (param.audioRtMs)
-    // when available — individual reaction times vary by 30-50 ms, and
-    // that error propagates straight into mic-latency miscalibration.
-    const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
-    const personalAudioRt = (opts && opts.audioRtMs) || 0;
-    const personalVisualRt = (opts && opts.visualRtMs) || 0;
-    const REACTION_TIME_MS = mode === 'visual'
-        ? (personalVisualRt > 0 ? personalVisualRt : 250)
-        : (personalAudioRt > 0 ? personalAudioRt : 200);
-    // Cluster bounds widen with the reaction-time constant so the
-    // reaction window remains centred on the expected response.
-    const ANTI_LO = -150, ANTI_HI = 150;
-    const REACT_LO = mode === 'visual' ? 200 : Math.max(120, REACTION_TIME_MS - 80);
-    const REACT_HI = mode === 'visual' ? 400 : REACTION_TIME_MS + 150;
-
-    const anticipation = dts.filter(d => d >= ANTI_LO && d <= ANTI_HI);
-    const reaction = dts.filter(d => d > REACT_LO && d <= REACT_HI);
-    const outOfRange = dts.length - anticipation.length - reaction.length;
-
-    const median = arr => {
-        if (!arr.length) return null;
-        const s = arr.slice().sort((a, b) => a - b);
-        return s[Math.floor(s.length / 2)];
-    };
-    const anticipationMedian = median(anticipation);
-    const reactionMedian = median(reaction);
-    const reactionAdjusted = reactionMedian !== null
-        ? reactionMedian - REACTION_TIME_MS
-        : null;
-
-    let medianDt = null;
-    let usedCluster = 'none';
-    let confidence = 'low';
-    let convergent = false;
-
-    if (anticipationMedian !== null) {
-        medianDt = anticipationMedian;
-        usedCluster = 'anticipation';
-        confidence = anticipation.length >= 3 ? 'high' : 'medium';
-        if (reactionAdjusted !== null
-            && Math.abs(anticipationMedian - reactionAdjusted) < 60) {
-            convergent = true;
-            confidence = 'high';
-            usedCluster = 'both';
-            // Sample-weighted mean of the two estimates.
-            const total = anticipation.length + reaction.length;
-            medianDt = Math.round(
-                (anticipationMedian * anticipation.length
-                 + reactionAdjusted * reaction.length) / total
-            );
-        }
-    } else if (reactionAdjusted !== null) {
-        medianDt = reactionAdjusted;
-        usedCluster = 'reaction';
-        confidence = reaction.length >= 3 ? 'medium' : 'low';
-    }
-
-    const lowQuality = medianDt === null;
-
-    return {
-        perBeat, medianDt,
-        anticipationMedian, anticipationCount: anticipation.length,
-        reactionMedian, reactionAdjusted, reactionCount: reaction.length,
-        outOfRangeCount: outOfRange,
-        convergent, confidence, usedCluster,
-        reactionTimeConstMs: REACTION_TIME_MS,
-        antiBounds: [ANTI_LO, ANTI_HI],
-        reactBounds: [REACT_LO, REACT_HI],
-        // Legacy field names preserved so existing UI / tests don't break.
-        droppedHardCap: outOfRange,
-        droppedOutliers: 0,
-        droppedNoDetection: perBeat.length - dts.length,
-        usedCount: anticipation.length + reaction.length,
-        lowQuality,
-        hardCapMs: _ND_WIZ_HARD_CAP_MS,  // legacy, no longer the actual cap
-        mode,
-    };
-}
-
-function _ndWizFinishRun(mode) {
-    const runResult = _ndWizComputeRun(
-        _ndWizBeats, _ndWizDetections, mode,
-        {
-            audioRtMs: _ndUserReactionAuditoryMs,
-            visualRtMs: _ndUserReactionVisualMs,
-        }
-    );
-    if (mode === 'visual') _ndWizVisualRun = runResult;
-    else if (mode === 'audio') _ndWizAudioRun = runResult;
-
-    _ndCalibAppendRun(mode, runResult);
-
-    _ndWizStep = 'intro';
-    _ndWizRender();
-}
-
-function _ndCalibAppendRun(mode, run) {
-    if (!run) return;
-    const entry = {
-        t: Date.now(),
-        mode,
-        medianMs: run.medianDt !== null && run.medianDt !== undefined ? Math.round(run.medianDt) : null,
-        confidence: run.confidence || 'low',
-        cluster: run.usedCluster || 'none',
-        rtUsed: mode === 'visual' ? _ndUserReactionVisualMs : _ndUserReactionAuditoryMs,
-    };
-    _ndCalibHistory.push(entry);
-    if (_ndCalibHistory.length > _ND_CALIB_HISTORY_MAX) {
-        _ndCalibHistory = _ndCalibHistory.slice(-_ND_CALIB_HISTORY_MAX);
-    }
+function _ndApplyMicLatencyFromVerdict(value) {
+    const v = Math.max(0, Math.round(Number(value)));
+    if (!Number.isFinite(v)) return;
+    _ndMicLatencyMs = v;
     _ndSaveSettings();
+    if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+        window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: v });
+    }
+    console.log(`[note_detect] Mic latency set to ${v} ms via play-history calibration`);
+    _ndCloseCalibrationModal();
 }
 
-// Pure: stability over a calibration history. Filters by mode (default
-// 'audio' since that's what locks mic latency), picks high-confidence
-// runs only, returns one of:
-//   { status: 'insufficient', count, requiredCount, recentValues }
-//   { status: 'locked', lockedValue, stddev, recentValues }
-//   { status: 'drifting', stddev, recentValues, spread }
-//   { status: 'drift-warning', lockedValue, latestValue, recentValues }
-//
-// Status meanings:
-//   insufficient — fewer than _ND_CALIB_LOCK_RUNS high-conf runs. Keep
-//                  calibrating.
-//   locked       — last N runs are within tolerance. Calibration is
-//                  done; subsequent wizard runs are verification.
-//   drifting     — last N runs spread > tolerance. Either the rig is
-//                  unstable or playing variance dominates; more data
-//                  won't help, investigate.
-//   drift-warning — was previously locked at a stable value, latest run
-//                   moved beyond the drift tolerance. Setup may have
-//                   changed (different audio interface, OS update, etc).
-function _ndCalibComputeStability(history, opts) {
-    opts = opts || {};
-    const mode = opts.mode || 'audio';
-    const lockRuns = opts.lockRuns || _ND_CALIB_LOCK_RUNS;
-    const lockTol = opts.lockTolMs !== undefined ? opts.lockTolMs : _ND_CALIB_LOCK_TOL_MS;
-    const driftTol = opts.driftTolMs !== undefined ? opts.driftTolMs : _ND_CALIB_DRIFT_TOL_MS;
-
-    const highConf = (history || []).filter(e =>
-        e.mode === mode
-        && e.confidence === 'high'
-        && e.medianMs !== null
-        && e.medianMs !== undefined
-    );
-    if (highConf.length < lockRuns) {
-        return {
-            status: 'insufficient',
-            count: highConf.length,
-            requiredCount: lockRuns,
-            recentValues: highConf.map(e => e.medianMs),
-        };
-    }
-    const recent = highConf.slice(-lockRuns);
-    const values = recent.map(e => e.medianMs);
-    const mean = values.reduce((s, v) => s + v, 0) / values.length;
-    const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length;
-    const stddev = Math.sqrt(variance);
-    const spread = Math.max(...values) - Math.min(...values);
-
-    // If there's earlier history beyond `recent`, check whether the
-    // pre-latest window was locked and the latest entry diverges from it.
-    if (highConf.length > lockRuns) {
-        const earlier = highConf.slice(-lockRuns - 1, -1);
-        const earlierVals = earlier.map(e => e.medianMs);
-        const earlierMean = earlierVals.reduce((s, v) => s + v, 0) / earlierVals.length;
-        const earlierSpread = Math.max(...earlierVals) - Math.min(...earlierVals);
-        const latest = highConf[highConf.length - 1].medianMs;
-        if (earlierSpread <= lockTol && Math.abs(latest - earlierMean) > driftTol) {
-            return {
-                status: 'drift-warning',
-                lockedValue: Math.round(earlierMean),
-                latestValue: latest,
-                recentValues: values,
-                stddev: Math.round(stddev),
-            };
-        }
-    }
-
-    if (spread <= lockTol) {
-        return {
-            status: 'locked',
-            lockedValue: Math.round(mean),
-            stddev: Math.round(stddev * 10) / 10,
-            recentValues: values,
-        };
-    }
-    return {
-        status: 'drifting',
-        stddev: Math.round(stddev * 10) / 10,
-        spread,
-        recentValues: values,
-    };
+function _ndCloseCalibrationModal() {
+    const m = document.getElementById('nd-calib-modal');
+    if (m) m.remove();
 }
 
-// Wizard detections are sourced from two paths to maximise coverage:
-//   (1) Onset detector fires — most precise timing, catches re-attacks
-//       during sustain (the case the old time-gap freshness filter
-//       missed). Pushes with midi=-1; YIN enriches later when it locks.
-//   (2) YIN-frame fallback — when the onset detector misses a soft
-//       pluck whose RMS doesn't cross _ND_ONSET_LEVEL but YIN still
-//       finds confident pitch. Pushed only on a real silence-to-pitch
-//       transition (120 ms gap from the last entry), to avoid every
-//       sustained frame becoming a separate pluck.
-const _ND_WIZ_ENRICH_WINDOW_MS = 200;
-const _ND_WIZ_FRAME_GAP_MS = 120;
-
-function _ndWizOnOnset() {
-    if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') return;
-    _ndWizDetections.push({
-        time: performance.now(),
-        midi: -1,
-    });
-}
-
-function _ndWizOnDetection() {
-    if (_ndWizStep !== 'running-visual' && _ndWizStep !== 'running-audio') return;
-    const now = performance.now();
-    const last = _ndWizDetections[_ndWizDetections.length - 1];
-    // Recent onset awaiting pitch — enrich rather than push.
-    if (last && last.midi === -1 && (now - last.time) < _ND_WIZ_ENRICH_WINDOW_MS) {
-        last.midi = _ndDetectedMidi;
-        return;
-    }
-    // No recent onset. Push only if past the silence-gap threshold so
-    // sustained frames don't each register as a separate pluck.
-    if (!last || (now - last.time) >= _ND_WIZ_FRAME_GAP_MS) {
-        _ndWizDetections.push({ time: now, midi: _ndDetectedMidi });
-    }
-}
-
-// Each side of the wizard (mic latency, A/V offset) writes only when its
-// source run is solid enough to back the value. A high-confidence audio
-// run still applies the mic latency even if the visual run was sparse;
-// we don't drag the audio win down with bad visual data. Returns the
-// applied/skipped breakdown so the UI can show the user what changed.
-function _ndWizRunIsApplyable(run) {
-    if (!run || run.medianDt === null || run.medianDt === undefined) return false;
-    if (run.confidence === 'high') return true;
-    if (run.confidence === 'medium' && run.usedCount >= 3) return true;
-    return false;
-}
-
-async function _ndWizApplyMetro() {
-    const aRun = _ndWizAudioRun;
-
-    const applied = [];
-    const skipped = [];
-
-    // Mic capture latency = audio run median dt. Apply only when the audio
-    // run is high confidence (convergent or thick anticipation cluster) or
-    // medium confidence with a usable sample count. Single-sample medium
-    // confidence is too noisy to commit.
-    if (_ndWizRunIsApplyable(aRun)) {
-        const audioMs = Math.round(aRun.medianDt);
-        const value = Math.max(0, audioMs);
-        _ndMicLatencyMs = value;
-        _ndSaveSettings();
-        applied.push(`mic latency = ${value} ms (audio run ${aRun.confidence}/${aRun.usedCluster}, n=${aRun.usedCount})`);
-        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
-            window.slopsmith.emit('notedetect:calibrated', { micLatencyMs: value });
-        }
-    } else if (aRun) {
-        skipped.push(`mic latency (audio run too thin: confidence=${aRun.confidence}, n=${aRun.usedCount})`);
-    }
-
-    // A/V offset is intentionally NOT auto-applied. Earlier versions wrote
-    // visual_dt - audio_dt to slopsmith's av_offset_ms whenever both runs
-    // were "applyable", but the wizard's per-run noise (~50 ms per side)
-    // means the diff is ±100 ms noisy and clobbered the user's manual
-    // setting on every wizard run. Visuals went visibly out of sync after
-    // any wizard apply.
-    //
-    // The wizard now MEASURES and DISPLAYS the A/V offset (in the review
-    // panel), but doesn't write to slopsmith. The user adjusts av_offset
-    // manually via slopsmith's [/] keys or the slider — that's a one-time
-    // visual-sync calibration, not something to re-derive each wizard run.
-    if (_ndWizVisualRun && _ndWizAudioRun) {
-        const v = _ndWizVisualRun.medianDt;
-        const a = _ndWizAudioRun.medianDt;
-        if (v !== null && a !== null) {
-            skipped.push(`A/V offset suggestion = ${Math.round(v - a)} ms (set manually via slopsmith's [/] keys; wizard no longer auto-writes this)`);
-        }
-    }
-
-    if (applied.length) console.log(`[note_detect] Calibration applied: ${applied.join('; ')}`);
-    if (skipped.length) console.log(`[note_detect] Calibration skipped: ${skipped.join('; ')}`);
-
-    _ndResetScoring();
-    _ndCloseWizard();
-}
-
-function _ndWizRender() {
-    let modal = document.getElementById('nd-wizard-modal');
-    if (_ndWizStep === 'closed') {
-        if (modal) modal.remove();
-        return;
-    }
+function _ndRenderCalibrationModal(state) {
+    let modal = document.getElementById('nd-calib-modal');
     if (!modal) {
         modal = document.createElement('div');
-        modal.id = 'nd-wizard-modal';
+        modal.id = 'nd-calib-modal';
         modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
         document.body.appendChild(modal);
     }
-
-    const beatsDone = _ndWizBeats.length;
-    const beatsExpected = _ND_METRO_CYCLES;
     const wrap = (inner) => `
         <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl text-gray-200">
             <div class="flex items-center justify-between mb-4">
-                <h3 class="text-lg font-bold">Calibration Wizard</h3>
-                <button onclick="_ndCloseWizard()" class="text-gray-400 hover:text-white">✕</button>
+                <h3 class="text-lg font-bold">Mic Latency Calibration</h3>
+                <button onclick="_ndCloseCalibrationModal()" class="text-gray-400 hover:text-white">✕</button>
             </div>
             ${inner}
         </div>`;
 
-    if (_ndWizStep === 'intro') {
-        const vDone = _ndWizVisualOffsetMs !== null;
-        const aDone = _ndWizAudioOffsetMs !== null;
-        const rtAud = _ndUserReactionAuditoryMs;
-        const rtVis = _ndUserReactionVisualMs;
-        const rtAudDone = rtAud > 0;
-        const rtVisDone = rtVis > 0;
-        const stab = _ndCalibComputeStability(_ndCalibHistory, { mode: 'audio' });
-        const stabBlock = (() => {
-            if (stab.status === 'locked') {
-                return `<div class="bg-green-900/30 border border-green-800/50 rounded-xl p-3 mb-3 text-xs text-green-200 leading-tight">
-                    <strong>🔒 Calibration locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms ±${stab.stddev} ms</strong> · last 3 runs: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.
-                    <span class="text-gray-400">Further runs are verification — only re-run if your audio rig changed.</span>
-                </div>`;
-            }
-            if (stab.status === 'drift-warning') {
-                return `<div class="bg-orange-900/40 border border-orange-700/50 rounded-xl p-3 mb-3 text-xs text-orange-200 leading-tight">
-                    <strong>⚠ Drift detected</strong> · was locked at ${stab.lockedValue >= 0 ? '+' : ''}${stab.lockedValue} ms; latest run ${stab.latestValue >= 0 ? '+' : ''}${stab.latestValue} ms (Δ ${Math.abs(stab.latestValue - stab.lockedValue)} ms).
-                    Did your audio interface change? If not, re-run to confirm.
-                </div>`;
-            }
-            if (stab.status === 'drifting') {
-                return `<div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-xs text-yellow-200 leading-tight">
-                    <strong>Calibrating</strong> · last ${stab.recentValues.length} runs spread ${stab.spread} ms (σ ${stab.stddev}). Need 3 high-confidence runs within ±${_ND_CALIB_LOCK_TOL_MS} ms to lock.<br>
-                    <span class="text-gray-400">Recent: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.</span>
-                </div>`;
-            }
-            return `<div class="bg-dark-800/60 border border-gray-800 rounded-xl p-3 mb-3 text-xs text-gray-300 leading-tight">
-                <strong>Calibrating</strong> · ${stab.count} of ${stab.requiredCount} high-confidence audio runs collected.${stab.recentValues.length ? ` Recent: ${stab.recentValues.map(v => (v >= 0 ? '+' : '') + v).join(', ')} ms.` : ''}
-            </div>`;
-        })();
-        modal.innerHTML = wrap(`
-            ${stabBlock}
-            <p class="text-sm text-gray-300 mb-2">Two reaction-time baselines (no instrument), then two bass tests.</p>
-            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Steps 1a/1b measure how fast you respond to a stimulus. Steps 2/3 measure your bass-pluck timing. Subtracting the personal reaction time isolates the mic pipeline from your reflexes.</p>
-            <div class="space-y-2 mb-4">
-                <button onclick="_ndWizStartKeyboardRun('audio')" class="w-full flex items-center justify-between px-4 py-2 ${rtAudDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>1a. Auditory reaction</strong> — SPACE on click (~10s).</span>
-                    <span class="text-xs text-gray-400">${rtAudDone ? `✓ ${rtAud} ms` : 'Start →'}</span>
-                </button>
-                <button onclick="_ndWizStartKeyboardRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${rtVisDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>1b. Visual reaction</strong> — SPACE on flash (~10s).</span>
-                    <span class="text-xs text-gray-400">${rtVisDone ? `✓ ${rtVis} ms` : 'Start →'}</span>
-                </button>
-                <button onclick="_ndWizStartRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${vDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>2. Visual bass</strong> — pluck on the green GO dot.</span>
-                    <span class="text-xs text-gray-400">${vDone ? `✓ ${Math.round(_ndWizVisualOffsetMs)} ms` : 'Start →'}</span>
-                </button>
-                <button onclick="_ndWizStartRun('audio')" class="w-full flex items-center justify-between px-4 py-2 ${aDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>3. Audio bass</strong> — pluck on the lower GO tone.</span>
-                    <span class="text-xs text-gray-400">${aDone ? `✓ ${Math.round(_ndWizAudioOffsetMs)} ms` : 'Start →'}</span>
-                </button>
-            </div>
-            <div class="flex gap-3 justify-end">
-                <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel</button>
-                <button onclick="_ndWizStep='review'; _ndWizRender()" ${(vDone && aDone) ? '' : 'disabled'} class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white disabled:opacity-50">Review</button>
-            </div>
-        `);
-    } else if (_ndWizStep === 'running-keyboard-audio' || _ndWizStep === 'running-keyboard-visual') {
-        const stim = _ndWizStep === 'running-keyboard-visual' ? 'visual' : 'audio';
-        const result = stim === 'visual' ? _ndWizKeyboardLastResultVisual : _ndWizKeyboardLastResult;
-        const lastInfo = result && result.medianMs !== null
-            ? `<p class="text-[11px] text-gray-400 mt-2">Last run: ${result.medianMs} ms (raw ${result.rawMedianMs} − ${result.inputLagMs} input lag)</p>`
-            : '';
-        const stimulus = stim === 'visual'
-            ? `<strong>Press SPACE</strong> as soon as the dot flashes green. Don't anticipate — react.`
-            : `<strong>Press SPACE</strong> as soon as you hear each click. Don't anticipate — react.`;
-        const stimArea = stim === 'visual'
-            ? `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 relative">
-                   <div id="nd-wiz-kbd-flash" class="w-16 h-16 rounded-full transition-none" style="background:rgba(60,60,70,0.6)"></div>
-                   <div id="nd-wiz-kbd-counter" class="absolute right-3 top-2 text-gray-200 text-xl font-mono">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</div>
-               </div>`
-            : `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-200 text-3xl font-mono">
-                   <span id="nd-wiz-kbd-counter">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</span>
-               </div>`;
-        modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-3">${stimulus} ${_ND_WIZ_KEYBOARD_CLICKS} stimuli at ${(_ND_WIZ_KEYBOARD_INTERVAL_MS / 1000).toFixed(1)}-sec intervals.</p>
-            ${stimArea}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight">No instrument needed. The wizard measures (keydown − stimulus) and stores the median minus a fixed input-lag constant as your personal ${stim} reaction time.</p>
-            ${lastInfo}
-            <div class="flex gap-3 justify-end">
-                <button onclick="_ndWizCancelTimers();_ndWizStep='intro';_ndWizRender()"
-                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel</button>
-            </div>
-        `);
-    } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
-        const mode = _ndWizStep.slice('running-'.length);
-        // Visual mode shows a row of 4 dots: 1 → 2 → 3 → GO! Each prep
-        // beat lights its dot in turn; the GO beat lights the rightmost
-        // dot prominently with "PLAY" text. Audio mode hides the dots
-        // entirely so the user locks onto the audible cue alone.
-        const dotRow = `
-            <div class="flex items-center justify-center gap-6 h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 relative">
-                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-1" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">1</span></div>
-                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-2" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">2</span></div>
-                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-3" class="w-10 h-10 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-gray-500">3</span></div>
-                <div class="flex flex-col items-center gap-1"><div id="nd-wiz-dot-4" class="w-12 h-12 rounded-full transition-all duration-100" style="background:rgba(60,60,70,0.6)"></div><span class="text-[10px] text-green-400 font-bold">GO</span></div>
-                <div id="nd-wiz-go-text" class="absolute top-1 right-3 text-2xl font-black text-green-300 transition-opacity duration-100" style="opacity:0; text-shadow:0 0 12px rgba(34,255,136,0.8)">PLAY!</div>
-            </div>`;
-        const runArea = mode === 'visual'
-            ? dotRow
-            : `<div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-400 text-sm">
-                   <span>🎧 Ears only — listen for the lower-pitched <strong class="text-green-300">GO</strong> tone after 3 quiet ticks</span>
-               </div>`;
-        const instr = mode === 'visual'
-            ? 'Watch the dots. Three count-in dots light in sequence (1, 2, 3), then the GO dot pulses bright green — pluck on GO, not before, not after. The count gives you the rhythm so you can hit GO with no reaction delay.'
-            : 'Eyes closed or away. Three quiet high ticks at 75 BPM, then a louder lower tone — pluck on the lower tone. Three ticks let you anticipate; the GO is unmistakable.';
-        modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-3">${instr}</p>
-            ${runArea}
-            <div class="text-center text-lg font-mono text-gray-300 mb-3">
-                <span id="nd-wiz-counter">${beatsDone} / ${beatsExpected}</span>
-            </div>
-            <div class="flex gap-3 justify-end">
-                <button onclick="_ndWizCancelTimers();_ndWizStopBall();_ndWizStep='intro';_ndWizRender()"
-                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel run</button>
-            </div>
-        `);
-    } else if (_ndWizStep === 'review') {
-        const vRun = _ndWizVisualRun;
-        const aRun = _ndWizAudioRun;
-        const v = vRun ? vRun.medianDt : null;
-        const a = aRun ? aRun.medianDt : null;
-        const avRaw = (a !== null && v !== null) ? Math.round(v - a) : 0;
-        const avApplied = Math.max(-1000, Math.min(1000, avRaw));
-        const latRaw = a !== null ? Math.round(a) : 0;
-        const latApplied = Math.max(0, latRaw);
-
-        const warnings = [];
-        if (vRun && !v && v !== 0) warnings.push('Visual run produced no usable cluster — every pluck was off-beat (outside both anticipation and reaction windows).');
-        if (aRun && !a && a !== 0) warnings.push('Audio run produced no usable cluster — every pluck was off-beat.');
-        if (latRaw < 0) warnings.push(`Plugin Audio Latency clamped from ${latRaw} to <strong>${latApplied}</strong> (physical latency can't be negative).`);
-        if (avRaw !== avApplied) warnings.push(`A/V Sync Offset clamped from ${avRaw} to <strong>${avApplied}</strong> (out of ±1000 ms range).`);
-
-        const noteName = (m) => {
-            if (m < 0 || !isFinite(m)) return '—';
-            const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-            const r = Math.round(m);
-            return `${names[((r % 12) + 12) % 12]}${Math.floor(r / 12) - 1}`;
-        };
-
-        const perBeatTable = (run, label) => {
-            if (!run) return '';
-            const [antiLo, antiHi] = run.antiBounds || [-150, 150];
-            const [reactLo, reactHi] = run.reactBounds || [150, 350];
-            const tag = (dt) => {
-                if (dt === null) return { kind: 'none', label: '' };
-                if (dt >= antiLo && dt <= antiHi) return { kind: 'anti', label: 'anticipation' };
-                if (dt > reactLo && dt <= reactHi) return { kind: 'react', label: 'reaction' };
-                return { kind: 'out', label: 'off-beat' };
-            };
-            const rows = run.perBeat.map((b, i) => {
-                const dtTxt = b.dt === null ? '<span class="text-gray-600">no detection</span>'
-                    : `<span class="text-gray-200 font-mono">${b.dt >= 0 ? '+' : ''}${Math.round(b.dt)} ms</span>`;
-                const note = b.detection ? noteName(b.detection.midi) : '—';
-                const t = tag(b.dt);
-                const rowCls = t.kind === 'anti' ? 'text-green-300'
-                             : t.kind === 'react' ? 'text-blue-300'
-                             : t.kind === 'out' ? 'text-orange-400'
-                             : '';
-                return `
-                    <tr class="${rowCls}">
-                        <td class="py-0.5 pr-2 text-gray-500">${i + 1}</td>
-                        <td class="py-0.5 pr-2">${dtTxt}</td>
-                        <td class="py-0.5 pr-2 font-mono text-gray-500">${note}</td>
-                        <td class="py-0.5 text-[10px]">${t.label}</td>
-                    </tr>`;
-            }).join('');
-            const clusterSummary = `${run.anticipationCount || 0} anticipation · ${run.reactionCount || 0} reaction · ${run.outOfRangeCount || 0} off-beat · ${run.droppedNoDetection} no-detection`;
-            const reasoning = (() => {
-                if (!run.medianDt && run.medianDt !== 0) {
-                    return `<p class="text-[11px] text-orange-400 mt-2 leading-tight"><strong>No usable data.</strong> Every pluck landed outside both the anticipation window (${antiLo} to ${antiHi} ms) and the reaction window (${reactLo} to ${reactHi} ms). You may be off by a half-beat — listen for the count, then play on the GO.</p>`;
-                }
-                const aMed = run.anticipationMedian;
-                const rMed = run.reactionMedian;
-                const rAdj = run.reactionAdjusted;
-                const rt = run.reactionTimeConstMs;
-                // rt is the user's measured personal value when the
-                // matching baseline (auditory or visual) has been run,
-                // otherwise the Welford 1980 mode-specific default.
-                const personalUsed = (run.mode === 'audio' && _ndUserReactionAuditoryMs > 0)
-                    || (run.mode === 'visual' && _ndUserReactionVisualMs > 0);
-                const rtSource = personalUsed
-                    ? `your measured reaction time`
-                    : `Welford 1980 default — measure your personal reaction time in step 1 for tighter results`;
-                if (run.usedCluster === 'both') {
-                    return `<p class="text-[11px] text-green-300 mt-2 leading-tight"><strong>Convergent.</strong> Anticipation cluster median = ${Math.round(aMed)} ms; reaction cluster median = ${Math.round(rMed)} ms (− ${rt} ms ${rtSource} = ${Math.round(rAdj)} ms). Both estimates agree → final = ${Math.round(run.medianDt)} ms.</p>`;
-                }
-                if (run.usedCluster === 'anticipation') {
-                    const reactBlurb = rMed !== null ? ` Reaction cluster gave ${Math.round(rAdj)} ms (median ${Math.round(rMed)} − ${rt} ${rtSource}); divergent, so we trusted the anticipation measurement.` : '';
-                    return `<p class="text-[11px] text-gray-400 mt-2 leading-tight"><strong>Anticipation cluster:</strong> median of ${run.anticipationCount} clean pluck(s) on the beat = ${Math.round(aMed)} ms.${reactBlurb}</p>`;
-                }
-                if (run.usedCluster === 'reaction') {
-                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms (${rtSource}) = ${Math.round(rAdj)} ms.${personalUsed ? ' High confidence — based on your personal measurement.' : ''}</p>`;
-                }
-                return '';
-            })();
-            return `
-                <details class="mb-3 bg-dark-800 rounded-xl p-3 text-xs">
-                    <summary class="cursor-pointer text-gray-300 font-semibold">${label} · per-beat data (${run.usedCount} of ${run.perBeat.length} clustered)</summary>
-                    <table class="mt-2 w-full text-xs">
-                        <thead class="text-gray-500 text-left">
-                            <tr><th class="pr-2">#</th><th class="pr-2">dt</th><th class="pr-2">detected</th><th></th></tr>
-                        </thead>
-                        <tbody>${rows}</tbody>
-                    </table>
-                    <p class="text-[10px] text-gray-600 mt-2 leading-tight">${clusterSummary}</p>
-                    ${reasoning}
-                </details>`;
-        };
-
-        const confLabel = (run) => {
-            if (!run || !run.confidence) return '';
-            const c = run.confidence;
-            const tag = c === 'high' ? 'text-green-300'
-                      : c === 'medium' ? 'text-yellow-300'
-                      : 'text-orange-400';
-            const src = run.usedCluster === 'both' ? 'convergent'
-                      : run.usedCluster === 'anticipation' ? 'anticipation'
-                      : run.usedCluster === 'reaction' ? 'reaction-adj'
-                      : '—';
-            return `<span class="${tag} text-[10px] uppercase tracking-wide">${c}</span> <span class="text-gray-500 text-[10px]">${src}</span>`;
-        };
-
-        const audioApplyable = _ndWizRunIsApplyable(aRun);
-        const visualApplyable = _ndWizRunIsApplyable(vRun);
-        const avApplyable = audioApplyable && visualApplyable;
-        const applyTag = (ok, why) => ok
-            ? '<span class="text-green-400 text-[10px] uppercase tracking-wide ml-2">will apply</span>'
-            : `<span class="text-orange-400 text-[10px] ml-2">skipped — ${why}</span>`;
-
-        modal.innerHTML = wrap(`
-            <div class="bg-dark-800 rounded-xl p-3 mb-3 space-y-2 text-sm">
-                <div class="flex justify-between items-baseline"><span class="text-gray-400">Visual run (dt_v, n=${vRun ? vRun.usedCount : 0}) ${confLabel(vRun)}</span><span class="text-gray-200 font-mono">${v !== null ? (v >= 0 ? '+' : '') + Math.round(v) + ' ms' : '—'}</span></div>
-                <div class="flex justify-between items-baseline"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0}) ${confLabel(aRun)}</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
-                <hr class="border-gray-700">
-                <div class="flex justify-between items-baseline"><span class="text-gray-300">Plugin Audio Latency ${applyTag(audioApplyable, aRun ? `audio ${aRun.confidence}` : 'no run')}</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
-                <div class="flex justify-between items-baseline"><span class="text-gray-300">A/V Sync Offset (= V − A) <span class="text-gray-500 text-[10px] ml-2">measurement only — set manually via slopsmith [/] keys</span></span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
-            </div>
-            ${perBeatTable(vRun, 'Visual')}
-            ${perBeatTable(aRun, 'Audio')}
-            ${warnings.length ? `
-                <div class="bg-yellow-900/30 border border-yellow-800/50 rounded-xl p-3 mb-3 text-[11px] text-yellow-200 leading-tight space-y-1">
-                    ${warnings.map(w => `<div>${w}</div>`).join('')}
-                </div>` : ''}
-            <p class="text-[11px] text-gray-500 mb-3 leading-tight"><span class="text-green-300">Green</span> rows = anticipation (pluck on/near the beat). <span class="text-blue-300">Blue</span> rows = reaction-cluster (pluck ~reaction-time after the click — adjusted by subtracting typical reaction time). <span class="text-orange-400">Orange</span> rows = off-beat / half-beat alias, discarded. Both clusters carry the calibration signal; when both are populated and agree we declare convergent. Fine-tune on the player with <code>[</code> / <code>]</code> after Apply if it still feels off.</p>
-            <div class="flex gap-3 justify-end">
-                <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Discard</button>
-                <button onclick="_ndWizStep='intro'; _ndWizRender()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Re-run</button>
-                <button onclick="_ndWizApplyMetro()" class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white">Apply</button>
-            </div>
-        `);
+    if (state.loading) {
+        modal.innerHTML = wrap(`<p class="text-gray-300 text-sm">Reading play history…</p>`);
+        return;
     }
+    if (state.error) {
+        modal.innerHTML = wrap(`
+            <p class="text-orange-300 text-sm mb-3">Error: ${state.error}</p>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndCloseCalibrationModal()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm">Close</button>
+            </div>`);
+        return;
+    }
+
+    const v = state.verdict;
+    const current = _ndMicLatencyMs;
+    const intro = `<p class="text-sm text-gray-300 mb-3">Current mic latency: <strong>${current} ms</strong></p>
+        <p class="text-[11px] text-gray-500 mb-3 leading-tight">Aggregating HIT timing errors from <strong>${state.scope}</strong>. Subtracts ${current} ms (current setting). If post-cal median is far from zero, calibration is biased — apply the nudge.</p>`;
+
+    if (v.verdict === 'insufficient') {
+        modal.innerHTML = wrap(intro + `
+            <div class="bg-yellow-900/30 border border-yellow-700/50 rounded-xl p-3 mb-4 text-sm">
+                <div class="text-yellow-300 font-semibold mb-1">Insufficient data</div>
+                <div class="text-gray-400 text-xs leading-tight">
+                    ${v.count} HIT${v.count === 1 ? '' : 's'} aggregated, need ${v.minHits}.
+                    Play a loop or two with Detect on, then re-open this dialog.
+                </div>
+            </div>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndOpenCalibrationFromSettings()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm">Recheck</button>
+                <button onclick="_ndCloseCalibrationModal()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm">Close</button>
+            </div>`);
+        return;
+    }
+
+    if (v.verdict === 'at-floor') {
+        modal.innerHTML = wrap(intro + `
+            <div class="bg-green-900/30 border border-green-700/50 rounded-xl p-3 mb-4 text-sm">
+                <div class="text-green-300 font-semibold mb-1">✓ At-floor — no change needed</div>
+                <div class="text-gray-300 text-xs leading-tight">
+                    Post-cal median ${v.postCalibMedian >= 0 ? '+' : ''}${v.postCalibMedian} ms within resolution ±${v.resolutionMs} ms (N=${v.count}, σ=${v.stddev} ms).
+                    Calibration is correct; remaining variance is your playing.
+                </div>
+            </div>
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndCloseCalibrationModal()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm">Close</button>
+            </div>`);
+        return;
+    }
+
+    // biased
+    const newValue = v.recommendedMicLatencyMs;
+    const sign = v.suggestedNudge >= 0 ? '+' : '';
+    modal.innerHTML = wrap(intro + `
+        <div class="bg-orange-900/30 border border-orange-700/50 rounded-xl p-3 mb-4 text-sm">
+            <div class="text-orange-300 font-semibold mb-1">Biased — recommend ${newValue} ms</div>
+            <div class="text-gray-300 text-xs leading-tight">
+                Post-cal median ${v.postCalibMedian >= 0 ? '+' : ''}${v.postCalibMedian} ms exceeds resolution ±${v.resolutionMs} ms (N=${v.count}, σ=${v.stddev} ms).<br>
+                Nudge: ${current} ${sign}${v.suggestedNudge} = <strong>${newValue}</strong> ms.
+            </div>
+            ${newValue === 0 && v.suggestedNudge < 0 ? `<div class="text-orange-200 text-[10px] mt-2 leading-tight">Note: nudge would push mic latency below 0 — clamped to 0. May indicate a chart-vs-audio sync issue specific to this song.</div>` : ''}
+        </div>
+        <div class="flex gap-3 justify-end">
+            <button onclick="_ndCloseCalibrationModal()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm">Cancel</button>
+            <button onclick="_ndApplyMicLatencyFromVerdict(${newValue})" class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white">Apply ${newValue} ms</button>
+        </div>`);
 }
+
 
 // ── Tuner ──────────────────────────────────────────────────────────────────
 // Standalone per-string tuning mode. User plays each open string; plugin
@@ -6364,9 +5335,9 @@ function _ndShowSettings() {
                class="w-full accent-gray-500 mb-2" disabled
                style="opacity:0.35;pointer-events:none">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
-            <button onclick="_ndOpenWizard()"
+            <button onclick="_ndOpenCalibrationFromSettings()"
                 class="px-3 py-1 bg-blue-900/40 hover:bg-blue-900/70 rounded text-xs text-blue-200"
-                title="Two-phase metronome calibration. Tap SPACE in time with the bouncing ball (visual run), then play a note in time with audible clicks (audio run). The audio run measures the round-trip from speaker to onset detection — your mic capture latency. Saved as _ndMicLatencyMs and subtracted from highway timing labels so what you see is your actual offset, not the hardware delay.">Calibrate latency</button>
+                title="Calibrates mic capture latency from accumulated play history. Reads timingError values from recent loop snapshots, computes the bias, applies a single-click correction. Replaces the metronome wizard.">Calibrate latency</button>
             <span class="text-[10px] text-gray-400 self-center" id="nd-mic-latency-readout">${_ndMicLatencyMs ? `mic: ${Math.round(_ndMicLatencyMs)}ms` : 'mic: not calibrated'}</span>
             <button onclick="_ndOpenTuner()"
                 class="px-3 py-1 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200"

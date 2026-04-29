@@ -98,7 +98,7 @@ function loadDetectionCore() {
         '_ndBuildTroubleMap', '_ndTroubleKey',
         '_ndComputeTop3Prescriptions',
         '_ndChartHasNoteWithin',
-        '_ndWizComputeRun',
+        '_ndCalibFromHistory',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -132,10 +132,6 @@ function loadDetectionCore() {
         troubleKey: sandbox._ndTroubleKey,
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
         chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
-        wizComputeRun: sandbox._ndWizComputeRun,
-        wizComputeKeyboardReaction: sandbox._ndWizComputeKeyboardReaction,
-        wizRunIsApplyable: sandbox._ndWizRunIsApplyable,
-        calibComputeStability: sandbox._ndCalibComputeStability,
         calibFromHistory: sandbox._ndCalibFromHistory,
         aggregateTroubleAcrossPlays: sandbox._ndAggregateTroubleAcrossPlays,
         perNoteCoaching: sandbox._ndPerNoteCoaching,
