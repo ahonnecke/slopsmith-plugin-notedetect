@@ -1154,7 +1154,14 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0, micLat
         timingErrors.sort((a, b) => a - b);
         const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
         const absMedian = Math.abs(median);
-        if (absMedian > 30) {
+        // Match the active strictness preset's "perfect" timing window
+        // — don't issue a prescription for timings the strictness mode
+        // already considers fine. Was hard-coded 30 ms regardless of
+        // mode, which scolded the user about an 80 ms median in a
+        // rocksmith run that scored 100%.
+        const timingFloor = (typeof _ndPerfectTimingMs === 'number' && _ndPerfectTimingMs > 0)
+            ? _ndPerfectTimingMs : 30;
+        if (absMedian > timingFloor) {
             const direction = median > 0 ? 'late' : 'early';
             const action = median > 0
                 ? 'You\'re consistently behind the beat. Anticipate the click instead of waiting for the visual cue.'
@@ -2398,6 +2405,19 @@ const _ND_STRICTNESS_PRESETS = {
     default:   { pitchTolerance:   50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5, perfectTimingMs:  50, perfectPitchCent:  20 },
     strict:    { pitchTolerance:   25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3, perfectTimingMs:  25, perfectPitchCent:  10 },
 };
+
+// ── Detector limits ─────────────────────────────────────────────────────
+// Independent of strictness. These reflect known failure regimes of the
+// onset+YIN pipeline that the player can't fix by playing better. Both
+// the live scorer (_ndCheckMisses → IGNORED_DETECTOR_FAILURE demotion)
+// and the offline filter (_ndLikelyDetectorFailures, used by coaching/
+// timeline/heatmap aggregates) reference the same constants here so the
+// two paths can't drift.
+const _ND_DETECTOR_FAST_REPEAT_GAP_SEC = 0.4;
+// Pitch errors at or below this many semitones from expected are almost
+// always sustain bleed from a low prior note dominating YIN's window.
+// Real finger slips stay within 1-3 semitones of the target.
+const _ND_DETECTOR_SUSTAIN_BLEED_SEMITONE_CUTOFF = -4;
 
 function _ndApplyStrictness(level) {
     const preset = _ND_STRICTNESS_PRESETS[level];
@@ -5126,7 +5146,8 @@ function _ndCheckMisses() {
                         prevChartT = v.chartT;
                     }
                 }
-                if (prevChartT > -Infinity && (noteTime - prevChartT) < 0.4) {
+                if (prevChartT > -Infinity
+                    && (noteTime - prevChartT) < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) {
                     detectorFailure = true;
                 }
             } else if (primary === 'MISSED_WRONG_PITCH') {
@@ -5138,7 +5159,8 @@ function _ndCheckMisses() {
                 }
                 const semiOff = (typeof pitchErrForResult === 'number')
                     ? Math.round(pitchErrForResult / 100) : null;
-                if (semiOff !== null && semiOff <= -4) {
+                if (semiOff !== null
+                    && semiOff <= _ND_DETECTOR_SUSTAIN_BLEED_SEMITONE_CUTOFF) {
                     detectorFailure = true;
                 }
             }
@@ -6046,7 +6068,7 @@ function _ndLikelyDetectorFailures(noteResults) {
         if (r.primary === 'MISSED_NO_DETECTION') {
             const prev = i > 0 ? sorted[i - 1] : null;
             const gap = prev ? (r.chartT - prev.chartT) : Infinity;
-            if (gap > 0 && gap < 0.4) {
+            if (gap > 0 && gap < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) {
                 flagged.add(r.key);
                 continue;
             }
@@ -6063,7 +6085,8 @@ function _ndLikelyDetectorFailures(noteResults) {
             }
             const semiOff = (typeof r.pitchError === 'number')
                 ? Math.round(r.pitchError / 100) : null;
-            if (semiOff !== null && semiOff <= -4) {
+            if (semiOff !== null
+                && semiOff <= _ND_DETECTOR_SUSTAIN_BLEED_SEMITONE_CUTOFF) {
                 flagged.add(r.key);
                 continue;
             }

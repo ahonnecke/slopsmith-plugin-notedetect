@@ -609,16 +609,19 @@ test('top3: timing-bias fires when mic-corrected median is still above threshold
 
 test('top3: mic latency arg is independent of avOffset arg', () => {
     // Same raw + mic latency, varying avOffset → identical text.
+    // Residual 250-150=100ms is comfortably above default mode's 50ms
+    // perfect-timing threshold so the prescription fires.
     const notes = [];
     for (let i = 0; i < 10; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
-                     timingError: 200, labels: [], expectedMidi: 40 });
+                     timingError: 250, labels: [], expectedMidi: 40 });
     }
     const plays = [makePlay(notes)];
     const a = core.computeTop3Prescriptions(plays, 'song.psarc', 0, 150);
     const b = core.computeTop3Prescriptions(plays, 'song.psarc', 105, 150);
     const tA = a.find(p => p.signal === 'timing_bias');
     const tB = b.find(p => p.signal === 'timing_bias');
+    assert.ok(tA, 'prescription should fire for 100ms residual in default mode');
     assert.equal(tA.text, tB.text);
 });
 
