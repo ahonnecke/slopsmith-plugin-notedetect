@@ -553,16 +553,45 @@ const playWith = (timingErrors) => ({
     })),
 });
 
-test('play-history: insufficient when count < 30', () => {
+test('play-history: insufficient when count < 5', () => {
     const plays = [playWith([10, 20, 30, 40])];
     const r = core.calibFromHistory(plays, 0);
     assert.equal(r.verdict, 'insufficient');
     assert.equal(r.count, 4);
+    assert.equal(r.minHits, 5);
 });
 
-test('play-history: biased when post-cal median > 2×SE and > 5ms', () => {
+test('play-history: 5 hits is enough for a verdict (one short loop)', () => {
+    const plays = [playWith([50, 50, 50, 50, 50])];
+    const r = core.calibFromHistory(plays, 0);
+    assert.notEqual(r.verdict, 'insufficient');
+    assert.equal(r.count, 5);
+    // 5 identical values → SE=0, resolution = max(0, 5ms) = 5ms; median 50 > 5 → biased
+    assert.equal(r.verdict, 'biased');
+});
+
+test('play-history: small N → wide resolution → small biases pass as at-floor', () => {
+    // N=10 with high variance → wide SE → small biases not detectable.
+    const plays = [playWith([0, 100, -100, 50, -50, 0, 100, -100, 50, -50])];
+    const r = core.calibFromHistory(plays, 0);
+    // Median ~0; resolution wider than 5ms because SE is large.
+    assert.equal(r.verdict, 'at-floor');
+    assert.ok(r.resolutionMs > 5);
+});
+
+test('play-history: resolution shrinks with N', () => {
+    // Same per-hit distribution, more samples → tighter resolution.
+    const small = [playWith(new Array(10).fill(50).map((v, i) => v + (i % 2 ? 30 : -30)))];
+    const large = [playWith(new Array(100).fill(50).map((v, i) => v + (i % 2 ? 30 : -30)))];
+    const rSmall = core.calibFromHistory(small, 0);
+    const rLarge = core.calibFromHistory(large, 0);
+    assert.ok(rLarge.resolutionMs < rSmall.resolutionMs,
+        `expected larger N to give tighter resolution (got large=${rLarge.resolutionMs}, small=${rSmall.resolutionMs})`);
+});
+
+test('play-history: biased when post-cal median > resolution', () => {
     // 100 hits all at +50 ms; mic_latency = 0; post-cal median = 50.
-    // SE → 0 (no variance), biased trivially. Suggested nudge = +50.
+    // SE → 0 (no variance), resolution = 5 ms floor; |50| > 5 → biased.
     const plays = [playWith(new Array(100).fill(50))];
     const r = core.calibFromHistory(plays, 0);
     assert.equal(r.verdict, 'biased');

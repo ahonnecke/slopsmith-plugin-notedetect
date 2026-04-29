@@ -7622,19 +7622,27 @@ function _ndFormatChartTime(t) {
 //     postCalibMedian        // (median - micLatencyMs) — calibration error
 //     stddev                 // population std (playing variance proxy)
 //     se                     // standard error = stddev / sqrt(count)
-//     suggestedNudge         // -postCalibMedian when biased, else 0
+//     resolutionMs           // |bias| we can detect = max(2×SE, FLOOR_MS)
+//     suggestedNudge         // +postCalibMedian when biased, else 0
 //     verdict                // 'insufficient' | 'biased' | 'at-floor'
 //   }
 //
 // Verdict rules:
-//   insufficient   < 30 hits, can't trust the median
-//   biased         |postCalibMedian| > 2 × se  AND  > 5 ms
-//                  → calibration is off by more than playing noise
-//   at-floor       |postCalibMedian| within 2 × se OR within 5 ms
-//                  → playing variance dominates; further calibration won't help
+//   insufficient   < 5 hits, median is meaningless
+//   biased         |postCalibMedian| > resolutionMs
+//                  → calibration is off by more than what N hits can resolve
+//   at-floor       |postCalibMedian| <= resolutionMs
+//                  → playing variance dominates at this N; can't tighten
+//                    without more data, but bias-as-large-as-resolutionMs
+//                    is ruled out
 //
 // The 5-ms floor exists because below that we're at perceptual noise; there's
 // no point chasing sub-perceptual bias.
+//
+// Threshold of 5 (not 30) chosen so a single loop with a few hits gets a
+// verdict immediately. Resolution scales with N: small N → wide tolerance
+// → small biases pass as at-floor; the user sees the resolution explicitly
+// and can play more if they want tighter detection.
 function _ndCalibFromHistory(plays, currentMicLatencyMs) {
     const mic = currentMicLatencyMs || 0;
     const hits = [];
@@ -7647,11 +7655,13 @@ function _ndCalibFromHistory(plays, currentMicLatencyMs) {
         }
     }
     const count = hits.length;
-    if (count < 30) {
+    const MIN_HITS = 5;
+    if (count < MIN_HITS) {
         return {
             count, rawMedian: null, rawMad: null,
-            postCalibMedian: null, stddev: null, se: null,
+            postCalibMedian: null, stddev: null, se: null, resolutionMs: null,
             suggestedNudge: 0, verdict: 'insufficient',
+            minHits: MIN_HITS,
             currentMicLatencyMs: mic,
         };
     }
@@ -7669,7 +7679,8 @@ function _ndCalibFromHistory(plays, currentMicLatencyMs) {
 
     const postCalibMedian = rawMedian - mic;
     const FLOOR_MS = 5;
-    const biased = Math.abs(postCalibMedian) > Math.max(2 * se, FLOOR_MS);
+    const resolutionMs = Math.max(2 * se, FLOOR_MS);
+    const biased = Math.abs(postCalibMedian) > resolutionMs;
     // Sign convention: HIT timingError is "how late the detection arrived
     // relative to the chart note." Display layer subtracts mic latency:
     //   shown = timingError - micLatencyMs
@@ -7687,6 +7698,7 @@ function _ndCalibFromHistory(plays, currentMicLatencyMs) {
         postCalibMedian: Math.round(postCalibMedian * 10) / 10,
         stddev: Math.round(stddev * 10) / 10,
         se: Math.round(se * 10) / 10,
+        resolutionMs: Math.round(resolutionMs * 10) / 10,
         suggestedNudge,
         recommendedMicLatencyMs,
         verdict: biased ? 'biased' : 'at-floor',
