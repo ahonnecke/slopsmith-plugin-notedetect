@@ -67,6 +67,10 @@ test-plays-roundtrip: ## Server-side round-trip harness for the per-play history
 replay-fix-impact: ## Replay snapshots through new analytics — measures residual / calibrator / sibling deltas. SONG=<dir> LIMIT=<N> VERBOSE=1.
 	node test/replay-fix-impact.js --pull $(if $(SONG),--song $(SONG)) $(if $(LIMIT),--limit $(LIMIT)) $(if $(VERBOSE),--verbose)
 
+.PHONY: calibrate-from-history
+calibrate-from-history: ## Validate mic-latency against play snapshots. MIC_LATENCY=<ms> for current value (default 0).
+	node test/calibrate-from-history.js $(if $(MIC_LATENCY),--mic-latency $(MIC_LATENCY)) $(if $(ROOT),--root $(ROOT))
+
 # Default fixture matches the "4/127" baseline (commit 2e99ab0). Override with
 # WAV=<path> for other takes. Companion .json in test/fixtures/ supplies
 # chartStartTime automatically, so --wav-offset is not required.

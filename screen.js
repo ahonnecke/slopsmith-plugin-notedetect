@@ -7609,6 +7609,91 @@ function _ndFormatChartTime(t) {
     return `${mm}:${ss}`;
 }
 
+// Pure: derive a calibration verdict from play history. Aggregates HIT
+// timingErrors across all plays, subtracts the current mic-latency value,
+// and asks: is the post-calibration median statistically distinguishable
+// from zero given the playing-variance floor?
+//
+// Returns:
+//   {
+//     count                  // N hits aggregated
+//     rawMedian              // pre-calibration median (sanity check)
+//     rawMad                 // median absolute deviation, robust spread
+//     postCalibMedian        // (median - micLatencyMs) — calibration error
+//     stddev                 // population std (playing variance proxy)
+//     se                     // standard error = stddev / sqrt(count)
+//     suggestedNudge         // -postCalibMedian when biased, else 0
+//     verdict                // 'insufficient' | 'biased' | 'at-floor'
+//   }
+//
+// Verdict rules:
+//   insufficient   < 30 hits, can't trust the median
+//   biased         |postCalibMedian| > 2 × se  AND  > 5 ms
+//                  → calibration is off by more than playing noise
+//   at-floor       |postCalibMedian| within 2 × se OR within 5 ms
+//                  → playing variance dominates; further calibration won't help
+//
+// The 5-ms floor exists because below that we're at perceptual noise; there's
+// no point chasing sub-perceptual bias.
+function _ndCalibFromHistory(plays, currentMicLatencyMs) {
+    const mic = currentMicLatencyMs || 0;
+    const hits = [];
+    for (const play of plays || []) {
+        for (const r of (play.noteResults || [])) {
+            if (!r) continue;
+            if (r.primary !== 'HIT' && r.primary !== 'DIRTY_HIT') continue;
+            if (typeof r.timingError !== 'number' || !isFinite(r.timingError)) continue;
+            hits.push(r.timingError);
+        }
+    }
+    const count = hits.length;
+    if (count < 30) {
+        return {
+            count, rawMedian: null, rawMad: null,
+            postCalibMedian: null, stddev: null, se: null,
+            suggestedNudge: 0, verdict: 'insufficient',
+            currentMicLatencyMs: mic,
+        };
+    }
+    const sorted = hits.slice().sort((a, b) => a - b);
+    const rawMedian = sorted[Math.floor(count / 2)];
+    const absDev = sorted.map(v => Math.abs(v - rawMedian)).sort((a, b) => a - b);
+    const rawMad = absDev[Math.floor(absDev.length / 2)];
+    // Population stddev from raw values (timingError already includes mic
+    // latency offset — it's a constant added to each value, so it cancels
+    // in any variance calculation).
+    const mean = hits.reduce((s, v) => s + v, 0) / count;
+    const variance = hits.reduce((s, v) => s + (v - mean) ** 2, 0) / count;
+    const stddev = Math.sqrt(variance);
+    const se = stddev / Math.sqrt(count);
+
+    const postCalibMedian = rawMedian - mic;
+    const FLOOR_MS = 5;
+    const biased = Math.abs(postCalibMedian) > Math.max(2 * se, FLOOR_MS);
+    // Sign convention: HIT timingError is "how late the detection arrived
+    // relative to the chart note." Display layer subtracts mic latency:
+    //   shown = timingError - micLatencyMs
+    // If shown median is still positive (player appears late) we want to
+    // INCREASE mic latency to subtract more. So nudge = +postCalibMedian.
+    const suggestedNudge = biased ? Math.round(postCalibMedian) : 0;
+    // Mic latency can't be physically negative. Clamp the recommended new
+    // value to >= 0; if the suggestion would push it below zero, the
+    // calibration model has a different problem (e.g. avOffset misconfigured).
+    const recommendedMicLatencyMs = Math.max(0, mic + suggestedNudge);
+    return {
+        count,
+        rawMedian: Math.round(rawMedian * 10) / 10,
+        rawMad: Math.round(rawMad * 10) / 10,
+        postCalibMedian: Math.round(postCalibMedian * 10) / 10,
+        stddev: Math.round(stddev * 10) / 10,
+        se: Math.round(se * 10) / 10,
+        suggestedNudge,
+        recommendedMicLatencyMs,
+        verdict: biased ? 'biased' : 'at-floor',
+        currentMicLatencyMs: mic,
+    };
+}
+
 // Pull every signed timing/pitch error from the last-N plays.
 //   - timing: HIT records only (NO_DETECTION + WRONG_PITCH have null timing)
 //   - pitch: HIT + WRONG_PITCH (NO_DETECTION has null pitch)

@@ -542,3 +542,97 @@ test('stability: history of mostly-locked + one outlier old run still locks on r
     // value and the recent one.
     assert.ok(r.status === 'drift-warning' || r.status === 'locked');
 });
+
+// ── Play-history validation (the truth source) ─────────────────────────
+
+const playWith = (timingErrors) => ({
+    songId: 't', playId: 'p',
+    noteResults: timingErrors.map(te => ({
+        primary: te === null ? 'MISSED_NO_DETECTION' : 'HIT',
+        timingError: te,
+    })),
+});
+
+test('play-history: insufficient when count < 30', () => {
+    const plays = [playWith([10, 20, 30, 40])];
+    const r = core.calibFromHistory(plays, 0);
+    assert.equal(r.verdict, 'insufficient');
+    assert.equal(r.count, 4);
+});
+
+test('play-history: biased when post-cal median > 2×SE and > 5ms', () => {
+    // 100 hits all at +50 ms; mic_latency = 0; post-cal median = 50.
+    // SE → 0 (no variance), biased trivially. Suggested nudge = +50.
+    const plays = [playWith(new Array(100).fill(50))];
+    const r = core.calibFromHistory(plays, 0);
+    assert.equal(r.verdict, 'biased');
+    assert.equal(r.rawMedian, 50);
+    assert.equal(r.postCalibMedian, 50);
+    assert.equal(r.suggestedNudge, 50);
+    assert.equal(r.recommendedMicLatencyMs, 50);
+});
+
+test('play-history: at-floor when post-cal median within tolerance', () => {
+    // Use a normal-ish distribution centered at 50 with N=100 and σ=20.
+    // mic_latency=50 → post-cal median should be ~0.
+    const samples = [];
+    for (let i = 0; i < 100; i++) {
+        // Box-Muller
+        const u = (i + 1) / 101;
+        const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * (i / 100));
+        samples.push(50 + 20 * z);
+    }
+    const plays = [playWith(samples)];
+    const r = core.calibFromHistory(plays, 50);
+    assert.equal(r.verdict, 'at-floor');
+    assert.ok(Math.abs(r.postCalibMedian) < 5);
+});
+
+test('play-history: applying recommended nudge centres post-cal median', () => {
+    // Constant +173 raw timing across 100 hits. mic_latency=0 →
+    // recommendation is 173. Re-running with mic_latency=173 → post-cal
+    // median = 0, verdict = at-floor.
+    const plays = [playWith(new Array(100).fill(173))];
+    const r1 = core.calibFromHistory(plays, 0);
+    assert.equal(r1.recommendedMicLatencyMs, 173);
+    const r2 = core.calibFromHistory(plays, r1.recommendedMicLatencyMs);
+    assert.equal(r2.postCalibMedian, 0);
+    assert.equal(r2.verdict, 'at-floor');
+});
+
+test('play-history: clamps recommendation at 0 (no negative latency)', () => {
+    // Raw median negative (player appearing early) — would suggest negative
+    // mic latency. Clamp to 0 because pipeline latency can't be negative.
+    const plays = [playWith(new Array(100).fill(-50))];
+    const r = core.calibFromHistory(plays, 0);
+    assert.equal(r.suggestedNudge, -50);
+    assert.equal(r.recommendedMicLatencyMs, 0);
+});
+
+test('play-history: ignores non-HIT records', () => {
+    const plays = [{
+        noteResults: [
+            { primary: 'HIT', timingError: 50 },
+            { primary: 'MISSED_NO_DETECTION', timingError: null },
+            { primary: 'WRONG_PITCH', timingError: 999 },  // not a HIT
+            { primary: 'DIRTY_HIT', timingError: 60 },
+            ...new Array(50).fill({ primary: 'HIT', timingError: 50 }),
+        ],
+    }];
+    const r = core.calibFromHistory(plays, 0);
+    // Only HIT and DIRTY_HIT count. WRONG_PITCH (999) excluded; MISSED null.
+    // 1 + 1 + 50 = 52 hits, all near 50.
+    assert.equal(r.count, 52);
+    assert.ok(Math.abs(r.rawMedian - 50) < 5);
+});
+
+test('play-history: aggregates across multiple plays', () => {
+    const plays = [
+        playWith(new Array(40).fill(100)),
+        playWith(new Array(40).fill(120)),
+    ];
+    const r = core.calibFromHistory(plays, 0);
+    assert.equal(r.count, 80);
+    // Median across 80 values [100×40 + 120×40] = boundary, picks one side.
+    assert.ok(r.rawMedian === 100 || r.rawMedian === 120);
+});

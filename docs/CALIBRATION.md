@@ -250,6 +250,47 @@ bimodal reaction window (visual) 200 to 400 ms       (default; uses personal vis
 bimodal convergence threshold     60 ms             |anticipation_med - reaction_adj| < this → convergent
 ```
 
+## Play-history validation harness
+
+`make calibrate-from-history` reads every snapshot under `/tmp/nd_plays/`
+(falls back to `test/fixtures/nd_plays/`), aggregates `timingError` across
+all HIT records, and computes:
+
+```
+rawMedian          median(timingError) — pre-calibration
+postCalibMedian    rawMedian - mic_latency — what scoring actually shows
+stddev             playing variance proxy
+SE = stddev/√N     bound on how confident the median is
+suggestedNudge     +postCalibMedian when biased
+verdict            insufficient | biased | at-floor
+```
+
+Verdict thresholds:
+- `insufficient` — fewer than 30 hits aggregated
+- `biased` — `|postCalibMedian| > max(2×SE, 5 ms)`
+- `at-floor` — within those bounds; further calibration can't tighten
+
+### Empirical finding (this session, 2026-04-29)
+
+Running against 1176 hits across 6 songs with `mic_latency = 0`:
+
+```
+ALL    1176    rawMedian +173.6 ms    SE +3.9 ms    verdict: biased
+Recommended mic latency: 174 ms
+```
+
+Re-running with `mic_latency = 174`:
+
+```
+ALL    1176    postCalibMedian -0.4 ms    SE +3.9 ms    verdict: at-floor
+```
+
+The wizard had been producing values 0-67 ms across runs — undershooting
+the truth by 100-170 ms. Wizard noise floor across runs (~50-70 ms) is much
+higher than the play-history SE (~4 ms with 1000+ hits). This is the
+direct evidence that play-history validation > wizard for getting the
+calibration *value*. Wizard is bootstrap; snapshots are truth.
+
 ## Open questions
 
 - The visual GO dot does more DOM work than prep dots and paints ~16 ms
