@@ -259,3 +259,106 @@ test('user run: pure-reaction sweep → falls back to reaction cluster', () => {
     assert.equal(run.confidence, 'medium');
     assert.equal(run.lowQuality, false);
 });
+
+// ── Personal reaction-time override (audio mode) ───────────────────────
+
+test('audio mode with personal RT override: replaces 200ms default', () => {
+    // User's measured auditory reaction = 285 ms (slower than the
+    // Welford 200 default). Audio run with all plucks at +290 ms should
+    // calibrate to ~5 ms instead of the default's ~90 ms.
+    const beats = [1000, 1800, 2600, 3400, 4200, 5000];
+    const detections = beats.map(t => ({ time: t + 290, midi: 28 }));
+    const run = core.wizComputeRun(beats, detections, 'audio', { audioRtMs: 285 });
+    assert.equal(run.reactionTimeConstMs, 285);
+    assert.equal(run.usedCluster, 'reaction');
+    assert.equal(run.medianDt, 5);   // 290 - 285
+});
+
+test('audio mode without RT override: falls back to 200ms default', () => {
+    const beats = [1000, 1800, 2600, 3400, 4200, 5000];
+    const detections = beats.map(t => ({ time: t + 290, midi: 28 }));
+    const run = core.wizComputeRun(beats, detections, 'audio');
+    assert.equal(run.reactionTimeConstMs, 200);
+    assert.equal(run.medianDt, 90);
+});
+
+test('visual mode ignores audioRtMs override', () => {
+    const beats = [1000, 1800, 2600];
+    const detections = beats.map(t => ({ time: t + 290, midi: 28 }));
+    const run = core.wizComputeRun(beats, detections, 'visual', { audioRtMs: 285 });
+    assert.equal(run.reactionTimeConstMs, 250);   // visual default
+    assert.equal(run.medianDt, 40);
+});
+
+test('audio mode RT override widens reaction window appropriately', () => {
+    // With personal RT = 300 ms, reaction window should be (220, 450) so
+    // detections in that range are still classified as reaction.
+    const beats = [1000];
+    const det = [{ time: 1320, midi: 28 }];
+    const run = core.wizComputeRun(beats, det, 'audio', { audioRtMs: 300 });
+    assert.equal(run.usedCluster, 'reaction');
+    assert.equal(run.medianDt, 20);   // 320 - 300
+});
+
+// ── Keyboard reaction-time pre-test ────────────────────────────────────
+
+test('keyboard: clean run → median - input lag', () => {
+    // 6 clicks at 1500ms intervals; user keypresses 240ms after each.
+    // Median = 240, minus 5ms input lag = 235.
+    const clicks = [1000, 2500, 4000, 5500, 7000, 8500];
+    const keys = clicks.map(c => c + 240);
+    const result = core.wizComputeKeyboardReaction(clicks, keys);
+    assert.equal(result.medianMs, 235);
+    assert.equal(result.rawMedianMs, 240);
+    assert.equal(result.dropped, 0);
+    assert.equal(result.lowQuality, false);
+});
+
+test('keyboard: jittered keypresses → robust median', () => {
+    const clicks = [1000, 2500, 4000, 5500, 7000, 8500];
+    const offsets = [200, 250, 230, 270, 240, 260];   // median = 245
+    const keys = clicks.map((c, i) => c + offsets[i]);
+    const result = core.wizComputeKeyboardReaction(clicks, keys);
+    assert.equal(result.rawMedianMs, 250);
+    assert.equal(result.medianMs, 245);   // 250 - 5
+});
+
+test('keyboard: anticipation (keypress before click) discarded', () => {
+    // User pressed early on click 3 (15ms before, dt = -15 < 50 min).
+    const clicks = [1000, 2500, 4000, 5500, 7000, 8500];
+    const keys = [
+        clicks[0] + 230,
+        clicks[1] + 240,
+        clicks[2] - 15,    // anticipation, discarded
+        clicks[3] + 245,
+        clicks[4] + 235,
+        clicks[5] + 250,
+    ];
+    const result = core.wizComputeKeyboardReaction(clicks, keys);
+    assert.equal(result.dropped, 1);
+    assert.equal(result.lowQuality, false);
+    assert.ok(Math.abs(result.medianMs - 235) <= 10);
+});
+
+test('keyboard: missed clicks (no keypress) counted as dropped', () => {
+    const clicks = [1000, 2500, 4000, 5500, 7000, 8500];
+    const keys = [clicks[0] + 240, clicks[1] + 250, clicks[5] + 260];
+    const result = core.wizComputeKeyboardReaction(clicks, keys);
+    assert.equal(result.dropped, 3);
+    assert.equal(result.lowQuality, true);   // 3/6 dropped → below half threshold
+});
+
+test('keyboard: empty keypresses → null median, lowQuality', () => {
+    const result = core.wizComputeKeyboardReaction([1000, 2500, 4000], []);
+    assert.equal(result.medianMs, null);
+    assert.equal(result.lowQuality, true);
+});
+
+test('keyboard: keypress after timeout window discarded', () => {
+    // Key landed 800 ms after click — above 700ms max, treated as miss.
+    const clicks = [1000];
+    const keys = [1800];
+    const result = core.wizComputeKeyboardReaction(clicks, keys);
+    assert.equal(result.dropped, 1);
+    assert.equal(result.medianMs, null);
+});

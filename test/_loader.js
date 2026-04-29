@@ -133,6 +133,7 @@ function loadDetectionCore() {
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
         chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
         wizComputeRun: sandbox._ndWizComputeRun,
+        wizComputeKeyboardReaction: sandbox._ndWizComputeKeyboardReaction,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,

@@ -88,6 +88,65 @@ async function main() {
         console.log('[ok] mic enabled, owned by wizard, ready for calibration');
     }
 
+    // Step 5b: simulate the keyboard reaction-time pre-test. We dispatch
+    // synthetic Space keydown events 215 ms after each scheduled click —
+    // result should round-trip a personal RT close to (215 - 5) = 210 ms.
+    console.log('[step] simulating keyboard reaction-time pre-test...');
+    const kbdResult = await page.evaluate(async () => {
+        _ndWizStartKeyboardRun();
+        const expected = _ND_WIZ_KEYBOARD_CLICKS;
+        let lastSeen = 0;
+        const startedAt = performance.now();
+        while (_ndWizStep === 'running-keyboard' && performance.now() - startedAt < 30000) {
+            const n = _ndWizKeyboardClicks.length;
+            // Each scheduled click time has been pushed; we want to fire a
+            // synthetic keydown 215 ms after each click ACTUALLY HAPPENS in
+            // wall time. Compare scheduled click time to current time to
+            // know when "now" passes click+30 (we fire early so the dispatch
+            // delay puts the keydown at click+~215).
+            const now = performance.now();
+            for (let i = lastSeen; i < n; i++) {
+                if (_ndWizKeyboardClicks[i] <= now - 30) {
+                    setTimeout(() => {
+                        document.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space' }));
+                    }, 215 - 30);
+                    lastSeen = i + 1;
+                }
+            }
+            await new Promise(r => setTimeout(r, 20));
+        }
+        return {
+            step: _ndWizStep,
+            personalRtMs: _ndUserReactionAuditoryMs,
+            lastResult: _ndWizKeyboardLastResult ? {
+                medianMs: _ndWizKeyboardLastResult.medianMs,
+                rawMedianMs: _ndWizKeyboardLastResult.rawMedianMs,
+                dropped: _ndWizKeyboardLastResult.dropped,
+                lowQuality: _ndWizKeyboardLastResult.lowQuality,
+            } : null,
+            clicksScheduled: _ndWizKeyboardClicks.length,
+            keysCaptured: _ndWizKeyboardKeys.length,
+            expectedClicks: expected,
+        };
+    });
+    console.log(`[info] kbd: clicks=${kbdResult.clicksScheduled}/${kbdResult.expectedClicks} keys=${kbdResult.keysCaptured} step=${kbdResult.step}`);
+    if (kbdResult.lastResult) {
+        const r = kbdResult.lastResult;
+        console.log(`[ok] keyboard run finished: median=${r.medianMs}ms (raw ${r.rawMedianMs}, ${r.dropped} dropped, lowQ=${r.lowQuality})`);
+        console.log(`[ok] _ndUserReactionAuditoryMs persisted = ${kbdResult.personalRtMs} ms`);
+    } else {
+        console.log('[FAIL] keyboard run did not finish');
+    }
+    const kbdOk = kbdResult.lastResult
+        && kbdResult.lastResult.medianMs !== null
+        && Math.abs(kbdResult.personalRtMs - 210) <= 30
+        && !kbdResult.lastResult.lowQuality;
+    if (!kbdOk) {
+        console.log(`[FAIL] expected personal RT near 210 ms, got ${kbdResult.personalRtMs}`);
+    } else {
+        console.log('[ok] personal reaction-time round-trip within ±30 ms tolerance');
+    }
+
     // Step 6: simulate a full visual run with synthetic detections firing on
     // every GO beat, then confirm finishRun produces a non-null medianDt.
     // The fake mic device emits silence, so we bypass YIN and call
@@ -155,7 +214,7 @@ async function main() {
     }
 
     await browser.close();
-    process.exit(micUp && cardPresent && modalUp && runOk ? 0 : 1);
+    process.exit(micUp && cardPresent && modalUp && runOk && kbdOk ? 0 : 1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

@@ -424,6 +424,15 @@ let _ndAutoDetectOnPlay = true;  // when host <audio> emits 'play', auto-enable 
 // mic capture (USB ADC, OS audio stack, browser MediaStream) and varies per
 // setup. No way to derive offline — has to be measured for each user's rig.
 let _ndMicLatencyMs = 0;
+
+// Personal auditory simple reaction time — measured by the wizard's keyboard
+// pre-test. User presses SPACE on each click; median (keydown - scheduled
+// click time) is their personal latency. Subtracted from the audio run when
+// the user plays in reaction-mode (no anticipation cluster). The previous
+// hard-coded 200 ms (Welford 1980 typical) was off by 30-50 ms for individual
+// users, propagating straight into mic-latency error. 0 = not measured yet,
+// estimator falls back to the 200 ms default.
+let _ndUserReactionAuditoryMs = 0;
 // Off by default — recording produces files (POSTed to the server, then to
 // /tmp/nd_recordings/). Opt in from the settings panel when you want a WAV
 // alongside the per-iteration play snapshots, e.g. for offline classifier
@@ -2114,6 +2123,7 @@ function _ndSaveSettings() {
             dirtyHitMaxOffRatio: _ndDirtyHitMaxOffRatio,
             clickTrackOnly: _ndClickTrackOnly,
             micLatencyMs: _ndMicLatencyMs,
+            userReactionAuditoryMs: _ndUserReactionAuditoryMs,
         }));
     } catch (e) { /* localStorage unavailable */ }
 }
@@ -2150,6 +2160,9 @@ function _ndLoadSettings() {
         if (s.dirtyHitMaxOffRatio !== undefined) _ndDirtyHitMaxOffRatio = s.dirtyHitMaxOffRatio;
         if (s.micLatencyMs !== undefined && isFinite(Number(s.micLatencyMs))) {
             _ndMicLatencyMs = Number(s.micLatencyMs);
+        }
+        if (s.userReactionAuditoryMs !== undefined && isFinite(Number(s.userReactionAuditoryMs))) {
+            _ndUserReactionAuditoryMs = Number(s.userReactionAuditoryMs);
         }
         // clickTrackOnly intentionally NOT loaded — it's a per-session
         // training toggle, not a persistent default. Reload starts with
@@ -4756,7 +4769,7 @@ const _ND_METRO_BEAT_WINDOW_MS = 400;   // detection must land within ±this of 
 // neither of which represent calibrated mic capture latency.
 const _ND_WIZ_HARD_CAP_MS = 200;
 
-let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-visual' | 'running-audio' | 'review'
+let _ndWizStep = 'closed';        // 'closed' | 'intro' | 'running-keyboard' | 'running-visual' | 'running-audio' | 'review'
 let _ndWizBeats = [];             // wall times (performance.now) of measured beats
 let _ndWizDetections = [];        // [{time, midi}] of detection events during a run
 let _ndWizVisualRun = null;       // {perBeat, medianDt, droppedOutliers, dropped}
@@ -4765,6 +4778,13 @@ let _ndWizTimers = [];
 let _ndWizAudioCtx = null;
 let _ndWizBallRaf = null;
 let _ndWizBallOrigin = 0;        // performance.now() at which ball == center for first beat
+// Keyboard reaction-time pre-test state. _ndWizKeyboardClicks holds scheduled
+// click times (performance.now ms), _ndWizKeyboardKeys holds keydown times
+// observed during the run. Compute pairs them by nearest-time and reports the
+// median delay as the user's personal auditory reaction time.
+let _ndWizKeyboardClicks = [];
+let _ndWizKeyboardKeys = [];
+let _ndWizKeyHandler = null;
 
 // Back-compat accessors so callers that still read the old variables work.
 Object.defineProperty(globalThis, '_ndWizVisualOffsetMs', { get: () => _ndWizVisualRun ? _ndWizVisualRun.medianDt : null, configurable: true });
@@ -4829,6 +4849,10 @@ function _ndCloseWizard() {
 function _ndWizCancelTimers() {
     for (const t of _ndWizTimers) clearTimeout(t);
     _ndWizTimers = [];
+    if (_ndWizKeyHandler) {
+        document.removeEventListener('keydown', _ndWizKeyHandler);
+        _ndWizKeyHandler = null;
+    }
 }
 
 // Bouncing-ball metronome animation. Ball crosses the centre line on EVERY
@@ -4893,6 +4917,147 @@ function _ndWizStopBall() {
         _ndWizBallRaf = null;
     }
 }
+
+// ── Keyboard reaction-time pre-test ────────────────────────────────────
+// Plays N audio clicks at evenly-spaced intervals; user presses SPACE on
+// each one. We record both scheduled click times and keydown times, then
+// pair them and take the median delay. That delay (minus a small fixed
+// keyboard input lag) IS the user's personal auditory simple reaction
+// time — used in lieu of the Welford-survey 200 ms default when the audio
+// run lands fully in reaction-cluster.
+const _ND_WIZ_KEYBOARD_CLICKS = 6;
+const _ND_WIZ_KEYBOARD_INTERVAL_MS = 1500;   // long enough that the user
+                                             // can fully release before
+                                             // the next click; short
+                                             // enough to keep the run
+                                             // brief (~10 sec).
+const _ND_WIZ_KEYBOARD_INPUT_LAG_MS = 5;     // typical browser keydown
+                                             // event lag (well-characterised
+                                             // ~3-8 ms across modern UAs).
+
+// Pure: pair scheduled click times with keypress times by nearest match,
+// compute the median delay, subtract the input-lag constant. Returns
+// {medianMs, perClick: [{scheduledMs, keyMs, dt}], dropped} where dt is
+// the raw keydown-minus-click delay (input lag still included). The final
+// reaction time = medianMs - input lag, clamped to a sane range.
+function _ndWizComputeKeyboardReaction(clickTimes, keyTimes) {
+    // Pair each click with the closest later keypress within a window.
+    // Window: 50-700 ms. Anything outside is "missed" or "anticipated"
+    // (false start) and discarded.
+    const MIN_DT = 50, MAX_DT = 700;
+    const usedKeys = new Set();
+    const perClick = clickTimes.map(c => {
+        let best = null, bestDt = null;
+        for (let i = 0; i < keyTimes.length; i++) {
+            if (usedKeys.has(i)) continue;
+            const dt = keyTimes[i] - c;
+            if (dt < MIN_DT || dt > MAX_DT) continue;
+            if (bestDt === null || dt < bestDt) {
+                best = i;
+                bestDt = dt;
+            }
+        }
+        if (best !== null) usedKeys.add(best);
+        return { scheduledMs: c, keyMs: best !== null ? keyTimes[best] : null, dt: bestDt };
+    });
+
+    const dts = perClick.map(p => p.dt).filter(d => d !== null);
+    const dropped = perClick.length - dts.length;
+    if (!dts.length) {
+        return {
+            perClick, medianMs: null, rawMedianMs: null, dropped,
+            inputLagMs: _ND_WIZ_KEYBOARD_INPUT_LAG_MS,
+            lowQuality: true,
+        };
+    }
+    const sorted = dts.slice().sort((a, b) => a - b);
+    const rawMedian = sorted[Math.floor(sorted.length / 2)];
+    const medianMs = Math.max(50, Math.round(rawMedian - _ND_WIZ_KEYBOARD_INPUT_LAG_MS));
+    return {
+        perClick, medianMs, rawMedianMs: rawMedian, dropped,
+        inputLagMs: _ND_WIZ_KEYBOARD_INPUT_LAG_MS,
+        // Stricter than "half made it" so that exactly 3-of-6 (border-
+        // line; user is hitting clicks but missing too many) gets flagged.
+        lowQuality: dts.length <= Math.floor(clickTimes.length / 2),
+    };
+}
+
+function _ndWizStartKeyboardRun() {
+    _ndWizStep = 'running-keyboard';
+    _ndWizKeyboardClicks = [];
+    _ndWizKeyboardKeys = [];
+    _ndWizCancelTimers();
+
+    if (!_ndWizAudioCtx) {
+        _ndWizAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const ctx = _ndWizAudioCtx;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const startDelay = 1500;
+    const startPerf = performance.now() + startDelay;
+    const startCtx = ctx.currentTime + startDelay / 1000;
+    const intervalSec = _ND_WIZ_KEYBOARD_INTERVAL_MS / 1000;
+
+    // Pre-schedule clicks on the AudioContext clock.
+    for (let i = 0; i < _ND_WIZ_KEYBOARD_CLICKS; i++) {
+        const ctxWhen = startCtx + i * intervalSec;
+        const perfWhen = startPerf + i * _ND_WIZ_KEYBOARD_INTERVAL_MS;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 800;
+        osc.connect(gain).connect(ctx.destination);
+        const sustainEnd = ctxWhen + 0.06;
+        gain.gain.setValueAtTime(0, ctxWhen);
+        gain.gain.linearRampToValueAtTime(0.4, ctxWhen + 0.005);
+        gain.gain.linearRampToValueAtTime(0, sustainEnd);
+        osc.start(ctxWhen);
+        osc.stop(sustainEnd + 0.01);
+        _ndWizKeyboardClicks.push(perfWhen);
+        _ndWizTimers.push(setTimeout(() => _ndWizUpdateKeyboardCounter(i + 1), perfWhen - performance.now()));
+    }
+
+    _ndWizKeyHandler = (e) => {
+        if (_ndWizStep !== 'running-keyboard') return;
+        if (e.code !== 'Space' && e.key !== ' ') return;
+        e.preventDefault();
+        _ndWizKeyboardKeys.push(performance.now());
+        _ndWizUpdateKeyboardCounter(_ndWizKeyboardKeys.length);
+    };
+    document.addEventListener('keydown', _ndWizKeyHandler);
+
+    // Total run length + 1s grace for the last keypress.
+    const finishDelay = startDelay + _ND_WIZ_KEYBOARD_CLICKS * _ND_WIZ_KEYBOARD_INTERVAL_MS + 1000;
+    _ndWizTimers.push(setTimeout(() => _ndWizFinishKeyboardRun(), finishDelay));
+
+    _ndWizRender();
+}
+
+function _ndWizUpdateKeyboardCounter(n) {
+    const el = document.getElementById('nd-wiz-kbd-counter');
+    if (el) el.textContent = `${Math.min(n, _ND_WIZ_KEYBOARD_CLICKS)} / ${_ND_WIZ_KEYBOARD_CLICKS}`;
+}
+
+function _ndWizFinishKeyboardRun() {
+    if (_ndWizKeyHandler) {
+        document.removeEventListener('keydown', _ndWizKeyHandler);
+        _ndWizKeyHandler = null;
+    }
+    const result = _ndWizComputeKeyboardReaction(_ndWizKeyboardClicks, _ndWizKeyboardKeys);
+    if (result.medianMs !== null && !result.lowQuality) {
+        _ndUserReactionAuditoryMs = result.medianMs;
+        _ndSaveSettings();
+        console.log(`[note_detect] Personal auditory reaction time: ${result.medianMs} ms (median of ${_ND_WIZ_KEYBOARD_CLICKS - result.dropped} keypresses, raw ${result.rawMedianMs} ms − ${result.inputLagMs} ms input lag)`);
+    } else {
+        console.warn(`[note_detect] Reaction-time test low quality (${result.dropped}/${_ND_WIZ_KEYBOARD_CLICKS} dropped) — keeping default ${_ndUserReactionAuditoryMs || 200} ms`);
+    }
+    _ndWizKeyboardLastResult = result;
+    _ndWizStep = 'intro';
+    _ndWizRender();
+}
+
+let _ndWizKeyboardLastResult = null;
 
 function _ndWizStartRun(mode) {
     _ndWizStep = 'running-' + mode;
@@ -5025,7 +5190,7 @@ function _ndWizFireBeat(b, mode, scheduledTime) {
 // note 2 while note 1 is still ringing — no silence gap, dropped). The
 // onset detector handles sustain re-attacks via its release/rearm gate,
 // so each entry here is already a fresh pluck.
-function _ndWizComputeRun(beats, detections, mode) {
+function _ndWizComputeRun(beats, detections, mode, opts) {
     // Assignment: for each beat, find the detection within the beat window
     // closest in time. Defensive: if the same detection lands inside two
     // adjacent beat windows (75 BPM = 800 ms; window = ±400 ms), each beat
@@ -5060,14 +5225,22 @@ function _ndWizComputeRun(beats, detections, mode) {
     // encoded twice and matches. When only one cluster has data, we use
     // it; reaction-only is medium confidence (depends on the constant).
     //
-    // Reaction-time constants: typical real-world simple reaction time is
-    // ~200 ms for auditory stimuli, ~250 ms for visual (Welford 1980,
-    // Kosinski 2008 surveys). User-tunable later if data warrants it.
+    // Reaction-time constants. Default surveys put auditory simple
+    // reaction at ~200 ms, visual at ~250 ms (Welford 1980, Kosinski
+    // 2008). The audio path overrides the default with the user's
+    // personal measurement from the keyboard pre-test (param.audioRtMs)
+    // when available — individual reaction times vary by 30-50 ms, and
+    // that error propagates straight into mic-latency miscalibration.
     const dts = perBeat.filter(b => b.dt !== null).map(b => b.dt);
-    const REACTION_TIME_MS = mode === 'visual' ? 250 : 200;
+    const personalAudioRt = (opts && opts.audioRtMs) || 0;
+    const REACTION_TIME_MS = mode === 'visual'
+        ? 250
+        : (personalAudioRt > 0 ? personalAudioRt : 200);
+    // Cluster bounds widen with the reaction-time constant so the
+    // reaction window remains centred on the expected response.
     const ANTI_LO = -150, ANTI_HI = 150;
-    const REACT_LO = mode === 'visual' ? 200 : 150;
-    const REACT_HI = mode === 'visual' ? 400 : 350;
+    const REACT_LO = mode === 'visual' ? 200 : Math.max(120, REACTION_TIME_MS - 80);
+    const REACT_HI = mode === 'visual' ? 400 : REACTION_TIME_MS + 150;
 
     const anticipation = dts.filter(d => d >= ANTI_LO && d <= ANTI_HI);
     const reaction = dts.filter(d => d > REACT_LO && d <= REACT_HI);
@@ -5134,7 +5307,10 @@ function _ndWizComputeRun(beats, detections, mode) {
 }
 
 function _ndWizFinishRun(mode) {
-    const runResult = _ndWizComputeRun(_ndWizBeats, _ndWizDetections, mode);
+    const runResult = _ndWizComputeRun(
+        _ndWizBeats, _ndWizDetections, mode,
+        { audioRtMs: _ndUserReactionAuditoryMs }
+    );
     if (mode === 'visual') _ndWizVisualRun = runResult;
     else if (mode === 'audio') _ndWizAudioRun = runResult;
 
@@ -5248,22 +5424,45 @@ function _ndWizRender() {
     if (_ndWizStep === 'intro') {
         const vDone = _ndWizVisualOffsetMs !== null;
         const aDone = _ndWizAudioOffsetMs !== null;
+        const rtMs = _ndUserReactionAuditoryMs;
+        const rtDone = rtMs > 0;
         modal.innerHTML = wrap(`
-            <p class="text-sm text-gray-300 mb-2"><strong>${_ND_METRO_CYCLES}</strong> rounds of <em>1 → 2 → 3 → PLAY</em> at ${_ND_METRO_BPM} BPM. Three quiet count beats then pluck on PLAY — the count gives you time to anticipate, the GO cue is unambiguous.</p>
-            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Don't react to the GO; pluck <em>with</em> it (you'll have heard 3 ticks at constant rhythm so the GO moment is predictable). Each round produces one data point; the median across rounds is your calibration.</p>
+            <p class="text-sm text-gray-300 mb-2">Three steps: measure your personal reaction time, then run visual + audio bass tests.</p>
+            <p class="text-[11px] text-gray-500 mb-4 leading-tight">Step 1 measures how fast you respond to a stimulus (no instrument). The audio bass test then subtracts that from your pluck timing to isolate mic-pipeline latency. No more guessing at typical-human reaction-time constants.</p>
             <div class="space-y-2 mb-4">
+                <button onclick="_ndWizStartKeyboardRun()" class="w-full flex items-center justify-between px-4 py-2 ${rtDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
+                    <span><strong>1. Reaction baseline</strong> — press SPACE on each click (~10 sec).</span>
+                    <span class="text-xs text-gray-400">${rtDone ? `✓ ${rtMs} ms` : 'Start →'}</span>
+                </button>
                 <button onclick="_ndWizStartRun('visual')" class="w-full flex items-center justify-between px-4 py-2 ${vDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>1. Visual</strong> — flash only. Measures mic input lag.</span>
+                    <span><strong>2. Visual</strong> — pluck on the green GO dot.</span>
                     <span class="text-xs text-gray-400">${vDone ? `✓ ${Math.round(_ndWizVisualOffsetMs)} ms` : 'Start →'}</span>
                 </button>
                 <button onclick="_ndWizStartRun('audio')" class="w-full flex items-center justify-between px-4 py-2 ${aDone ? 'bg-green-900/30 hover:bg-green-900/40' : 'bg-dark-600 hover:bg-dark-500'} rounded-xl text-sm">
-                    <span><strong>2. Audio</strong> — click + flash. Measures total round-trip.</span>
+                    <span><strong>3. Audio</strong> — pluck on the lower-pitched GO tone.</span>
                     <span class="text-xs text-gray-400">${aDone ? `✓ ${Math.round(_ndWizAudioOffsetMs)} ms` : 'Start →'}</span>
                 </button>
             </div>
             <div class="flex gap-3 justify-end">
                 <button onclick="_ndCloseWizard()" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel</button>
                 <button onclick="_ndWizStep='review'; _ndWizRender()" ${(vDone && aDone) ? '' : 'disabled'} class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-sm font-semibold text-white disabled:opacity-50">Review</button>
+            </div>
+        `);
+    } else if (_ndWizStep === 'running-keyboard') {
+        const result = _ndWizKeyboardLastResult;
+        const lastInfo = result && result.medianMs !== null
+            ? `<p class="text-[11px] text-gray-400 mt-2">Last run: ${result.medianMs} ms (raw ${result.rawMedianMs} − ${result.inputLagMs} input lag)</p>`
+            : '';
+        modal.innerHTML = wrap(`
+            <p class="text-sm text-gray-300 mb-3"><strong>Press SPACE</strong> as soon as you hear each click. Don't anticipate — react. ${_ND_WIZ_KEYBOARD_CLICKS} clicks at ${(_ND_WIZ_KEYBOARD_INTERVAL_MS / 1000).toFixed(1)}-sec intervals.</p>
+            <div class="flex items-center justify-center h-32 bg-dark-800 rounded-xl mb-3 border border-gray-800 text-gray-200 text-3xl font-mono">
+                <span id="nd-wiz-kbd-counter">0 / ${_ND_WIZ_KEYBOARD_CLICKS}</span>
+            </div>
+            <p class="text-[11px] text-gray-500 mb-3 leading-tight">No instrument needed. The wizard measures (keydown - click) and stores the median minus a fixed input-lag constant as your personal auditory reaction time.</p>
+            ${lastInfo}
+            <div class="flex gap-3 justify-end">
+                <button onclick="_ndWizCancelTimers();_ndWizStep='intro';_ndWizRender()"
+                    class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300">Cancel</button>
             </div>
         `);
     } else if (_ndWizStep === 'running-visual' || _ndWizStep === 'running-audio') {
@@ -5358,15 +5557,22 @@ function _ndWizRender() {
                 const rMed = run.reactionMedian;
                 const rAdj = run.reactionAdjusted;
                 const rt = run.reactionTimeConstMs;
+                // For audio mode: rt is the user's measured personal value
+                // when available, otherwise the 200 ms Welford default. For
+                // visual mode it's always the 250 ms default (no per-user
+                // visual reaction measurement yet).
+                const rtSource = run.mode === 'audio' && _ndUserReactionAuditoryMs > 0
+                    ? `your measured reaction time`
+                    : `Welford 1980 default`;
                 if (run.usedCluster === 'both') {
-                    return `<p class="text-[11px] text-green-300 mt-2 leading-tight"><strong>Convergent.</strong> Anticipation cluster median = ${Math.round(aMed)} ms; reaction cluster median = ${Math.round(rMed)} ms (− ${rt} ms typical reaction = ${Math.round(rAdj)} ms). Both estimates agree → final = ${Math.round(run.medianDt)} ms.</p>`;
+                    return `<p class="text-[11px] text-green-300 mt-2 leading-tight"><strong>Convergent.</strong> Anticipation cluster median = ${Math.round(aMed)} ms; reaction cluster median = ${Math.round(rMed)} ms (− ${rt} ms ${rtSource} = ${Math.round(rAdj)} ms). Both estimates agree → final = ${Math.round(run.medianDt)} ms.</p>`;
                 }
                 if (run.usedCluster === 'anticipation') {
-                    const reactBlurb = rMed !== null ? ` Reaction cluster gave ${Math.round(rAdj)} ms (median ${Math.round(rMed)} − ${rt}); divergent, so we trusted the anticipation measurement.` : '';
+                    const reactBlurb = rMed !== null ? ` Reaction cluster gave ${Math.round(rAdj)} ms (median ${Math.round(rMed)} − ${rt} ${rtSource}); divergent, so we trusted the anticipation measurement.` : '';
                     return `<p class="text-[11px] text-gray-400 mt-2 leading-tight"><strong>Anticipation cluster:</strong> median of ${run.anticipationCount} clean pluck(s) on the beat = ${Math.round(aMed)} ms.${reactBlurb}</p>`;
                 }
                 if (run.usedCluster === 'reaction') {
-                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms typical reaction = ${Math.round(rAdj)} ms. Medium confidence — depends on the reaction-time constant being right for you.</p>`;
+                    return `<p class="text-[11px] text-blue-300 mt-2 leading-tight"><strong>Reaction-time fallback:</strong> no anticipation plucks. ${run.reactionCount} reaction-cluster plucks, median ${Math.round(rMed)} ms; subtracting ${rt} ms (${rtSource}) = ${Math.round(rAdj)} ms.${run.mode === 'audio' && _ndUserReactionAuditoryMs > 0 ? ' High confidence — based on your personal measurement.' : ' Medium confidence — measure your personal reaction time in step 1 for a tighter estimate.'}</p>`;
                 }
                 return '';
             })();
