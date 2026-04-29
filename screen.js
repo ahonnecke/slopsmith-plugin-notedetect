@@ -5550,10 +5550,7 @@ function _ndWizRunIsApplyable(run) {
 }
 
 async function _ndWizApplyMetro() {
-    const vRun = _ndWizVisualRun;
     const aRun = _ndWizAudioRun;
-    const visualMs = vRun && vRun.medianDt !== null ? Math.round(vRun.medianDt) : null;
-    const audioMs  = aRun && aRun.medianDt !== null ? Math.round(aRun.medianDt)  : null;
 
     const applied = [];
     const skipped = [];
@@ -5563,6 +5560,7 @@ async function _ndWizApplyMetro() {
     // medium confidence with a usable sample count. Single-sample medium
     // confidence is too noisy to commit.
     if (_ndWizRunIsApplyable(aRun)) {
+        const audioMs = Math.round(aRun.medianDt);
         const value = Math.max(0, audioMs);
         _ndMicLatencyMs = value;
         _ndSaveSettings();
@@ -5574,26 +5572,23 @@ async function _ndWizApplyMetro() {
         skipped.push(`mic latency (audio run too thin: confidence=${aRun.confidence}, n=${aRun.usedCount})`);
     }
 
-    // A/V offset = visual_dt - audio_dt. Both sides need to be solid; this
-    // is a derivative of two measurements, so noise compounds. Strict gate.
-    if (_ndWizRunIsApplyable(aRun) && _ndWizRunIsApplyable(vRun)) {
-        const raw = visualMs - audioMs;
-        const avMs = Math.max(-1000, Math.min(1000, raw));
-        try {
-            await fetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ av_offset_ms: avMs }),
-            });
-            if (typeof setAvOffsetMs === 'function') setAvOffsetMs(avMs);
-            applied.push(`A/V offset = ${avMs} ms`);
-        } catch (e) {
-            console.warn('A/V offset save failed:', e);
-            skipped.push(`A/V offset (network error: ${e.message || e})`);
+    // A/V offset is intentionally NOT auto-applied. Earlier versions wrote
+    // visual_dt - audio_dt to slopsmith's av_offset_ms whenever both runs
+    // were "applyable", but the wizard's per-run noise (~50 ms per side)
+    // means the diff is ±100 ms noisy and clobbered the user's manual
+    // setting on every wizard run. Visuals went visibly out of sync after
+    // any wizard apply.
+    //
+    // The wizard now MEASURES and DISPLAYS the A/V offset (in the review
+    // panel), but doesn't write to slopsmith. The user adjusts av_offset
+    // manually via slopsmith's [/] keys or the slider — that's a one-time
+    // visual-sync calibration, not something to re-derive each wizard run.
+    if (_ndWizVisualRun && _ndWizAudioRun) {
+        const v = _ndWizVisualRun.medianDt;
+        const a = _ndWizAudioRun.medianDt;
+        if (v !== null && a !== null) {
+            skipped.push(`A/V offset suggestion = ${Math.round(v - a)} ms (set manually via slopsmith's [/] keys; wizard no longer auto-writes this)`);
         }
-    } else if (vRun || aRun) {
-        const why = !_ndWizRunIsApplyable(vRun) ? 'visual' : 'audio';
-        skipped.push(`A/V offset (${why} run not high enough confidence)`);
     }
 
     if (applied.length) console.log(`[note_detect] Calibration applied: ${applied.join('; ')}`);
@@ -5864,7 +5859,7 @@ function _ndWizRender() {
                 <div class="flex justify-between items-baseline"><span class="text-gray-400">Audio run (dt_a, n=${aRun ? aRun.usedCount : 0}) ${confLabel(aRun)}</span><span class="text-gray-200 font-mono">${a !== null ? (a >= 0 ? '+' : '') + Math.round(a) + ' ms' : '—'}</span></div>
                 <hr class="border-gray-700">
                 <div class="flex justify-between items-baseline"><span class="text-gray-300">Plugin Audio Latency ${applyTag(audioApplyable, aRun ? `audio ${aRun.confidence}` : 'no run')}</span><span class="text-gray-200 font-mono font-semibold">${latApplied} ms</span></div>
-                <div class="flex justify-between items-baseline"><span class="text-gray-300">A/V Sync Offset (= V − A) ${applyTag(avApplyable, audioApplyable ? 'visual run too thin' : 'audio run too thin')}</span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
+                <div class="flex justify-between items-baseline"><span class="text-gray-300">A/V Sync Offset (= V − A) <span class="text-gray-500 text-[10px] ml-2">measurement only — set manually via slopsmith [/] keys</span></span><span class="text-gray-200 font-mono font-semibold">${avRaw >= 0 ? '+' : ''}${avRaw} ms</span></div>
             </div>
             ${perBeatTable(vRun, 'Visual')}
             ${perBeatTable(aRun, 'Audio')}
