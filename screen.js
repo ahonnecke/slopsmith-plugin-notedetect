@@ -461,6 +461,12 @@ let _ndBestStreak = 0;
 let _ndSectionStats = [];    // [{name, hits, misses}]
 let _ndCurrentSection = null;
 
+// Drill-mode flags. Default off; flipped by _ndStartDrill() (Phase 5).
+// Declared early because _ndSnapshotPlay reads them when building the
+// summary payload, so they must exist whether drill mode has been used or not.
+let _ndDrillActive = false;
+let _ndDrillSectionName = null;
+
 // Compound judgment counters (docs/NOTE_FAILURE_SPEC.md). A HIT can still
 // have timing/pitch labels if the detection was within tolerance but not
 // perfectly aligned. These counters tally label occurrences, not unique
@@ -478,6 +484,23 @@ let _ndEarly = 0, _ndLate = 0, _ndSharp = 0, _ndFlat = 0;
 // Set initially to default-preset values; _ndApplyStrictness rebinds them.
 let _ndPerfectTimingMs  = 50;
 let _ndPerfectPitchCent = 20;
+
+// Coaching-mode score weights. The user's headline complaint was that
+// "missing a note by 10 ms costs the same as playing the wrong string."
+// These weights split those cases: a HIT with timing/pitch labels still
+// gets ~85% of a clean HIT (it's still a hit, just sloppy), while a
+// MISS_WRONG_PITCH costs roughly 3× a baseline timing miss because it's
+// a categorically different error — wrong note, not wrong moment.
+// The combined score is sum(weight) / (total * HIT_CLEAN), clamped [0,1].
+const _ND_SCORE_WEIGHTS = {
+    HIT_CLEAN:        1.00,
+    HIT_TIMING_OFF:   0.85,   // HIT with EARLY/LATE label
+    HIT_PITCH_OFF:    0.85,   // HIT with SHARP/FLAT label
+    DIRTY_HIT:        0.60,   // HIT downgraded by hygiene (off-target frame ratio)
+    MISS_NO_DETECT:  -1.50,   // ~2× baseline — no pluck or onset never fired
+    MISS_WRONG_PITCH:-2.50,   // ~3× — the coaching headline
+    IGNORED_FAILURE:  0.00,   // detector fault, not player's — exclude from total
+};
 
 // Adaptive drift estimate. Real-world recordings (especially CDLC and
 // charts of live human performances) have rubato — the audio's note
@@ -857,12 +880,24 @@ function _ndSnapshotPlay(reason) {
     const playId = new Date().toISOString().replace(/[:.]/g, '-');
     const noteResults = [];
     _ndNoteResults.forEach((v, k) => noteResults.push({ key: k, ...v }));
+    const scores = _ndComputeScores();
     const snapshot = {
         songId,
         playId,
         reason,
         startedAt: Date.now(),
         noteResults,
+        summary: {
+            hits: scores.hits,
+            misses: scores.misses,
+            pitchScore: scores.pitchPct,
+            timingMedianMs: scores.timingMedianMs,
+            timingStdMs: scores.timingStdMs,
+            coverage: scores.coverage,
+            combinedWeightedScore: scores.combined,
+        },
+        isDrill: !!_ndDrillActive,
+        drillSectionName: _ndDrillSectionName || null,
     };
     // Build the trouble map from this just-completed play BEFORE clearing
     // so the next loop iteration starts with up-to-date pre-arrival glow.
@@ -880,8 +915,10 @@ function _ndSnapshotPlay(reason) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(snapshot),
-    }).then(() => {
-        console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes)`);
+    }).then(r => r.json())
+      .then(data => {
+        const id = data && data.id;
+        console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes, id=${id})`);
         // Refresh the trouble map from the cross-loop aggregate now that
         // the new snapshot is on disk. Single-play map (set above) was
         // a stop-gap so the immediate next iteration had glow; this
@@ -894,8 +931,9 @@ function _ndSnapshotPlay(reason) {
             // breathe between expensive renders.
             _ndRunPracticePanelUpdates();
         }
+        return id || null;
     })
-      .catch(e => console.warn('[note_detect] Play snapshot failed:', e));
+      .catch(e => { console.warn('[note_detect] Play snapshot failed:', e); return null; });
 }
 
 // Pull the most-recent play snapshot off disk and seed the trouble map.
@@ -2098,6 +2136,19 @@ const _ND_REATTACK_REFRACTORY_SEC = 0.200;
 // every pluck instead of dropping every other one to refractory.
 const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
 const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
+// Chart-guided onset gate: when the chart shows a note within
+// [now-LOOKBACK, now+LOOKAHEAD], swap the onset thresholds for relaxed
+// values that catch sustain-bleed attacks the conservative gate would
+// drop. The chart is a prior — we only loosen where we already expect
+// a hit, so the false-fire blast radius is bounded by chart density.
+// LOOKBACK 150ms covers mic + onset-comp residual after avOffset; the
+// LOOKAHEAD 200ms matches strict's late-tolerance window. Validated
+// offline against Gasoline WAV: drops MISSED_NO_DETECTION from 37 to
+// N (see test/onset-sim.js report).
+const _ND_CHART_GUIDED_LOOKBACK_SEC  = 0.150;
+const _ND_CHART_GUIDED_LOOKAHEAD_SEC = 0.200;
+const _ND_CHART_GUIDED_LEVEL = 0.015;  // entry/min level when chart-guided
+const _ND_CHART_GUIDED_RATIO = 1.3;    // re-attack rise ratio when chart-guided
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
 // Release-before-retrigger: after any onset fires, another re-attack can't
@@ -5675,6 +5726,515 @@ function _ndStopHUD() {
     _ndRemoveHUD();
 }
 
+// Per-result weight under the coaching-mode score model.
+// HITs with EARLY/LATE/SHARP/FLAT labels are still hits but capped at 85%
+// (partial credit for timing/pitch sloppiness within the tolerance window).
+// IGNORED_DETECTOR_FAILURE returns 0 and is also excluded from the total
+// at the call site so it doesn't pull the denominator.
+function _ndResultWeight(r) {
+    const W = _ND_SCORE_WEIGHTS;
+    if (r.primary === 'IGNORED_DETECTOR_FAILURE') return W.IGNORED_FAILURE;
+    if (r.primary === 'DIRTY_HIT') return W.DIRTY_HIT;
+    if (r.primary === 'HIT') {
+        const labels = r.labels || [];
+        if (labels.includes('SHARP') || labels.includes('FLAT')) return W.HIT_PITCH_OFF;
+        if (labels.includes('LATE')  || labels.includes('EARLY')) return W.HIT_TIMING_OFF;
+        return W.HIT_CLEAN;
+    }
+    if (r.primary === 'MISSED_NO_DETECTION') return W.MISS_NO_DETECT;
+    if (r.primary === 'MISSED_WRONG_PITCH')  return W.MISS_WRONG_PITCH;
+    return 0;
+}
+
+// Walk _ndNoteResults once and produce the four numbers the UI cares about:
+//   combined  — coaching-weighted accuracy (0..1, clamped)
+//   pitchPct  — of detections, what fraction were the right pitch
+//   timingMedianMs / timingStdMs — over HITs only
+//   coverage  — fraction of chart notes that produced any detection at all
+// Plus raw hits/misses for backward compat with practice_journal payload.
+function _ndComputeScores() {
+    const W = _ND_SCORE_WEIGHTS;
+    let weightedSum = 0, total = 0;
+    let hitCount = 0, wrongPitchCount = 0;
+    let detectedCount = 0;          // HIT, DIRTY_HIT, or MISSED_WRONG_PITCH (player produced something)
+    const hitTimings = [];
+
+    for (const r of _ndNoteResults.values()) {
+        if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;  // not player's fault
+        total++;
+        weightedSum += _ndResultWeight(r);
+        if (r.primary === 'HIT' || r.primary === 'DIRTY_HIT') {
+            hitCount++;
+            detectedCount++;
+            if (typeof r.timingError === 'number') hitTimings.push(r.timingError);
+        } else if (r.primary === 'MISSED_WRONG_PITCH') {
+            wrongPitchCount++;
+            detectedCount++;
+        }
+    }
+
+    const maxPossible = total * W.HIT_CLEAN;
+    const combined = total === 0 ? 0
+        : Math.max(0, Math.min(1, weightedSum / maxPossible));
+    const pitchDenom = hitCount + wrongPitchCount;
+    const pitchPct = pitchDenom === 0 ? null : hitCount / pitchDenom;
+    const coverage = total === 0 ? null : detectedCount / total;
+
+    let timingMedianMs = null, timingStdMs = null;
+    if (hitTimings.length > 0) {
+        const sorted = [...hitTimings].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        timingMedianMs = sorted.length % 2 === 0
+            ? (sorted[mid - 1] + sorted[mid]) / 2
+            : sorted[mid];
+        const mean = hitTimings.reduce((s, v) => s + v, 0) / hitTimings.length;
+        const variance = hitTimings.reduce((s, v) => s + (v - mean) ** 2, 0) / hitTimings.length;
+        timingStdMs = Math.sqrt(variance);
+    }
+
+    return {
+        combined, pitchPct, coverage, timingMedianMs, timingStdMs,
+        total, hits: hitCount, misses: total - hitCount,
+    };
+}
+
+// ── Post-play coaching review modal ────────────────────────────────────
+// Pops at session boundaries (song end, restart, loop-clear, detect-off)
+// and shows the three coaching axes + a section heatmap + a trouble-spot
+// list with "Drill this" buttons. Distinct from _ndShowReport (the cross-
+// play history panel at line 1543); this one is single-session focused.
+
+const _ND_REVIEW_SOURCE_LABELS = {
+    song_end:   'Song complete',
+    restart:    'Restarted',
+    loop_clear: 'Loop ended',
+    detect_off: 'Detect off',
+};
+
+function _ndAggregateBySection(noteResults, sections) {
+    // Returns Map<sectionName, {hits, misses, total, weighted, max,
+    //                            failureModeCounts: Map<mode,n>,
+    //                            timingErrors: number[]}>
+    const byName = new Map();
+    const ensure = (name) => {
+        let row = byName.get(name);
+        if (!row) {
+            row = { hits: 0, misses: 0, total: 0, weighted: 0, max: 0,
+                    failureModeCounts: new Map(), timingErrors: [] };
+            byName.set(name, row);
+        }
+        return row;
+    };
+    // Pre-create rows for every chart section so the heatmap shows empty
+    // cells rather than collapsing them.
+    for (const sec of sections || []) ensure(sec.name);
+    for (const r of noteResults) {
+        const name = r.sectionName || '(unsectioned)';
+        const row = ensure(name);
+        if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;
+        row.total++;
+        row.weighted += _ndResultWeight(r);
+        row.max += _ND_SCORE_WEIGHTS.HIT_CLEAN;
+        if (r.primary === 'HIT' || r.primary === 'DIRTY_HIT') {
+            row.hits++;
+            if (typeof r.timingError === 'number') row.timingErrors.push(r.timingError);
+        } else {
+            row.misses++;
+        }
+        const mode = _ndClassifyFailureMode(r);
+        row.failureModeCounts.set(mode, (row.failureModeCounts.get(mode) || 0) + 1);
+    }
+    return byName;
+}
+
+function _ndScoreColor(pct) {
+    // pct is 0..1; null/undefined → neutral gray.
+    if (pct == null) return '#4b5563';
+    if (pct >= 0.90) return '#10b981';   // green
+    if (pct >= 0.70) return '#eab308';   // yellow
+    if (pct >= 0.40) return '#f97316';   // orange
+    return '#dc2626';                    // red
+}
+
+function _ndRenderSubScoreTile(label, valueText, color) {
+    return `
+        <div class="bg-dark-700 border border-gray-700 rounded-lg px-4 py-3 text-center">
+            <div class="text-gray-500 text-[11px] uppercase tracking-wide">${label}</div>
+            <div class="text-2xl font-bold mt-1" style="color:${color}">${valueText}</div>
+        </div>
+    `;
+}
+
+function _ndRenderSectionHeatmapSvg(perSection, sections, totalDuration) {
+    const width = 800, height = 32;
+    if (!sections || !sections.length || totalDuration <= 0) {
+        return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
+    }
+    let cells = '';
+    for (let i = 0; i < sections.length; i++) {
+        const sec = sections[i];
+        const next = sections[i + 1];
+        const start = sec.time || 0;
+        const end = next ? (next.time || totalDuration) : totalDuration;
+        const x = (start / totalDuration) * width;
+        const w = Math.max(1, ((end - start) / totalDuration) * width);
+        const row = perSection.get(sec.name);
+        const accuracy = row && row.total > 0
+            ? Math.max(0, Math.min(1, row.weighted / row.max))
+            : null;
+        const color = _ndScoreColor(accuracy);
+        const title = row && row.total > 0
+            ? `${sec.name}: ${Math.round(accuracy * 100)}% (${row.hits}/${row.total})`
+            : `${sec.name}: no notes`;
+        cells += `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${height}" fill="${color}" stroke="#1f2937" stroke-width="0.5"><title>${title}</title></rect>`;
+    }
+    return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${cells}</svg>`;
+}
+
+function _ndRenderTroubleSpotRow(name, row) {
+    const accuracy = row.total > 0 ? Math.max(0, Math.min(1, row.weighted / row.max)) : 0;
+    const accColor = _ndScoreColor(accuracy);
+    // Dominant failure mode (excluding CLEAN)
+    let dominantMode = 'UNKNOWN', dominantCount = 0;
+    for (const [mode, n] of row.failureModeCounts) {
+        if (mode === 'CLEAN') continue;
+        if (n > dominantCount) { dominantMode = mode; dominantCount = n; }
+    }
+    const info = (typeof _ND_FAILURE_MODE_INFO === 'object' && _ND_FAILURE_MODE_INFO[dominantMode])
+        || { label: dominantMode, color: '#9ca3af' };
+    return `
+        <div class="flex items-center gap-3 bg-dark-700 border border-gray-700 rounded-lg px-3 py-2">
+            <div class="font-mono text-2xl font-bold w-16 text-center" style="color:${accColor}">${Math.round(accuracy * 100)}%</div>
+            <div class="flex-1 min-w-0">
+                <div class="text-gray-200 text-sm font-medium truncate">${name}</div>
+                <div class="text-[11px] text-gray-500">${row.hits}/${row.total} hits · <span style="color:${info.color}">${info.label}</span> ×${dominantCount}</div>
+            </div>
+            <button data-drill-section="${encodeURIComponent(name)}"
+                    class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-800 rounded text-xs text-blue-200 shrink-0">
+                Drill this
+            </button>
+        </div>
+    `;
+}
+
+async function _ndShowCoachingReview({ playId, source }) {
+    document.getElementById('nd-review-modal')?.remove();
+    let play;
+    try {
+        const r = await fetch(`/api/plugins/note_detect/play/${playId}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        play = await r.json();
+    } catch (e) {
+        console.warn('[note_detect] review fetch failed:', e);
+        return;
+    }
+    const sections = (highway.getSections && highway.getSections()) || [];
+    const songInfo = highway.getSongInfo && highway.getSongInfo();
+    const totalDuration = (songInfo && songInfo.duration) || 0;
+    const perSection = _ndAggregateBySection(play.noteResults || [], sections);
+
+    const summary = play.summary || {};
+    const pitchPctText = summary.pitchScore != null
+        ? `${Math.round(summary.pitchScore * 100)}%` : '—';
+    const coverageText = summary.coverage != null
+        ? `${Math.round(summary.coverage * 100)}%` : '—';
+    const timingText = summary.timingMedianMs != null
+        ? `${Math.round(summary.timingMedianMs)} ±${Math.round(summary.timingStdMs || 0)}ms`
+        : '—';
+    const combinedColor = _ndScoreColor(summary.combinedWeightedScore);
+
+    // Sort sections by combined score ascending (worst first); skip empties.
+    const trouble = [...perSection.entries()]
+        .filter(([_, row]) => row.total > 0)
+        .map(([name, row]) => ({ name, row, score: row.weighted / row.max }))
+        .sort((a, b) => a.score - b.score);
+
+    const modal = document.createElement('div');
+    modal.id = 'nd-review-modal';
+    modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+    modal.innerHTML = `
+        <div class="bg-dark-800 border border-gray-700 rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-auto m-4">
+            <div class="sticky top-0 bg-dark-800 border-b border-gray-700 px-5 py-3 flex items-center justify-between z-10">
+                <div class="min-w-0 flex-1">
+                    <div class="text-gray-200 font-semibold truncate">${(songInfo && songInfo.title) || play.songId || 'Song'}</div>
+                    <div class="text-gray-500 text-xs">
+                        ${_ND_REVIEW_SOURCE_LABELS[source] || source || 'Review'}
+                        · ${play.playedAt ? new Date(play.playedAt).toLocaleString() : ''}
+                        · ${(play.noteResults || []).length} notes
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 ml-4">
+                    <div class="text-right">
+                        <div class="text-[10px] text-gray-500 uppercase tracking-wide">Score</div>
+                        <div class="text-2xl font-bold leading-none" style="color:${combinedColor}">${
+                            summary.combinedWeightedScore != null ? Math.round(summary.combinedWeightedScore * 100) + '%' : '—'
+                        }</div>
+                    </div>
+                    <button id="nd-review-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
+                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(summary.pitchScore))}
+                ${_ndRenderSubScoreTile('Timing', timingText, _ndScoreColor(
+                    summary.timingMedianMs != null ? Math.max(0, 1 - Math.abs(summary.timingMedianMs) / 100) : null
+                ))}
+                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(summary.coverage))}
+            </div>
+
+            ${sections.length ? `
+            <div class="px-5 py-4 border-b border-gray-700">
+                <div class="text-gray-400 text-xs mb-2">Section heatmap</div>
+                <div class="rounded overflow-hidden border border-gray-700">
+                    ${_ndRenderSectionHeatmapSvg(perSection, sections, totalDuration)}
+                </div>
+            </div>` : ''}
+
+            <div class="px-5 py-4 border-b border-gray-700">
+                <div class="text-gray-400 text-xs mb-2">Trouble spots — worst first</div>
+                <div class="space-y-1.5">
+                    ${trouble.length === 0
+                        ? '<div class="text-gray-500 text-xs italic">No trouble spots — clean play.</div>'
+                        : trouble.map(t => _ndRenderTroubleSpotRow(t.name, t.row)).join('')
+                    }
+                </div>
+            </div>
+
+            <div class="px-5 py-4">
+                <button id="nd-review-history-toggle"
+                        class="text-gray-400 hover:text-gray-200 text-xs flex items-center gap-1">
+                    <span class="nd-history-arrow">▸</span> History — improvement over time
+                </button>
+                <div id="nd-review-history" class="hidden mt-3"></div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    // Dismissal: X button, click outside, Escape.
+    const close = () => {
+        modal.remove();
+        document.removeEventListener('keydown', escHandler);
+    };
+    const escHandler = (e) => { if (e.key === 'Escape') close(); };
+    modal.querySelector('#nd-review-close').onclick = close;
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    document.addEventListener('keydown', escHandler);
+
+    // Drill buttons — defer to _ndStartDrill (Phase 5). Stub-safe: if the
+    // function isn't defined yet, log instead of crashing.
+    modal.querySelectorAll('[data-drill-section]').forEach(btn => {
+        btn.onclick = () => {
+            const name = decodeURIComponent(btn.getAttribute('data-drill-section'));
+            close();
+            if (typeof _ndStartDrill === 'function') {
+                _ndStartDrill(name);
+            } else {
+                console.warn('[note_detect] _ndStartDrill not defined yet; drill request ignored:', name);
+            }
+        };
+    });
+
+    // History toggle (Phase 6). Lazy-fetch on first expand.
+    const historyToggle = modal.querySelector('#nd-review-history-toggle');
+    const historyEl = modal.querySelector('#nd-review-history');
+    let historyLoaded = false;
+    historyToggle.onclick = async () => {
+        const arrow = historyToggle.querySelector('.nd-history-arrow');
+        if (historyEl.classList.contains('hidden')) {
+            historyEl.classList.remove('hidden');
+            arrow.textContent = '▾';
+            if (!historyLoaded) {
+                historyLoaded = true;
+                historyEl.innerHTML = '<div class="text-gray-500 text-xs italic">Loading history…</div>';
+                await _ndRenderReviewHistory(historyEl, play.songId);
+            }
+        } else {
+            historyEl.classList.add('hidden');
+            arrow.textContent = '▸';
+        }
+    };
+}
+
+async function _ndRenderReviewHistory(container, songId) {
+    let plays = [];
+    let sectionsData = { sections: [], plays: [] };
+    try {
+        const [pr, sr] = await Promise.all([
+            fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=10`).then(r => r.json()),
+            fetch(`/api/plugins/note_detect/sections/${encodeURIComponent(songId)}?limit=10`).then(r => r.json()),
+        ]);
+        plays = (pr && pr.plays) || [];
+        sectionsData = sr || sectionsData;
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-xs">History fetch failed: ${e.message}</div>`;
+        return;
+    }
+    if (plays.length < 2) {
+        container.innerHTML = '<div class="text-gray-500 text-xs italic">Need at least 2 plays for a trend.</div>';
+        return;
+    }
+    // Plays come newest-first from the server; reverse for left-to-right
+    // chronological display.
+    const ordered = [...plays].reverse();
+    const lineChart = _ndRenderHistoryLineChart(ordered);
+    const sectionTrends = _ndRenderSectionTrends(sectionsData);
+    container.innerHTML = `
+        <div class="text-gray-400 text-xs mb-1">Combined score across last ${ordered.length} plays</div>
+        <div class="bg-dark-700 border border-gray-700 rounded p-2">${lineChart}</div>
+        ${sectionTrends ? `
+            <div class="text-gray-400 text-xs mt-3 mb-1">Per-section trend</div>
+            ${sectionTrends}
+        ` : ''}
+    `;
+}
+
+function _ndRenderHistoryLineChart(plays) {
+    const W = 600, H = 100, M = 8;
+    const pts = plays.map(p => p.summary && p.summary.combinedWeightedScore).map(v => v == null ? null : Math.max(0, Math.min(1, v)));
+    if (pts.every(v => v == null)) {
+        return '<div class="text-gray-500 text-xs italic">No score data yet (older plays predate scoring fields).</div>';
+    }
+    const xStep = pts.length > 1 ? (W - 2 * M) / (pts.length - 1) : 0;
+    const y = (v) => M + (1 - v) * (H - 2 * M);
+    let path = '';
+    let dotMarkup = '';
+    pts.forEach((v, i) => {
+        if (v == null) return;
+        const cx = M + i * xStep;
+        const cy = y(v);
+        path += (path === '' ? `M ${cx} ${cy}` : ` L ${cx} ${cy}`);
+        const playId = plays[i].id;
+        const isDrill = plays[i].isDrill;
+        dotMarkup += `<circle cx="${cx}" cy="${cy}" r="${isDrill ? 3 : 4}" fill="${_ndScoreColor(v)}" stroke="${isDrill ? '#60a5fa' : 'transparent'}" stroke-width="${isDrill ? 1.5 : 0}"><title>play ${playId}: ${Math.round(v * 100)}%${isDrill ? ' (drill)' : ''}</title></circle>`;
+    });
+    // 50%/70%/90% reference lines
+    const ref = (v, color, label) => `
+        <line x1="${M}" x2="${W - M}" y1="${y(v)}" y2="${y(v)}" stroke="${color}" stroke-width="0.5" stroke-dasharray="2,2"/>
+        <text x="${W - M + 2}" y="${y(v) + 3}" fill="${color}" font-size="9">${label}</text>
+    `;
+    return `
+        <svg width="100%" viewBox="0 0 ${W + 28} ${H}" preserveAspectRatio="none">
+            ${ref(0.9, '#10b981', '90')}
+            ${ref(0.7, '#eab308', '70')}
+            ${ref(0.5, '#f97316', '50')}
+            <path d="${path}" stroke="#9ca3af" stroke-width="1.5" fill="none"/>
+            ${dotMarkup}
+        </svg>
+    `;
+}
+
+function _ndRenderSectionTrends(sectionsData) {
+    const sections = sectionsData.sections || [];
+    if (!sections.length) return '';
+    // Pick the 5 sections with the most data; fewest-attempts last.
+    const ranked = sections
+        .map(s => ({ name: s.name, trend: s.trend || [] }))
+        .filter(s => s.trend.length > 0)
+        .sort((a, b) => b.trend.length - a.trend.length)
+        .slice(0, 5);
+    if (!ranked.length) return '';
+    return `<div class="space-y-1">${ranked.map(s => {
+        const bars = s.trend.map(p => {
+            const acc = p.accuracy != null ? p.accuracy : 0;
+            const color = _ndScoreColor(acc);
+            const h = Math.max(2, Math.round(acc * 24));
+            return `<span class="inline-block w-2 mr-0.5 align-bottom" style="height:24px;background:linear-gradient(to top, ${color} 0 ${h}px, #1f2937 ${h}px 24px)"></span>`;
+        }).join('');
+        return `
+            <div class="flex items-center gap-2 text-xs">
+                <div class="flex-1 truncate text-gray-300">${s.name}</div>
+                <div class="flex items-end h-6">${bars}</div>
+            </div>
+        `;
+    }).join('')}</div>`;
+}
+
+// Snapshot + open review. Returns the new play_id (or null if nothing to save).
+// No _ndEnabled guard here — detect_off is intentionally fired *after*
+// _ndEnabled has flipped false, and song_end fires whether Detect is on or
+// off. The empty-results check handles the Detect-was-never-on case.
+async function _ndOnSessionBoundary(source) {
+    // Suppress non-loop pops while drilling — the user is mid-practice
+    // session and a modal would be a distraction. Only loop_clear and
+    // detect_off (the explicit "done drilling" signals) pop.
+    if (_ndDrillActive && source !== 'loop_clear' && source !== 'detect_off') return null;
+
+    let playId = null;
+    if (_ndNoteResults.size > 0) {
+        playId = await _ndSnapshotPlay(source);
+    } else if ((source === 'loop_clear' || source === 'detect_off') && _ndDrillActive) {
+        // Drill ended after a `loop_restart` snapshot cleared the results
+        // map. Fall back to the most recent drill play for this section so
+        // the user still sees a review of the just-finished drill session.
+        playId = await _ndFetchMostRecentDrillPlayId();
+    }
+    if (playId) _ndShowCoachingReview({ playId, source });
+
+    // Any session boundary ends drill mode — the explicit ones (loop_clear,
+    // detect_off) and the implicit ones (song_end, restart). Reset both
+    // flags so the next play isn't mis-tagged is_drill in the DB.
+    if (_ndDrillActive) {
+        _ndDrillActive = false;
+        _ndDrillSectionName = null;
+    }
+    return playId;
+}
+
+async function _ndFetchMostRecentDrillPlayId() {
+    const songId = _ndCurrentSongId();
+    if (!songId) return null;
+    try {
+        const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=20`);
+        if (!r.ok) return null;
+        const data = await r.json();
+        const drillMatch = (data.plays || []).find(
+            p => p.isDrill && p.drillSectionName === _ndDrillSectionName
+        );
+        return drillMatch ? drillMatch.id : null;
+    } catch { return null; }
+}
+
+// ── Drill mode (Phase 5) ────────────────────────────────────────────────
+// "Drill this section" buttons in the review modal call this. Sets the
+// A-B loop to bracket the section, auto-enables Detect, and flags the
+// next plays as drill_section in the DB so the historical view can
+// distinguish them from full song-pass plays.
+function _ndStartDrill(sectionName) {
+    const sections = (highway.getSections && highway.getSections()) || [];
+    if (!sections.length) {
+        console.warn('[note_detect] _ndStartDrill: no sections available');
+        return;
+    }
+    const idx = sections.findIndex(s => s.name === sectionName);
+    if (idx === -1) {
+        console.warn(`[note_detect] _ndStartDrill: section "${sectionName}" not found`);
+        return;
+    }
+    const songInfo = (highway.getSongInfo && highway.getSongInfo()) || {};
+    const totalDuration = songInfo.duration || 600;
+    const start = sections[idx].time || 0;
+    const end = idx + 1 < sections.length ? (sections[idx + 1].time || totalDuration) : totalDuration;
+
+    _ndDrillActive = true;
+    _ndDrillSectionName = sectionName;
+
+    // Fresh scoring window for the drill — prior session's HUD numbers
+    // shouldn't bleed in. _ndToggle() also calls _ndResetScoring on
+    // enable, but resetting now means even the no-toggle path starts fresh.
+    _ndResetScoring();
+
+    if (typeof window.setActiveLoop === 'function') {
+        window.setActiveLoop(start, end);
+    } else {
+        console.warn('[note_detect] _ndStartDrill: window.setActiveLoop missing — drill loop not set');
+    }
+
+    if (!_ndEnabled) _ndToggle();  // fire-and-forget; _ndStartAudio is async
+
+    console.log(`[note_detect] Drill "${sectionName}" ${start.toFixed(1)}–${end.toFixed(1)}s`);
+}
+
 function _ndUpdateHUD() {
     if (!_ndEnabled) return;
 
@@ -5686,7 +6246,10 @@ function _ndUpdateHUD() {
     const flashEl = document.getElementById('nd-flash-overlay');
 
     if (accEl && total > 0) {
-        const accuracy = Math.round((_ndHits / total) * 100);
+        // Coaching-weighted score: wrong-pitch errors hit the score harder
+        // than near-miss timing. See _ND_SCORE_WEIGHTS.
+        const scores = _ndComputeScores();
+        const accuracy = Math.round(scores.combined * 100);
         const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
         accEl.textContent = accuracy + '%';
         accEl.style.color = color;
@@ -7342,6 +7905,34 @@ function _ndAttachAutoDetectListener() {
     // out on the old timeline but the schedule will heal within a beat.
     audio.addEventListener('seeking', () => { _ndClickTrackScheduled.clear(); });
     audio.addEventListener('pause', ()    => { _ndClickTrackScheduled.clear(); });
+
+    // ── Coaching-review session boundaries ──────────────────────────────
+    // Song-end pops the review (drill-mode is suppressed inside
+    // _ndOnSessionBoundary). Listening on the audio element directly
+    // because window.slopsmith.on('song:ended') is also a thing but the
+    // audio event fires unconditionally even before slopsmith plumbs it.
+    audio.addEventListener('ended', () => { _ndOnSessionBoundary('song_end'); });
+
+    // Slopsmith emits song:restart from the new Restart Song button (Phase 4).
+    // Subscribe defensively so the listener exists even before the button
+    // is wired — it's a no-op until the event fires.
+    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        window.slopsmith.on('song:restart', () => { _ndOnSessionBoundary('restart'); });
+    }
+
+    // Clearing the A-B loop ends a looping session — pop a review for the
+    // notes played during that loop (drill or otherwise).
+    const clearBtn = document.getElementById('btn-loop-clear');
+    if (clearBtn && clearBtn.dataset.ndReviewWired !== '1') {
+        clearBtn.dataset.ndReviewWired = '1';
+        clearBtn.addEventListener('click', () => {
+            // Slopsmith's own click handler nulls loopA/loopB synchronously
+            // before any 'click' bubbles continue, so by the time we read
+            // window.getActiveLoop() it returns null. Snapshot regardless —
+            // _ndOnSessionBoundary skips when no notes were attempted.
+            _ndOnSessionBoundary('loop_clear');
+        });
+    }
 }
 
 // ── Click-track-only playback ────────────────────────────────────────────
@@ -7476,19 +8067,11 @@ async function _ndToggle() {
         _ndStopHUD();
         if (_ndMissCheckInterval) { clearInterval(_ndMissCheckInterval); _ndMissCheckInterval = null; }
 
-        // Snapshot the final play before the report reads from history —
-        // await so the latest play is on disk by the time _ndShowReport's
-        // GET /plays request hits the server.
-        await _ndSnapshotPlay('detect_off');
-
-        // Auto-open the rich Practice Report (replaces the old _ndShowSummary
-        // modal — the report includes Top 3 prescriptions + Top Issues with
-        // advice + Suggested Loops, all driven by the same per-play history).
-        // _ndShowReport is a toggle: if it's already open, calling it removes
-        // the panel. Guard so detect-off-after-having-it-open doesn't dismiss.
-        if (!document.getElementById('nd-report-panel')) {
-            _ndShowReport();
-        }
+        // Snapshot + pop the coaching review modal for this just-finished
+        // session. The cross-play Practice Report (_ndShowReport) is still
+        // available manually via the Report button — different lens, same
+        // data. _ndOnSessionBoundary handles drill-state cleanup itself.
+        await _ndOnSessionBoundary('detect_off');
 
         // Close settings panel
         const panel = document.getElementById('nd-settings-panel');
