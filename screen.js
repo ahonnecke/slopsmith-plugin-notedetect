@@ -6011,6 +6011,10 @@ function _ndFindMissClusters(noteResults, opts = {}) {
         });
     }
     selected.sort((a, b) => a.startSec - b.startSec);
+    // Attach coaching analysis (focus, goal, dominant mode, recommended
+    // speed) to each cluster so renderers and the drill HUD share one
+    // source of truth.
+    for (const c of selected) c.analysis = _ndAnalyzeCluster(c);
     return selected;
 }
 
@@ -6100,41 +6104,122 @@ function _ndFmtMmSs(t) {
     return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-function _ndRenderClusterRow(cluster, idx) {
-    const accuracy = cluster.total > 0
-        ? Math.max(0, Math.min(1, (cluster.total - cluster.misses) / cluster.total)) : 0;
-    const accColor = _ndScoreColor(accuracy);
-    // Dominant failure mode within this cluster (excluding CLEAN).
+// Compute coaching analysis for one cluster: dominant failure mode,
+// timing pattern, focus sentence (what kind of problem is this?), and
+// an explicit numeric goal. Stored ON the cluster so Phase 4's drill
+// HUD can reuse the same focus/goal strings the cluster row displayed.
+function _ndAnalyzeCluster(cluster) {
+    // Dominant failure mode (excluding CLEAN).
     const modeCounts = new Map();
+    let totalErrorNotes = 0;
+    const timingErrors = [];
+    const pitchErrors = [];
+    const stringFretCounts = new Map();
     for (const r of cluster.notes) {
         const mode = _ndClassifyFailureMode(r);
         if (mode === 'CLEAN') continue;
         modeCounts.set(mode, (modeCounts.get(mode) || 0) + 1);
+        totalErrorNotes++;
+        if (typeof r.timingError === 'number') timingErrors.push(r.timingError);
+        if (typeof r.pitchError === 'number') pitchErrors.push(r.pitchError);
+        const sf = `s${r.s}/f${r.f}`;
+        stringFretCounts.set(sf, (stringFretCounts.get(sf) || 0) + 1);
     }
     let dominantMode = 'UNKNOWN', dominantCount = 0;
     for (const [m, n] of modeCounts) {
         if (n > dominantCount) { dominantMode = m; dominantCount = n; }
     }
-    const info = (typeof _ND_FAILURE_MODE_INFO === 'object' && _ND_FAILURE_MODE_INFO[dominantMode])
-        || { label: dominantMode, color: '#9ca3af' };
+    // Timing skew across the cluster (HITs only — misses have no timing).
+    let timingMean = null;
+    if (timingErrors.length) {
+        timingMean = timingErrors.reduce((s, v) => s + v, 0) / timingErrors.length;
+    }
+    // Most-frequent string/fret (if a single position dominates >40% of
+    // errors, surface it as a specific motor cue).
+    let dominantPosition = null, dominantPositionCount = 0;
+    for (const [sf, n] of stringFretCounts) {
+        if (n > dominantPositionCount) { dominantPosition = sf; dominantPositionCount = n; }
+    }
+    const positionDominant = totalErrorNotes > 0
+        && (dominantPositionCount / totalErrorNotes) >= 0.4;
+
+    // Focus sentence — the WHAT-kind-of-problem-is-this in plain motor
+    // terms. Falls through a priority chain: hard-timing-skew >
+    // pitch-error > coverage-failure > generic.
+    let focus;
+    let recommendedSpeed = 1.0;
+    if (timingMean !== null && Math.abs(timingMean) >= 30
+            && (dominantMode === 'TIMING_LATE' || dominantMode === 'TIMING_EARLY'
+                || (dominantMode === 'CLEAN' && Math.abs(timingMean) >= 30))) {
+        const dir = timingMean > 0 ? 'late' : 'early';
+        focus = `Consistently ${dir} by ~${Math.abs(Math.round(timingMean))}ms`;
+        recommendedSpeed = 0.75;  // slow practice locks in timing
+    } else if (dominantMode === 'WRONG_PITCH' || dominantMode === 'WRONG_FRET'
+                || dominantMode === 'WRONG_OCTAVE' || dominantMode === 'OPEN_STRING') {
+        const where = positionDominant ? ` on ${dominantPosition}` : '';
+        focus = `Wrong pitch dominates${where}`;
+    } else if (dominantMode === 'NO_PLUCK_OR_ONSET') {
+        focus = 'Notes not registering — pluck harder or check input gain';
+    } else if (dominantMode === 'SIBLING_CLAIMED') {
+        focus = 'Same-pitch sibling notes are stealing detection — practice the rhythm cleanly';
+    } else if (dominantMode === 'STRING_BLEED') {
+        focus = 'String bleed — mute the strings you are not playing';
+    } else if (dominantMode === 'PITCH_SHARP' || dominantMode === 'PITCH_FLAT') {
+        const dir = dominantMode === 'PITCH_SHARP' ? 'sharp' : 'flat';
+        focus = `Pitch landing ${dir} — check tuning or finger pressure`;
+    } else {
+        focus = `${dominantCount} miss${dominantCount === 1 ? '' : 'es'} of various kinds`;
+    }
+
+    // Goal: aim for an accuracy target on the next attempt. Use a
+    // motivating-but-realistic target — at minimum 20 percentage points
+    // above the current cluster accuracy, capped at 90% (perfection is
+    // not the practice goal; consistency is).
+    const currentAccuracy = cluster.total > 0
+        ? (cluster.total - cluster.misses) / cluster.total : 0;
+    const goal = Math.min(0.9, Math.max(0.5, currentAccuracy + 0.2));
+
+    return {
+        dominantMode, dominantCount, totalErrorNotes,
+        timingMean, dominantPosition, positionDominant,
+        focus, goal, recommendedSpeed,
+    };
+}
+
+function _ndRenderClusterRow(cluster, idx) {
+    const accuracy = cluster.total > 0
+        ? Math.max(0, Math.min(1, (cluster.total - cluster.misses) / cluster.total)) : 0;
+    const accColor = _ndScoreColor(accuracy);
+    const analysis = cluster.analysis;
+    const info = (typeof _ND_FAILURE_MODE_INFO === 'object' && _ND_FAILURE_MODE_INFO[analysis.dominantMode])
+        || { label: analysis.dominantMode, color: '#9ca3af', advice: null };
     const span = `${_ndFmtMmSs(cluster.startSec)}–${_ndFmtMmSs(cluster.endSec)}`;
     const dur = (cluster.endSec - cluster.startSec).toFixed(1);
+    const goalPct = Math.round(analysis.goal * 100);
+    const adviceBlock = info.advice ? `
+        <div class="text-[11px] text-gray-300 mt-1.5 leading-snug border-l-2 pl-2" style="border-color:${info.color}">
+            ${info.advice}
+        </div>` : '';
     return `
-        <div class="flex items-center gap-3 bg-dark-700 border border-gray-700 rounded-lg px-3 py-2">
-            <div class="font-mono text-xl font-bold w-20 text-center" style="color:${accColor}">${span}</div>
-            <div class="flex-1 min-w-0">
-                <div class="text-gray-200 text-sm font-medium">
-                    ${cluster.misses} miss${cluster.misses === 1 ? '' : 'es'} in ${dur}s
-                    <span class="text-gray-500">· ${cluster.total} note${cluster.total === 1 ? '' : 's'} total</span>
+        <div class="bg-dark-700 border border-gray-700 rounded-lg px-3 py-2">
+            <div class="flex items-center gap-3">
+                <div class="font-mono text-xl font-bold w-20 text-center" style="color:${accColor}">${span}</div>
+                <div class="flex-1 min-w-0">
+                    <div class="text-gray-200 text-sm font-medium">
+                        <span style="color:${info.color}">${analysis.focus}</span>
+                    </div>
+                    <div class="text-[11px] text-gray-500">
+                        ${cluster.misses} miss${cluster.misses === 1 ? '' : 'es'} in ${dur}s
+                        · ${cluster.total} note${cluster.total === 1 ? '' : 's'}
+                        · goal: <span class="text-gray-300 font-medium">${goalPct}%</span>
+                    </div>
                 </div>
-                <div class="text-[11px] text-gray-500">
-                    Mostly: <span style="color:${info.color}">${info.label}</span> ×${dominantCount}
-                </div>
+                <button data-drill-cluster="${idx}"
+                        class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-800 rounded text-xs text-blue-200 shrink-0">
+                    Drill this
+                </button>
             </div>
-            <button data-drill-cluster="${idx}"
-                    class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-800 rounded text-xs text-blue-200 shrink-0">
-                Drill this
-            </button>
+            ${adviceBlock}
         </div>
     `;
 }
@@ -6172,6 +6257,35 @@ async function _ndShowCoachingReview({ playId, source }) {
     // densest miss zones regardless of where chart sections fall.
     const clusters = _ndFindMissClusters(play.noteResults);
 
+    // Phase 2: pick the single most-actionable cluster as a top-of-modal
+    // "Top fix" callout. Coaching research is consistent: stat-dump-first
+    // layouts produce stat-dump-first thinking; recommendation-first
+    // layouts produce action. Score by miss-rate × cluster size so we
+    // prefer dense clusters over sparse ones, and big clusters over tiny
+    // ones, but neither alone.
+    let topFix = null;
+    if (clusters.length) {
+        let bestScore = -1, bestIdx = -1;
+        for (let i = 0; i < clusters.length; i++) {
+            const c = clusters[i];
+            const missRate = c.total > 0 ? c.misses / c.total : 0;
+            const score = missRate * c.misses;
+            if (score > bestScore) { bestScore = score; bestIdx = i; }
+        }
+        if (bestIdx >= 0) {
+            const cluster = clusters[bestIdx];
+            const info = (typeof _ND_FAILURE_MODE_INFO === 'object'
+                && _ND_FAILURE_MODE_INFO[cluster.analysis.dominantMode])
+                || { label: cluster.analysis.dominantMode, color: '#9ca3af', advice: null };
+            topFix = {
+                idx: bestIdx,
+                cluster,
+                info,
+                timeStr: _ndFmtMmSs(cluster.startSec),
+            };
+        }
+    }
+
     const modal = document.createElement('div');
     modal.id = 'nd-review-modal';
     modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
@@ -6196,6 +6310,25 @@ async function _ndShowCoachingReview({ playId, source }) {
                     <button id="nd-review-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
                 </div>
             </div>
+
+            ${topFix ? `
+            <button id="nd-review-topfix" data-jump-cluster="${topFix.idx}"
+                    class="w-full text-left px-5 py-3 bg-gradient-to-r from-blue-900/30 to-transparent border-b border-blue-800/40 hover:from-blue-900/50 transition">
+                <div class="flex items-start gap-3">
+                    <div class="text-2xl leading-none mt-0.5">🎯</div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${topFix.timeStr}</div>
+                        <div class="text-gray-100 text-sm font-medium mt-0.5">
+                            ${topFix.cluster.analysis.focus}
+                        </div>
+                        ${topFix.info.advice ? `
+                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">
+                            ${topFix.info.advice}
+                        </div>` : ''}
+                    </div>
+                    <div class="text-blue-400 text-xs shrink-0 mt-1">jump to ↓</div>
+                </div>
+            </button>` : ''}
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
                 ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(summary.pitchScore))}
@@ -6243,6 +6376,25 @@ async function _ndShowCoachingReview({ playId, source }) {
     modal.querySelector('#nd-review-close').onclick = close;
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     document.addEventListener('keydown', escHandler);
+
+    // Top-fix headline — clicking it scrolls to the matching cluster row
+    // and highlights it briefly so the user can see WHY the recommendation
+    // landed there before deciding to drill.
+    const topFixBtn = modal.querySelector('#nd-review-topfix');
+    if (topFixBtn) {
+        topFixBtn.addEventListener('click', () => {
+            const idx = parseInt(topFixBtn.getAttribute('data-jump-cluster'), 10);
+            const target = modal.querySelector(`[data-drill-cluster="${idx}"]`);
+            if (target) {
+                const row = target.closest('.bg-dark-700');
+                if (row) {
+                    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    row.classList.add('ring-2', 'ring-blue-500');
+                    setTimeout(() => row.classList.remove('ring-2', 'ring-blue-500'), 1500);
+                }
+            }
+        });
+    }
 
     // Cluster Drill buttons — start a tight loop on the cluster's range.
     modal.querySelectorAll('[data-drill-cluster]').forEach(btn => {
