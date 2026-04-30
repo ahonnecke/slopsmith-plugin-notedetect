@@ -475,6 +475,16 @@ let _ndCurrentSection = null;
 // summary payload, so they must exist whether drill mode has been used or not.
 let _ndDrillActive = false;
 let _ndDrillSectionName = null;
+// Drill-HUD state (Phase 4). Populated by _ndStartDrillRange and
+// updated on each loop_restart so the HUD can show iteration count,
+// per-iteration score, best-so-far, and progress toward the goal.
+let _ndDrillFocus = null;        // string shown in the drill HUD
+let _ndDrillGoal = null;         // 0..1 target for combined weighted score
+let _ndDrillIterScores = [];     // combined score (0..1) per loop iteration
+let _ndDrillBestScore = 0;
+let _ndDrillSavedSpeed = null;   // audio.playbackRate at drill start, restored on end
+let _ndDrillSpeedMul = 1.0;      // current drill speed multiplier (0.75 or 1.0)
+let _ndDrillGoalReached = false; // sticky once the user crosses the goal
 
 // Last play_id snapshotted for this song. Used by _ndOnSessionBoundary as
 // a fallback so the review modal still pops on Restart / loop-clear /
@@ -922,6 +932,10 @@ function _ndSnapshotPlay(reason) {
     // Per-iteration banner — quick in-page summary of just-finished pass so
     // the user gets immediate feedback without running `make loop-report`.
     if (reason === 'loop_restart') _ndShowIterationBanner(noteResults);
+    // Phase 4: capture this iteration's combined score for the drill HUD
+    // BEFORE clearing the results map. _ndDrillCaptureIterationScore
+    // reads via _ndComputeScores which depends on _ndNoteResults.
+    if (reason === 'loop_restart' && _ndDrillActive) _ndDrillCaptureIterationScore();
     _ndNoteResults.clear();
     _ndNotePitchAttempts.clear();
     _ndNoteHygiene.clear();
@@ -6201,10 +6215,28 @@ function _ndRenderClusterRow(cluster, idx) {
                         · goal: <span class="text-gray-300 font-medium">${goalPct}%</span>
                     </div>
                 </div>
-                <button data-drill-cluster="${idx}"
-                        class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-800 rounded text-xs text-blue-200 shrink-0">
-                    Drill this
-                </button>
+                <div class="flex flex-col gap-1 shrink-0">
+                    ${analysis.recommendedSpeed === 0.75 ? `
+                        <button data-drill-cluster="${idx}" data-drill-speed="0.75"
+                                class="px-3 py-1.5 bg-blue-900/70 hover:bg-blue-800 rounded text-xs text-blue-100 font-semibold whitespace-nowrap"
+                                title="Slow practice locks in motor patterns when timing is the problem">
+                            Drill @ 75%
+                        </button>
+                        <button data-drill-cluster="${idx}" data-drill-speed="1.0"
+                                class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300 whitespace-nowrap">
+                            Full speed
+                        </button>
+                    ` : `
+                        <button data-drill-cluster="${idx}" data-drill-speed="1.0"
+                                class="px-3 py-1.5 bg-blue-900/70 hover:bg-blue-800 rounded text-xs text-blue-100 font-semibold whitespace-nowrap">
+                            Drill this
+                        </button>
+                        <button data-drill-cluster="${idx}" data-drill-speed="0.75"
+                                class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300 whitespace-nowrap">
+                            @ 75%
+                        </button>
+                    `}
+                </div>
             </div>
             ${adviceBlock}
         </div>
@@ -6384,16 +6416,28 @@ async function _ndShowCoachingReview({ playId, source }) {
     }
 
     // Cluster Drill buttons — start a tight loop on the cluster's range.
+    // Each row has two buttons (full-speed + 75%); the recommended one is
+    // styled prominently. data-drill-speed carries the playbackRate.
     modal.querySelectorAll('[data-drill-cluster]').forEach(btn => {
         btn.onclick = () => {
             const idx = parseInt(btn.getAttribute('data-drill-cluster'), 10);
+            const speedAttr = btn.getAttribute('data-drill-speed');
+            const speedMul = speedAttr ? parseFloat(speedAttr) : 1.0;
             const cluster = clusters[idx];
             if (!cluster) {
                 console.warn('[note_detect] cluster idx not found:', idx);
                 return;
             }
             close();
-            _ndStartDrillRange(cluster.startSec, cluster.endSec, `cluster ${idx + 1}`);
+            _ndStartDrillRange(
+                cluster.startSec, cluster.endSec,
+                `cluster ${idx + 1}`,
+                {
+                    focus: cluster.analysis.focus,
+                    goal: cluster.analysis.goal,
+                    speedMul,
+                }
+            );
         };
     });
 
@@ -6551,12 +6595,9 @@ async function _ndOnSessionBoundary(source) {
     }
 
     // Any session boundary ends drill mode — the explicit ones (loop_clear,
-    // detect_off) and the implicit ones (song_end, restart). Reset both
-    // flags so the next play isn't mis-tagged is_drill in the DB.
-    if (_ndDrillActive) {
-        _ndDrillActive = false;
-        _ndDrillSectionName = null;
-    }
+    // detect_off) and the implicit ones (restart). _ndEndDrill restores
+    // audio.playbackRate, hides the drill HUD, and clears all drill state.
+    _ndEndDrill();
     return playId;
 }
 
@@ -6582,7 +6623,8 @@ async function _ndFetchMostRecentDrillPlayId() {
 // Drill a specific [start, end] range — used by cluster-based trouble spots.
 // Cleaner than _ndStartDrill (which had to look up sections by name and
 // compute a range from chart structure that can be too coarse).
-function _ndStartDrillRange(startSec, endSec, label) {
+function _ndStartDrillRange(startSec, endSec, label, opts = {}) {
+    const { focus = null, goal = null, speedMul = 1.0 } = opts;
     const audio = document.getElementById('audio');
     const songInfo = (highway.getSongInfo && highway.getSongInfo()) || {};
     const totalDuration = songInfo.duration
@@ -6591,9 +6633,6 @@ function _ndStartDrillRange(startSec, endSec, label) {
         console.warn('[note_detect] _ndStartDrillRange: no duration available — aborting');
         return;
     }
-    // Clamp the range to within the song so loopB doesn't sit past
-    // audio.duration (the audio.currentTime>=loopB trigger never fires
-    // if loopB is unreachable — that was the "loop = entire song" bug).
     const start = Math.max(0, startSec);
     const end = Math.min(totalDuration - 0.05, endSec);
     if (end - start < 0.5) {
@@ -6603,7 +6642,23 @@ function _ndStartDrillRange(startSec, endSec, label) {
 
     _ndDrillActive = true;
     _ndDrillSectionName = label || `${start.toFixed(1)}-${end.toFixed(1)}s`;
+    _ndDrillFocus = focus;
+    _ndDrillGoal = goal;
+    _ndDrillIterScores = [];
+    _ndDrillBestScore = 0;
+    _ndDrillGoalReached = false;
     _ndResetScoring();
+
+    // Speed scaffolding: drilling at 75% locks in motor patterns when the
+    // problem is timing. Save the host audio's playbackRate so we can
+    // restore it when the drill ends.
+    if (audio) {
+        _ndDrillSavedSpeed = audio.playbackRate;
+        if (speedMul && speedMul !== _ndDrillSavedSpeed) {
+            audio.playbackRate = speedMul;
+        }
+        _ndDrillSpeedMul = speedMul;
+    }
 
     if (typeof window.setActiveLoop === 'function') {
         window.setActiveLoop(start, end);
@@ -6611,7 +6666,110 @@ function _ndStartDrillRange(startSec, endSec, label) {
         console.warn('[note_detect] _ndStartDrillRange: window.setActiveLoop missing');
     }
     if (!_ndEnabled) _ndToggle();
-    console.log(`[note_detect] Drill range "${label}" ${start.toFixed(1)}–${end.toFixed(1)}s (${(end - start).toFixed(1)}s long)`);
+
+    _ndShowDrillHud();
+    console.log(`[note_detect] Drill range "${label}" ${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (${(end - start).toFixed(1)}s long)`);
+}
+
+// ── Drill HUD (Phase 4) ────────────────────────────────────────────────
+// Floating overlay showing the drill's focus, goal, current iteration's
+// score, and best-so-far. Updates on each loop_restart so the user can
+// watch the number rise across iterations. Removed when drill ends.
+function _ndShowDrillHud() {
+    let hud = document.getElementById('nd-drill-hud');
+    if (!hud) {
+        hud = document.createElement('div');
+        hud.id = 'nd-drill-hud';
+        hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
+        document.body.appendChild(hud);
+    }
+    _ndUpdateDrillHud();
+}
+
+function _ndUpdateDrillHud() {
+    const hud = document.getElementById('nd-drill-hud');
+    if (!hud) return;
+    const goalPct = Math.round((_ndDrillGoal || 0) * 100);
+    const lastScore = _ndDrillIterScores.length
+        ? _ndDrillIterScores[_ndDrillIterScores.length - 1] : null;
+    const lastPct = lastScore != null ? Math.round(lastScore * 100) : null;
+    const bestPct = Math.round(_ndDrillBestScore * 100);
+    const iter = _ndDrillIterScores.length;
+    const focusLine = _ndDrillFocus
+        ? `<div class="text-blue-200 text-xs mt-0.5">${_ndDrillFocus}</div>` : '';
+    const speedTag = _ndDrillSpeedMul !== 1.0
+        ? `<span class="text-yellow-300 text-[11px] ml-2">@ ${Math.round(_ndDrillSpeedMul * 100)}%</span>` : '';
+    const goalLine = _ndDrillGoalReached
+        ? `<div class="text-green-300 font-bold text-xs mt-1">🎯 Goal hit! ${bestPct}% (target ${goalPct}%)</div>`
+        : (lastPct != null
+            ? `<div class="text-gray-300 text-xs mt-1">
+                 Iter ${iter}: <span class="font-bold" style="color:${_ndScoreColor(lastScore)}">${lastPct}%</span>
+                 · best ${bestPct}% · goal <span class="text-blue-300">${goalPct}%</span>
+               </div>`
+            : `<div class="text-gray-500 text-xs mt-1">Play through the loop — score updates each iteration</div>`);
+    hud.innerHTML = `
+        <div class="flex items-center justify-between gap-3">
+            <div>
+                <div class="text-blue-300 text-[10px] uppercase tracking-wide font-semibold">
+                    🎯 Drilling${speedTag}
+                </div>
+                ${focusLine}
+                ${goalLine}
+            </div>
+            <button id="nd-drill-end" class="text-gray-500 hover:text-gray-200 text-xl leading-none px-2"
+                    title="End drill">×</button>
+        </div>
+    `;
+    const endBtn = hud.querySelector('#nd-drill-end');
+    if (endBtn) endBtn.onclick = () => {
+        // End drill = clear loop. Slopsmith's clear handler nulls
+        // loopA/loopB, our btn-loop-clear listener fires the boundary.
+        const clearBtn = document.getElementById('btn-loop-clear');
+        if (clearBtn) clearBtn.click();
+    };
+}
+
+function _ndHideDrillHud() {
+    const hud = document.getElementById('nd-drill-hud');
+    if (hud) hud.remove();
+}
+
+// Centralized drill teardown: hide HUD, restore audio playback rate,
+// clear all drill state. Called from every drill-end path so cleanup is
+// uniform regardless of whether the user clicked Loop Clear, Detect off,
+// Restart Song, or navigated to a different song.
+function _ndEndDrill() {
+    if (!_ndDrillActive && !document.getElementById('nd-drill-hud')) return;
+    _ndHideDrillHud();
+    const audio = document.getElementById('audio');
+    if (audio && _ndDrillSavedSpeed != null
+            && Number.isFinite(_ndDrillSavedSpeed)
+            && audio.playbackRate !== _ndDrillSavedSpeed) {
+        audio.playbackRate = _ndDrillSavedSpeed;
+    }
+    _ndDrillActive = false;
+    _ndDrillSectionName = null;
+    _ndDrillFocus = null;
+    _ndDrillGoal = null;
+    _ndDrillIterScores = [];
+    _ndDrillBestScore = 0;
+    _ndDrillSavedSpeed = null;
+    _ndDrillSpeedMul = 1.0;
+    _ndDrillGoalReached = false;
+}
+
+// Called from _ndSnapshotPlay when reason==='loop_restart' during drill.
+// Captures the just-finished iteration's combined score for HUD display.
+function _ndDrillCaptureIterationScore() {
+    if (!_ndDrillActive) return;
+    const scores = _ndComputeScores();
+    const score = scores.combined || 0;
+    _ndDrillIterScores.push(score);
+    if (score > _ndDrillBestScore) _ndDrillBestScore = score;
+    if (_ndDrillGoal && score >= _ndDrillGoal && !_ndDrillGoalReached) {
+        _ndDrillGoalReached = true;
+    }
+    _ndUpdateDrillHud();
 }
 
 function _ndStartDrill(sectionName) {
@@ -13314,11 +13472,10 @@ setInterval(() => {
         _ndTroubleNotes = new Map();
         _ndPlaysCacheSongId = null;
         _ndLastSnapshotPlayId = null;
-        // Drill state is per-song. Switching songs resets it so a leftover
-        // _ndDrillActive=true from the previous song doesn't suppress
-        // session-boundary events here.
-        _ndDrillActive = false;
-        _ndDrillSectionName = null;
+        // Drill state is per-song. _ndEndDrill restores audio.playbackRate
+        // (drill might have been at 0.75) and hides the HUD before the new
+        // song loads.
+        _ndEndDrill();
         await origPlaySong(filename, arrangement);
         _ndInjectButton();
         _ndAttachAutoDetectListener();
