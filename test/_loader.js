@@ -140,6 +140,15 @@ function loadDetectionCore() {
         likelyDetectorFailures: sandbox._ndLikelyDetectorFailures,
         filterDetectorFailures: sandbox._ndFilterDetectorFailures,
         detectTuningMismatch: sandbox._ndDetectTuningMismatch,
+        // Coaching review pure functions — exposed so the test harness
+        // can drive them with synthetic / real noteResults fixtures and
+        // assert the output without a browser or live performance.
+        scoresFromNotes: sandbox._ndScoresFromNotes,
+        findMissClusters: sandbox._ndFindMissClusters,
+        analyzeCluster: sandbox._ndAnalyzeCluster,
+        aggregateBySection: sandbox._ndAggregateBySection,
+        exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
+        classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into
         // wizard module state (_ndWizBeats, _ndWizDetections, etc).
         _sandbox: sandbox,

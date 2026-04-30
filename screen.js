@@ -6065,8 +6065,16 @@ function _ndAggregateBySection(noteResults, sections) {
         } else {
             row.misses++;
         }
-        const mode = _ndClassifyFailureMode(r);
-        row.failureModeCounts.set(mode, (row.failureModeCounts.get(mode) || 0) + 1);
+        // _ndClassifyFailureMode returns { mode, severity }; extract .mode
+        // for the Map key so counts tally per-mode-string rather than
+        // per-unique-object (each call returns a fresh object, so using
+        // the object as a key buckets every note separately and counts
+        // are stuck at 1).
+        const classified = _ndClassifyFailureMode(r);
+        const mode = classified && classified.mode;
+        if (mode) {
+            row.failureModeCounts.set(mode, (row.failureModeCounts.get(mode) || 0) + 1);
+        }
     }
     return byName;
 }
@@ -6126,15 +6134,19 @@ function _ndFmtMmSs(t) {
 // an explicit numeric goal. Stored ON the cluster so Phase 4's drill
 // HUD can reuse the same focus/goal strings the cluster row displayed.
 function _ndAnalyzeCluster(cluster) {
-    // Dominant failure mode (excluding CLEAN).
+    // Dominant failure mode (excluding CLEAN). _ndClassifyFailureMode
+    // returns { mode, severity } — extract .mode for the string key
+    // because Map.set with an object uses reference identity, which
+    // would make every note its own bucket and dominantCount stuck at 1.
     const modeCounts = new Map();
     let totalErrorNotes = 0;
     const timingErrors = [];
     const pitchErrors = [];
     const stringFretCounts = new Map();
     for (const r of cluster.notes) {
-        const mode = _ndClassifyFailureMode(r);
-        if (mode === 'CLEAN') continue;
+        const classified = _ndClassifyFailureMode(r);
+        const mode = classified && classified.mode;
+        if (!mode || mode === 'CLEAN') continue;
         modeCounts.set(mode, (modeCounts.get(mode) || 0) + 1);
         totalErrorNotes++;
         if (typeof r.timingError === 'number') timingErrors.push(r.timingError);
@@ -6264,58 +6276,21 @@ function _ndRenderClusterRow(cluster, idx) {
     `;
 }
 
-async function _ndShowCoachingReview({ playId, source }) {
-    document.getElementById('nd-review-modal')?.remove();
-    let play;
-    try {
-        const r = await fetch(`/api/plugins/note_detect/play/${playId}`);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        play = await r.json();
-    } catch (e) {
-        console.warn('[note_detect] review fetch failed:', e);
-        return;
-    }
-    const sections = (highway.getSections && highway.getSections()) || [];
-    const songInfo = highway.getSongInfo && highway.getSongInfo();
-    const totalDuration = (songInfo && songInfo.duration) || 0;
+// Single entry point for everything the coaching review modal computes.
+// Pure function: takes a play (with .noteResults), optional sections +
+// totalDuration for the heatmap, returns a JSON-serializable bundle of
+// every derived value the modal renders. The modal calls this once at
+// open time, then renders from the result. Tests call this against
+// synthetic and real-play fixtures, asserting the output shape and
+// values to catch regressions in clusters/scoring/heatmap/topFix.
+function _ndExportCoachingAnalysis(play, opts = {}) {
+    const { sections = [], totalDuration = 0 } = opts;
+    const noteResults = (play && play.noteResults) || [];
 
-    // SINGLE SOURCE OF TRUTH for everything displayed in this modal.
-    // play.summary is the snapshot computed at write-time and persisted
-    // to the DB — fine for fast list views, but if scoring weights or
-    // coverage logic ever shift between snapshot and view, the summary
-    // and the recomputed clusters/heatmap would disagree. Derive every
-    // number here from play.noteResults via the same _ndScoresFromNotes
-    // function the live HUD and the snapshot writer use, so the headline
-    // score, the three sub-score tiles, the section heatmap, the
-    // clusters, and the axis-fallback advice all share one calculation.
-    const derived = _ndScoresFromNotes(play.noteResults || []);
-    const perSection = _ndAggregateBySection(play.noteResults || [], sections);
+    const derived = _ndScoresFromNotes(noteResults);
+    const perSection = _ndAggregateBySection(noteResults, sections);
+    const clusters = _ndFindMissClusters(noteResults);
 
-    const pitchPctText = derived.pitchPct != null
-        ? `${Math.round(derived.pitchPct * 100)}%` : '—';
-    const coverageText = derived.coverage != null
-        ? `${Math.round(derived.coverage * 100)}%` : '—';
-    const timingText = derived.timingMedianMs != null
-        ? `${Math.round(derived.timingMedianMs)} ±${Math.round(derived.timingStdMs || 0)}ms`
-        : '—';
-    const combinedColor = _ndScoreColor(derived.combined);
-
-    // Trouble spots are miss-density clusters — NOT chart sections.
-    // Reason: many CDLCs have very few sections (e.g., Gasoline has 2 for
-    // a 3:46 song), so section-level drilling effectively loops the whole
-    // song. Cluster-level drilling gives tight 5–10s windows around the
-    // densest miss zones regardless of where chart sections fall.
-    const clusters = _ndFindMissClusters(play.noteResults);
-
-    // Phase 2 — pick the single most-actionable headline:
-    //   1. If there are clusters, prefer the densest (cluster-level fix)
-    //   2. Else fall back to the worst sub-score AXIS (global fix)
-    // Coaching research is consistent: stat-dump-first layouts produce
-    // stat-dump-first thinking; recommendation-first layouts produce
-    // action. A clean play with timing skew (user's "79% with no
-    // clusters" case) shouldn't show "no trouble clusters" alone — it
-    // should say "your timing was consistently off by Xms; here's what
-    // to do." That's the axis-level fallback.
     let topFix = null;
     if (clusters.length) {
         let bestScore = -1, bestIdx = -1;
@@ -6333,35 +6308,31 @@ async function _ndShowCoachingReview({ playId, source }) {
             topFix = {
                 kind: 'cluster',
                 idx: bestIdx,
-                cluster,
-                info,
-                timeStr: _ndFmtMmSs(cluster.startSec),
+                clusterStartSec: cluster.startSec,
+                clusterEndSec: cluster.endSec,
+                focus: cluster.analysis.focus,
+                advice: info.advice,
+                color: info.color,
+                modeLabel: info.label,
             };
         }
     } else {
-        // No clusters — the playing was uniform. Pick the weakest
-        // sub-score axis and surface coaching advice on it. Pitch and
-        // coverage thresholds at 95% (those are usually high), timing
-        // threshold at 30ms median (that's a noticeable rhythmic drift).
-        // Reads from `derived` (recomputed live) NOT from the persisted
-        // summary, so the axis fallback always agrees with the sub-score
-        // tiles and the heatmap.
+        // Axis-level fallback (no clusters = uniform play). Pick the
+        // weakest sub-score and surface global coaching.
         const pitch = derived.pitchPct;
         const cov = derived.coverage;
         const timing = derived.timingMedianMs;
         const candidates = [];
         if (pitch != null && pitch < 0.95) {
             candidates.push({
-                axis: 'Pitch',
-                severity: 1 - pitch,
+                axis: 'Pitch', severity: 1 - pitch,
                 focus: `Pitch was off on ${Math.round((1 - pitch) * 100)}% of detected notes`,
                 advice: 'Practice the fingering pattern silently first. Common causes: catching adjacent open strings, octave confusion on bass, or fret-buzz on heavily distorted signals.',
             });
         }
         if (cov != null && cov < 0.95) {
             candidates.push({
-                axis: 'Coverage',
-                severity: 1 - cov,
+                axis: 'Coverage', severity: 1 - cov,
                 focus: `${Math.round((1 - cov) * 100)}% of notes produced no detection`,
                 advice: 'Pluck harder, or check your input gain. If the chart is dense (chords, fast runs), the detector may need more attack energy to fire onsets between sustains.',
             });
@@ -6384,11 +6355,66 @@ async function _ndShowCoachingReview({ playId, source }) {
                 kind: 'axis',
                 axis: c.axis,
                 focus: c.focus,
-                info: { color: '#60a5fa', advice: c.advice },
-                timeStr: c.axis,
+                advice: c.advice,
+                color: '#60a5fa',
             };
         }
     }
+
+    // Serialize perSection (Map) as a plain object for tests.
+    const perSectionObj = {};
+    for (const [name, row] of perSection) {
+        perSectionObj[name] = {
+            hits: row.hits,
+            misses: row.misses,
+            total: row.total,
+            weighted: row.weighted,
+            max: row.max,
+            accuracy: row.total > 0 ? Math.max(0, Math.min(1, row.weighted / row.max)) : null,
+        };
+    }
+
+    return {
+        derived,
+        clusters,
+        perSection: perSectionObj,
+        topFix,
+        sections,        // pass-through for renderers that need section order
+        totalDuration,
+    };
+}
+
+async function _ndShowCoachingReview({ playId, source }) {
+    document.getElementById('nd-review-modal')?.remove();
+    let play;
+    try {
+        const r = await fetch(`/api/plugins/note_detect/play/${playId}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        play = await r.json();
+    } catch (e) {
+        console.warn('[note_detect] review fetch failed:', e);
+        return;
+    }
+    const sections = (highway.getSections && highway.getSections()) || [];
+    const songInfo = highway.getSongInfo && highway.getSongInfo();
+    const totalDuration = (songInfo && songInfo.duration) || 0;
+
+    // SINGLE SOURCE OF TRUTH for everything displayed in this modal.
+    // _ndExportCoachingAnalysis is the pure function the test harness
+    // also calls — modal and tests share one entry point so a coaching
+    // change can never produce different results in production vs tests.
+    const analysis = _ndExportCoachingAnalysis(play, { sections, totalDuration });
+    const { derived, clusters, topFix } = analysis;
+    const perSection = _ndAggregateBySection(play.noteResults || [], sections);
+
+    const pitchPctText = derived.pitchPct != null
+        ? `${Math.round(derived.pitchPct * 100)}%` : '—';
+    const coverageText = derived.coverage != null
+        ? `${Math.round(derived.coverage * 100)}%` : '—';
+    const timingText = derived.timingMedianMs != null
+        ? `${Math.round(derived.timingMedianMs)} ±${Math.round(derived.timingStdMs || 0)}ms`
+        : '—';
+    const combinedColor = _ndScoreColor(derived.combined);
 
     const modal = document.createElement('div');
     modal.id = 'nd-review-modal';
@@ -6421,14 +6447,10 @@ async function _ndShowCoachingReview({ playId, source }) {
                 <div class="flex items-start gap-3">
                     <div class="text-2xl leading-none mt-0.5">🎯</div>
                     <div class="flex-1 min-w-0">
-                        <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${topFix.timeStr}</div>
-                        <div class="text-gray-100 text-sm font-medium mt-0.5">
-                            ${topFix.cluster.analysis.focus}
-                        </div>
-                        ${topFix.info.advice ? `
-                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">
-                            ${topFix.info.advice}
-                        </div>` : ''}
+                        <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${_ndFmtMmSs(topFix.clusterStartSec)}</div>
+                        <div class="text-gray-100 text-sm font-medium mt-0.5">${topFix.focus}</div>
+                        ${topFix.advice ? `
+                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">${topFix.advice}</div>` : ''}
                     </div>
                     <div class="text-blue-400 text-xs shrink-0 mt-1">jump to ↓</div>
                 </div>
@@ -6438,13 +6460,9 @@ async function _ndShowCoachingReview({ playId, source }) {
                     <div class="text-2xl leading-none mt-0.5">🎯</div>
                     <div class="flex-1 min-w-0">
                         <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${topFix.axis}</div>
-                        <div class="text-gray-100 text-sm font-medium mt-0.5">
-                            ${topFix.focus}
-                        </div>
-                        ${topFix.info.advice ? `
-                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">
-                            ${topFix.info.advice}
-                        </div>` : ''}
+                        <div class="text-gray-100 text-sm font-medium mt-0.5">${topFix.focus}</div>
+                        ${topFix.advice ? `
+                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">${topFix.advice}</div>` : ''}
                     </div>
                 </div>
             </div>`) : ''}
