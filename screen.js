@@ -2175,11 +2175,21 @@ const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
 // passed + ratio gate didn't fire), so RMS handles silence→playing in its
 // strong regime and HFC plugs the sustain-bleed hole.
 //
-// Validated via test/spectral-flux-sim.js across 5 fixtures (K=6,
-// refractory=0.250s): Gasoline +19 HIT, Mexico +5, Take +6, Level
-// fixtures within ±2 noise. RMS-only baseline → +27 net HIT across the
-// roster.
-const _ND_HFC_K = 6;                  // adaptive threshold = K × rolling median
+// Validated via test/spectral-flux-sim.js on Gasoline (the fixture where
+// the sim's matcher matches live to within 2.4pp; cross-fixture sim is
+// unreliable due to drift compensation and tier-2 selection differences
+// between sim and live's _ndMatchNotes).
+//
+// K sweep on Gasoline (RMS baseline 267 HIT / 89.3%):
+//   K=6  → 271 HIT (+4), 22 WRONG_PITCH (-3), 381 fires (+136)
+//   K=10 → 272 HIT (+5), 21 WRONG_PITCH (-4), 338 fires (+93)   ← sweet spot
+//   K=12 → 271 HIT (+4), 22 WRONG_PITCH (-3), 324 fires (+79)
+//   K=20 → 267 HIT (0),  25 WRONG_PITCH (0),  291 fires (+46)
+//
+// K=10 picked: same recovery as lower K with 31% fewer extra fires.
+// Below K=8 false-fire rate balloons without recovering more chart
+// notes. Above K=12 we lose the recovery entirely.
+const _ND_HFC_K = 10;                 // adaptive threshold = K × rolling median
 const _ND_HFC_REFRACTORY_SEC = 0.250; // stricter than baseline 200ms
 const _ND_HFC_MEDIAN_WINDOW = 23;     // ~23 chunks × 43ms ≈ 1s rolling history
 const _ND_HFC_MIN_FLUX = 0.01;        // absolute floor; suppresses fires on silence
@@ -6035,6 +6045,41 @@ function _ndFindMissClusters(noteResults, opts = {}) {
     return selected;
 }
 
+// Time-binned heatmap. Independent of chart section structure (CDLCs
+// with sparse sections — Gasoline has 2 for a 3:46 song — made the
+// section-based heatmap useless). Bins of fixed time width give
+// consistent granularity regardless of how the chart was annotated.
+//
+// Each bin gets the combined weighted score over notes whose chartT
+// falls in [startSec, endSec). Same _ndScoresFromNotes function used
+// for headline + clusters + per-section, so heatmap colors agree with
+// everything else by construction. Empty bins (no notes) carry a null
+// score and render as neutral background.
+function _ndComputeTimeHeatmap(noteResults, totalDuration, binSec = 5) {
+    if (totalDuration <= 0 || binSec <= 0) return [];
+    const notes = (noteResults || []).filter(r => r && r.primary !== 'IGNORED_DETECTOR_FAILURE');
+    const numBins = Math.ceil(totalDuration / binSec);
+    const bins = [];
+    for (let i = 0; i < numBins; i++) {
+        const startSec = i * binSec;
+        const endSec = Math.min(startSec + binSec, totalDuration);
+        const inBin = notes.filter(r => r.chartT >= startSec && r.chartT < endSec);
+        if (inBin.length === 0) {
+            bins.push({ startSec, endSec, totalNotes: 0, score: null, hits: 0, misses: 0 });
+            continue;
+        }
+        const scores = _ndScoresFromNotes(inBin);
+        bins.push({
+            startSec, endSec,
+            totalNotes: inBin.length,
+            score: scores.combined,
+            hits: scores.hits,
+            misses: scores.misses,
+        });
+    }
+    return bins;
+}
+
 function _ndAggregateBySection(noteResults, sections) {
     // Returns Map<sectionName, {hits, misses, total, weighted, max,
     //                            failureModeCounts: Map<mode,n>,
@@ -6095,6 +6140,40 @@ function _ndRenderSubScoreTile(label, valueText, color) {
             <div class="text-2xl font-bold mt-1" style="color:${color}">${valueText}</div>
         </div>
     `;
+}
+
+// Time-binned heatmap renderer. Replaces the section-based heatmap
+// because chart sections are too coarse on most CDLCs. Renders one
+// rectangle per bin colored by the bin's weighted score; chart section
+// boundaries appear as thin vertical guides with section names floated
+// above so the user still gets song-arc context. Empty bins (gaps
+// between songs of notes) render in dark gray.
+function _ndRenderTimeHeatmapSvg(timeHeatmap, totalDuration, sections) {
+    const width = 800, barH = 32;
+    if (!timeHeatmap || timeHeatmap.length === 0 || totalDuration <= 0) {
+        return `<svg width="100%" height="${barH}" viewBox="0 0 ${width} ${barH}"></svg>`;
+    }
+    let cells = '';
+    for (const bin of timeHeatmap) {
+        const x = (bin.startSec / totalDuration) * width;
+        const w = Math.max(1, ((bin.endSec - bin.startSec) / totalDuration) * width);
+        const color = bin.score == null ? '#1f2937' : _ndScoreColor(bin.score);
+        const title = bin.score == null
+            ? `${_ndFmtMmSs(bin.startSec)}–${_ndFmtMmSs(bin.endSec)}: no notes`
+            : `${_ndFmtMmSs(bin.startSec)}–${_ndFmtMmSs(bin.endSec)}: ${Math.round(bin.score * 100)}% (${bin.hits}/${bin.totalNotes})`;
+        cells += `<rect x="${x.toFixed(1)}" y="14" width="${w.toFixed(1)}" height="${barH}" fill="${color}" stroke="#0a0a0a" stroke-width="0.3"><title>${title}</title></rect>`;
+    }
+    let secLayer = '';
+    if (sections && sections.length) {
+        for (const sec of sections) {
+            const t = typeof sec.time === 'number' ? sec.time : 0;
+            if (t > totalDuration) continue;
+            const x = (t / totalDuration) * width;
+            secLayer += `<line x1="${x.toFixed(1)}" y1="14" x2="${x.toFixed(1)}" y2="${14 + barH}" stroke="#9ca3af" stroke-width="0.6" opacity="0.6"/>`;
+            secLayer += `<text x="${(x + 2).toFixed(1)}" y="11" fill="#9ca3af" font-size="9" opacity="0.85">${sec.name}</text>`;
+        }
+    }
+    return `<svg width="100%" viewBox="0 0 ${width} ${14 + barH}" preserveAspectRatio="none">${secLayer}${cells}</svg>`;
 }
 
 function _ndRenderSectionHeatmapSvg(perSection, sections, totalDuration) {
@@ -6284,12 +6363,13 @@ function _ndRenderClusterRow(cluster, idx) {
 // synthetic and real-play fixtures, asserting the output shape and
 // values to catch regressions in clusters/scoring/heatmap/topFix.
 function _ndExportCoachingAnalysis(play, opts = {}) {
-    const { sections = [], totalDuration = 0 } = opts;
+    const { sections = [], totalDuration = 0, heatmapBinSec = 5 } = opts;
     const noteResults = (play && play.noteResults) || [];
 
     const derived = _ndScoresFromNotes(noteResults);
     const perSection = _ndAggregateBySection(noteResults, sections);
     const clusters = _ndFindMissClusters(noteResults);
+    const timeHeatmap = _ndComputeTimeHeatmap(noteResults, totalDuration, heatmapBinSec);
 
     let topFix = null;
     if (clusters.length) {
@@ -6378,6 +6458,7 @@ function _ndExportCoachingAnalysis(play, opts = {}) {
         derived,
         clusters,
         perSection: perSectionObj,
+        timeHeatmap,
         topFix,
         sections,        // pass-through for renderers that need section order
         totalDuration,
@@ -6404,7 +6485,7 @@ async function _ndShowCoachingReview({ playId, source }) {
     // also calls — modal and tests share one entry point so a coaching
     // change can never produce different results in production vs tests.
     const analysis = _ndExportCoachingAnalysis(play, { sections, totalDuration });
-    const { derived, clusters, topFix } = analysis;
+    const { derived, clusters, topFix, timeHeatmap } = analysis;
     const perSection = _ndAggregateBySection(play.noteResults || [], sections);
 
     const pitchPctText = derived.pitchPct != null
@@ -6475,11 +6556,14 @@ async function _ndShowCoachingReview({ playId, source }) {
                 ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage))}
             </div>
 
-            ${sections.length ? `
+            ${timeHeatmap.length ? `
             <div class="px-5 py-4 border-b border-gray-700">
-                <div class="text-gray-400 text-xs mb-2">Section heatmap</div>
+                <div class="text-gray-400 text-xs mb-2 flex justify-between">
+                    <span>Heatmap — ${Math.round(timeHeatmap[0].endSec - timeHeatmap[0].startSec)}s bins</span>
+                    <span class="text-gray-600">hover for breakdown</span>
+                </div>
                 <div class="rounded overflow-hidden border border-gray-700">
-                    ${_ndRenderSectionHeatmapSvg(perSection, sections, totalDuration)}
+                    ${_ndRenderTimeHeatmapSvg(timeHeatmap, totalDuration, sections)}
                 </div>
             </div>` : ''}
 

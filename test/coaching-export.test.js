@@ -19,7 +19,7 @@ const assert = require('node:assert/strict');
 const { loadDetectionCore } = require('./_loader');
 
 const core = loadDetectionCore();
-const { exportCoachingAnalysis, scoresFromNotes, findMissClusters } = core;
+const { exportCoachingAnalysis, scoresFromNotes, findMissClusters, computeTimeHeatmap } = core;
 
 // ── Synthetic-note builders ───────────────────────────────────────────
 // Match the shape _ndShowCoachingReview / scoresFromNotes consume.
@@ -187,6 +187,65 @@ test('cluster row accuracy uses same metric as headline', () => {
             `cluster at ${c.startSec.toFixed(1)}s: weighted score is reproducible`,
         );
     }
+});
+
+test('time heatmap: bins span the full duration regardless of note distribution', () => {
+    const notes = [hit(1), hit(2), hit(3)];  // notes only in first few seconds
+    const bins = computeTimeHeatmap(notes, 60, 5);
+    assert.equal(bins.length, 12, '60s / 5s = 12 bins');
+    assert.equal(bins[0].startSec, 0);
+    assert.equal(bins[bins.length - 1].endSec, 60);
+    assert.equal(bins[0].totalNotes, 3, 'first bin holds all 3 notes');
+    assert.equal(bins[1].totalNotes, 0, 'middle bin is empty');
+    assert.equal(bins[1].score, null, 'empty bin score is null (renders neutral)');
+});
+
+test('time heatmap: per-bin score uses the same weighted calc as headline', () => {
+    // Bin 1 (0–5s): all clean → 100%
+    // Bin 2 (5–10s): all LATE → 85%
+    // Bin 3 (10–15s): mix of clean + miss → some intermediate
+    const notes = [
+        ...Array.from({ length: 4 }, (_, i) => hit(i + 0.5)),
+        ...Array.from({ length: 4 }, (_, i) => lateHit(5 + i, 50)),
+        hit(11), hit(12), miss(13, 'MISSED_NO_DETECTION'), miss(14, 'MISSED_NO_DETECTION'),
+    ];
+    const bins = computeTimeHeatmap(notes, 15, 5);
+    assert.equal(Math.round(bins[0].score * 100), 100,
+        'all-clean bin = 100%');
+    assert.equal(Math.round(bins[1].score * 100), 85,
+        'all-LATE bin = 85% (HIT_TIMING_OFF weight)');
+    // Bin 3: 2 hits (200) + 2 no-detect (-300) = -100, clamped to 0
+    assert.equal(bins[2].score, 0,
+        'half-miss bin clamps to 0% (combined formula floor)');
+});
+
+test('time heatmap: bin scores match scoresFromNotes over the same notes', () => {
+    // Single source of truth invariant — heatmap bins recomputed via
+    // scoresFromNotes(bin.notes) must equal what computeTimeHeatmap
+    // already stored on each bin.
+    const notes = [];
+    for (let i = 0; i < 30; i++) {
+        notes.push(i % 4 === 0 ? lateHit(i, 60) : hit(i));
+    }
+    const bins = computeTimeHeatmap(notes, 30, 5);
+    for (const bin of bins) {
+        if (bin.totalNotes === 0) continue;
+        const inBin = notes.filter(r => r.chartT >= bin.startSec && r.chartT < bin.endSec);
+        const direct = scoresFromNotes(inBin);
+        assert.equal(
+            Math.round(bin.score * 1000),
+            Math.round(direct.combined * 1000),
+            `bin ${bin.startSec}–${bin.endSec}: stored score must equal recomputed`,
+        );
+    }
+});
+
+test('exportCoachingAnalysis includes timeHeatmap', () => {
+    const notes = Array.from({ length: 30 }, (_, i) => hit(i * 2));
+    const a = exportCoachingAnalysis({ noteResults: notes },
+        { sections, totalDuration: 60, heatmapBinSec: 10 });
+    assert.ok(Array.isArray(a.timeHeatmap), 'timeHeatmap is in the output bundle');
+    assert.equal(a.timeHeatmap.length, 6, '60s / 10s = 6 bins');
 });
 
 test('per-section accuracy reflects weighted score, not raw hit ratio', () => {

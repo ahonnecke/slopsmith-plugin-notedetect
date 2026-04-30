@@ -147,6 +147,7 @@ function loadDetectionCore() {
         findMissClusters: sandbox._ndFindMissClusters,
         analyzeCluster: sandbox._ndAnalyzeCluster,
         aggregateBySection: sandbox._ndAggregateBySection,
+        computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
         classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into
