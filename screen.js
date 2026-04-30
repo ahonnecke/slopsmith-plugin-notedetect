@@ -4059,31 +4059,44 @@ async function _ndStartAudio() {
             if (existing == null || existing === noteStateFor) h.setNoteStateProvider(noteStateFor);
         }
         _ndStream = await navigator.mediaDevices.getUserMedia(constraints);
-        // Use native sample rate — browsers often ignore non-standard rates,
-        // and we need reliable timing for pitch detection
-        _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        _ndResetBpFilter(_ndAudioCtx.sampleRate);
-
-        // ── Silent-stop recovery ──────────────────────────────────────────
-        // Three known causes of "Detect stays green-checked but no input
-        // pickup": AudioContext auto-suspends (Chrome hides idle/backgrounded
-        // tabs), MediaStreamTrack ends (USB unplug, BT drop, device steal),
-        // or the ScriptProcessor stops firing without throwing. The first
-        // two emit events; the third needs a watchdog. Without recovery
-        // hooks, frames just stop flowing and the user has no signal that
-        // anything went wrong — the (d) "works for a while then silently
-        // stops" failure mode reported during play sessions.
-        _ndAudioCtx.addEventListener('statechange', async () => {
-            console.log(`[note_detect] AudioContext state → ${_ndAudioCtx?.state}`);
-            if (_ndAudioCtx && _ndAudioCtx.state === 'suspended' && _ndEnabled) {
-                try {
-                    await _ndAudioCtx.resume();
-                    console.log('[note_detect] AudioContext auto-resumed');
-                } catch (e) {
-                    console.warn('[note_detect] AudioContext resume failed:', e);
+        // Reuse the AudioContext across Detect cycles to keep its
+        // sink-input on the speaker output continuously registered.
+        // Every `new AudioContext()` is a fresh sink-input on PipeWire,
+        // which is a renegotiation point for any other consumer of that
+        // sink (specifically: the user's pactl module-loopback piping
+        // USB-guitar → speakers). Reusing eliminates the per-toggle and
+        // per-song-change renegotiation entirely. The graph nodes
+        // (source, gain, splitter, processor) still get rebuilt each
+        // cycle because MediaStreamSource has to bind to a fresh stream.
+        if (!_ndAudioCtx || _ndAudioCtx.state === 'closed') {
+            _ndAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            // ── Silent-stop recovery ──────────────────────────────────
+            // Three known causes of "Detect stays green-checked but no
+            // input pickup": AudioContext auto-suspends (Chrome hides
+            // idle/backgrounded tabs), MediaStreamTrack ends (USB
+            // unplug, BT drop, device steal), or the ScriptProcessor
+            // stops firing without throwing. The first two emit events;
+            // the third needs a watchdog. Without recovery hooks, frames
+            // just stop flowing and the user has no signal that anything
+            // went wrong.
+            _ndAudioCtx.addEventListener('statechange', async () => {
+                console.log(`[note_detect] AudioContext state → ${_ndAudioCtx?.state}`);
+                if (_ndAudioCtx && _ndAudioCtx.state === 'suspended' && _ndEnabled) {
+                    try {
+                        await _ndAudioCtx.resume();
+                        console.log('[note_detect] AudioContext auto-resumed');
+                    } catch (e) {
+                        console.warn('[note_detect] AudioContext resume failed:', e);
+                    }
                 }
+            });
+        } else if (_ndAudioCtx.state === 'suspended') {
+            // Reusing a previously-suspended context — wake it back up.
+            try { await _ndAudioCtx.resume(); } catch (e) {
+                console.warn('[note_detect] AudioContext resume on reuse failed:', e);
             }
-        });
+        }
+        _ndResetBpFilter(_ndAudioCtx.sampleRate);
         for (const tr of _ndStream.getAudioTracks()) {
             tr.addEventListener('ended', () => {
                 console.warn(`[note_detect] Audio track ended: "${tr.label}". Attempting restart...`);
@@ -4275,15 +4288,14 @@ function _ndStopAudio() {
         _ndStream.getTracks().forEach(t => t.stop());
         _ndStream = null;
     }
-    if (_ndAudioCtx) {
-        // close() returns a Promise; fire-and-forget is fine, but ignoring
-        // it left a window where PipeWire saw an in-flight close while
-        // Firefox was already grabbing the source again (user's reported
-        // detect/nodetect/detect/nodetect/detect cascade). We don't await
-        // here because callers don't, but the explicit graph disconnect
-        // above means the close has nothing left to drain.
-        _ndAudioCtx.close().catch(() => {});
-        _ndAudioCtx = null;
+    // Suspend (don't close) the AudioContext. close() destroys the
+    // sink-input PipeWire registered for our destination; recreating
+    // it on the next _ndStartAudio call is the renegotiation that
+    // corks the user's loopback. Suspending keeps the sink-input
+    // alive (just inactive) so the speaker sink's consumer set stays
+    // stable across Detect cycles and song changes.
+    if (_ndAudioCtx && _ndAudioCtx.state === 'running') {
+        _ndAudioCtx.suspend().catch(() => {});
     }
     _ndInputLevel = 0;
     _ndInputPeak = 0;
@@ -6674,10 +6686,15 @@ function _ndUpdateHUD() {
     const flashEl = document.getElementById('nd-flash-overlay');
 
     if (accEl && total > 0) {
-        // Coaching-weighted score: wrong-pitch errors hit the score harder
-        // than near-miss timing. See _ND_SCORE_WEIGHTS.
-        const scores = _ndComputeScores();
-        const accuracy = Math.round(scores.combined * 100);
+        // Live HUD shows the same simple hit rate the highway markers and the
+        // post-song summary modal show — divergence between them confused
+        // users who saw 87% on the highway but 50% in the HUD. The
+        // coaching-weighted score (with negative weights for misses) still
+        // exists in _ndComputeScores().combined and is rendered in the
+        // post-play coaching review where session-level mastery framing
+        // makes sense; the live HUD just needs to mirror what the player is
+        // looking at.
+        const accuracy = Math.round((_ndHits / total) * 100);
         const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
         accEl.textContent = accuracy + '%';
         accEl.style.color = color;
