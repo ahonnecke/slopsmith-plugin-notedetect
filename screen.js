@@ -2143,19 +2143,23 @@ const _ND_REATTACK_REFRACTORY_SEC = 0.200;
 // every pluck instead of dropping every other one to refractory.
 const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
 const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
-// Chart-guided onset gate: when the chart shows a note within
-// [now-LOOKBACK, now+LOOKAHEAD], swap the onset thresholds for relaxed
-// values that catch sustain-bleed attacks the conservative gate would
-// drop. The chart is a prior — we only loosen where we already expect
-// a hit, so the false-fire blast radius is bounded by chart density.
-// LOOKBACK 150ms covers mic + onset-comp residual after avOffset; the
-// LOOKAHEAD 200ms matches strict's late-tolerance window. Validated
-// offline against Gasoline WAV: drops MISSED_NO_DETECTION from 37 to
-// N (see test/onset-sim.js report).
-const _ND_CHART_GUIDED_LOOKBACK_SEC  = 0.150;
-const _ND_CHART_GUIDED_LOOKAHEAD_SEC = 0.200;
-const _ND_CHART_GUIDED_LEVEL = 0.015;  // entry/min level when chart-guided
-const _ND_CHART_GUIDED_RATIO = 1.3;    // re-attack rise ratio when chart-guided
+// Spectral-flux supplemental onset gate (HFC = high-frequency content).
+// Bass attacks have a click in the 1–5 kHz band from finger/string contact
+// that's a pure transient — present at the attack moment, absent during
+// sustain. RMS-based gates miss attacks during sustain bleed because the
+// previous note's RMS is still high; HFC sees the click regardless. Used
+// as a SUPPLEMENT to RMS (only fires when RMS is in-note + refractory
+// passed + ratio gate didn't fire), so RMS handles silence→playing in its
+// strong regime and HFC plugs the sustain-bleed hole.
+//
+// Validated via test/spectral-flux-sim.js across 5 fixtures (K=6,
+// refractory=0.250s): Gasoline +19 HIT, Mexico +5, Take +6, Level
+// fixtures within ±2 noise. RMS-only baseline → +27 net HIT across the
+// roster.
+const _ND_HFC_K = 6;                  // adaptive threshold = K × rolling median
+const _ND_HFC_REFRACTORY_SEC = 0.250; // stricter than baseline 200ms
+const _ND_HFC_MEDIAN_WINDOW = 23;     // ~23 chunks × 43ms ≈ 1s rolling history
+const _ND_HFC_MIN_FLUX = 0.01;        // absolute floor; suppresses fires on silence
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
 // Release-before-retrigger: after any onset fires, another re-attack can't
@@ -2187,6 +2191,14 @@ let _ndInNote = false;                // are we currently inside a detected note
 let _ndPendingOnsetChartT = null;     // chart time of the most recent onset, cleared when consumed by _ndMatchNotes
 let _ndLastOnsetPerfNow = 0;          // performance.now()/1000 of the last onset (for refractory)
 let _ndReattackRmsBuf = [];           // running RMS window for the re-attack detector
+// HFC supplemental gate state. _ndHfcPrevMag holds the previous chunk's
+// magnitude spectrum for the frame-to-frame difference; _ndHfcRecentFlux
+// is the rolling history used to compute the adaptive threshold.
+let _ndHfcPrevMag = null;
+let _ndHfcRecentFlux = [];
+let _ndHfcHann = null;                // lazy-initialized when frame size is known
+let _ndHfcScratchRe = null;
+let _ndHfcScratchIm = null;
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -2510,6 +2522,81 @@ function _ndApplyStrictness(level) {
         _ndPerfectPitchCent = preset.perfectPitchCent;
     }
 })();
+
+// ── Spectral-flux primitives (HFC supplemental onset) ─────────────────────
+// In-place radix-2 Cooley-Tukey FFT. re[] and im[] must be length 2^k.
+// Used by the HFC supplemental onset gate; not on YIN's path.
+function _ndFftInPlace(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+        let bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            const tr = re[i]; re[i] = re[j]; re[j] = tr;
+            const ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    for (let size = 2; size <= n; size <<= 1) {
+        const half = size >> 1;
+        const phaseStep = -2 * Math.PI / size;
+        for (let i = 0; i < n; i += size) {
+            for (let k = 0; k < half; k++) {
+                const phase = phaseStep * k;
+                const wRe = Math.cos(phase);
+                const wIm = Math.sin(phase);
+                const a = i + k;
+                const b = a + half;
+                const tRe = wRe * re[b] - wIm * im[b];
+                const tIm = wRe * im[b] + wIm * re[b];
+                re[b] = re[a] - tRe; im[b] = im[a] - tIm;
+                re[a] = re[a] + tRe; im[a] = im[a] + tIm;
+            }
+        }
+    }
+}
+
+// Lazy-init Hann window + FFT scratch buffers sized to the audio chunk.
+// First call costs O(n) for the window; subsequent calls reuse buffers.
+function _ndHfcEnsureBuffers(n) {
+    if (_ndHfcHann && _ndHfcHann.length === n) return;
+    _ndHfcHann = new Float32Array(n);
+    for (let i = 0; i < n; i++) _ndHfcHann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+    _ndHfcScratchRe = new Float32Array(n);
+    _ndHfcScratchIm = new Float32Array(n);
+}
+
+// HFC flux for the current chunk vs the previous chunk's spectrum.
+// Returns { flux, mag } — caller stores mag for next call's diff.
+function _ndHfcComputeFlux(input) {
+    _ndHfcEnsureBuffers(input.length);
+    for (let i = 0; i < input.length; i++) {
+        _ndHfcScratchRe[i] = input[i] * _ndHfcHann[i];
+        _ndHfcScratchIm[i] = 0;
+    }
+    _ndFftInPlace(_ndHfcScratchRe, _ndHfcScratchIm);
+    const half = (input.length >> 1) + 1;
+    const mag = new Float32Array(half);
+    for (let k = 0; k < half; k++) {
+        mag[k] = Math.sqrt(_ndHfcScratchRe[k] * _ndHfcScratchRe[k]
+                         + _ndHfcScratchIm[k] * _ndHfcScratchIm[k]) / input.length;
+    }
+    let flux = 0;
+    if (_ndHfcPrevMag && _ndHfcPrevMag.length === half) {
+        for (let k = 1; k < half; k++) {  // skip DC bin
+            const d = mag[k] - _ndHfcPrevMag[k];
+            if (d > 0) flux += k * d;       // HFC weighting: higher bins matter more
+        }
+    }
+    return { flux, mag };
+}
+
+// Median of a small array. Used for HFC's adaptive threshold.
+function _ndMedian(arr) {
+    if (arr.length === 0) return 0;
+    const sorted = arr.slice().sort((a, b) => a - b);
+    return sorted[Math.floor((sorted.length - 1) * 0.5)];
+}
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
@@ -3454,6 +3541,14 @@ function _ndProcessAudioChunk(input) {
     // fresh pluck rather than body-peak noise from the ongoing note.
     if (rms < _ND_REATTACK_REARM_LEVEL) _ndReattackArmed = true;
 
+    // HFC flux — computed every chunk so prevMag and the rolling-history
+    // window track even when no onset fires. The flux value drives the
+    // Trigger 3 supplemental gate below.
+    const { flux: hfcFlux, mag: hfcMag } = _ndHfcComputeFlux(input);
+    _ndHfcPrevMag = hfcMag;
+    _ndHfcRecentFlux.push(hfcFlux);
+    if (_ndHfcRecentFlux.length > _ND_HFC_MEDIAN_WINDOW) _ndHfcRecentFlux.shift();
+
     let fireOnset = false;
     // Trigger 1: silence → playing (fresh note after a rest).
     if (rms > _ND_ONSET_LEVEL && !_ndInNote && refractoryOk) {
@@ -3474,6 +3569,20 @@ function _ndProcessAudioChunk(input) {
     // Exit — hysteresis gap prevents re-fire on sustain noise.
     else if (rms < _ND_ONSET_EXIT_LEVEL) {
         _ndInNote = false;
+    }
+
+    // Trigger 3: HFC supplemental — fires only when (a) RMS is in-note
+    // (we ARE in a sustained note), (b) Triggers 1 and 2 didn't fire
+    // (RMS gate couldn't see the attack), and (c) HFC flux exceeds
+    // K × rolling-median + an absolute floor. This is the sustain-bleed
+    // regime where previous-note RMS dominates the envelope but the new
+    // attack's high-frequency click is still a clean transient. Stricter
+    // refractory (250ms vs 200ms baseline) keeps HFC conservative.
+    if (!fireOnset && _ndInNote && refractoryOk
+        && (nowPerfSec - _ndLastOnsetPerfNow) > _ND_HFC_REFRACTORY_SEC
+        && hfcFlux >= _ND_HFC_MIN_FLUX) {
+        const med = _ndMedian(_ndHfcRecentFlux);
+        if (med > 0 && hfcFlux > med * _ND_HFC_K) fireOnset = true;
     }
 
     if (fireOnset) {
@@ -5818,6 +5927,65 @@ const _ND_REVIEW_SOURCE_LABELS = {
     detect_off: 'Detect off',
 };
 
+// Sliding-window miss-cluster finder for a single play's noteResults.
+// Sister to _ndSuggestLoops (which works across plays for the report
+// panel). Output is cluster windows with start/end seconds, miss counts,
+// dominant failure modes, and the notes inside — ready to drive the
+// review modal's Drill buttons. Cluster ranges respect chart sparsity:
+// they're always tight even when chart sections are coarse (e.g.,
+// the Gasoline CDLC has 2 sections for a 3:46 song).
+function _ndFindMissClusters(noteResults, opts = {}) {
+    const {
+        windowSec = 6,           // tight enough to drill, wide enough to context
+        slideSec = 0.5,
+        minMissCount = 2,        // skip noise (single one-off miss)
+        maxClusters = 8,
+        padHeadSec = 0.5,        // lead-in so the user can ramp up
+        padTailSec = 1.0,
+        minGapSec = 1.0,         // merge clusters within this gap
+    } = opts;
+    const judged = (noteResults || []).filter(r => r.primary !== 'IGNORED_DETECTOR_FAILURE');
+    if (!judged.length) return [];
+    const isMiss = (r) => r.primary !== 'HIT' && r.primary !== 'DIRTY_HIT';
+
+    let minT = Infinity, maxT = -Infinity;
+    for (const r of judged) {
+        if (r.chartT < minT) minT = r.chartT;
+        if (r.chartT > maxT) maxT = r.chartT;
+    }
+    const candidates = [];
+    for (let start = minT; start <= maxT; start += slideSec) {
+        const end = start + windowSec;
+        const inWin = judged.filter(r => r.chartT >= start && r.chartT < end);
+        const misses = inWin.filter(isMiss).length;
+        if (misses >= minMissCount) {
+            candidates.push({ start, end, misses, total: inWin.length, notes: inWin });
+        }
+    }
+    if (!candidates.length) return [];
+    candidates.sort((a, b) => b.misses - a.misses || a.start - b.start);
+
+    // Greedy non-overlap pick. Two clusters are "overlapping" if their
+    // padded windows touch within minGapSec — prevents two adjacent
+    // drill targets that the user would just merge mentally.
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxClusters) break;
+        const padA = c.start - padHeadSec;
+        const padB = c.end + padTailSec;
+        if (selected.some(s =>
+            (padA - minGapSec) < s.endSecRaw && (padB + minGapSec) > s.startSecRaw)) continue;
+        selected.push({
+            startSecRaw: c.start, endSecRaw: c.end,
+            startSec: Math.max(0, padA),
+            endSec: padB,
+            misses: c.misses, total: c.total, notes: c.notes,
+        });
+    }
+    selected.sort((a, b) => a.startSec - b.startSec);
+    return selected;
+}
+
 function _ndAggregateBySection(noteResults, sections) {
     // Returns Map<sectionName, {hits, misses, total, weighted, max,
     //                            failureModeCounts: Map<mode,n>,
@@ -5898,25 +6066,44 @@ function _ndRenderSectionHeatmapSvg(perSection, sections, totalDuration) {
     return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${cells}</svg>`;
 }
 
-function _ndRenderTroubleSpotRow(name, row) {
-    const accuracy = row.total > 0 ? Math.max(0, Math.min(1, row.weighted / row.max)) : 0;
+function _ndFmtMmSs(t) {
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function _ndRenderClusterRow(cluster, idx) {
+    const accuracy = cluster.total > 0
+        ? Math.max(0, Math.min(1, (cluster.total - cluster.misses) / cluster.total)) : 0;
     const accColor = _ndScoreColor(accuracy);
-    // Dominant failure mode (excluding CLEAN)
-    let dominantMode = 'UNKNOWN', dominantCount = 0;
-    for (const [mode, n] of row.failureModeCounts) {
+    // Dominant failure mode within this cluster (excluding CLEAN).
+    const modeCounts = new Map();
+    for (const r of cluster.notes) {
+        const mode = _ndClassifyFailureMode(r);
         if (mode === 'CLEAN') continue;
-        if (n > dominantCount) { dominantMode = mode; dominantCount = n; }
+        modeCounts.set(mode, (modeCounts.get(mode) || 0) + 1);
+    }
+    let dominantMode = 'UNKNOWN', dominantCount = 0;
+    for (const [m, n] of modeCounts) {
+        if (n > dominantCount) { dominantMode = m; dominantCount = n; }
     }
     const info = (typeof _ND_FAILURE_MODE_INFO === 'object' && _ND_FAILURE_MODE_INFO[dominantMode])
         || { label: dominantMode, color: '#9ca3af' };
+    const span = `${_ndFmtMmSs(cluster.startSec)}–${_ndFmtMmSs(cluster.endSec)}`;
+    const dur = (cluster.endSec - cluster.startSec).toFixed(1);
     return `
         <div class="flex items-center gap-3 bg-dark-700 border border-gray-700 rounded-lg px-3 py-2">
-            <div class="font-mono text-2xl font-bold w-16 text-center" style="color:${accColor}">${Math.round(accuracy * 100)}%</div>
+            <div class="font-mono text-xl font-bold w-20 text-center" style="color:${accColor}">${span}</div>
             <div class="flex-1 min-w-0">
-                <div class="text-gray-200 text-sm font-medium truncate">${name}</div>
-                <div class="text-[11px] text-gray-500">${row.hits}/${row.total} hits · <span style="color:${info.color}">${info.label}</span> ×${dominantCount}</div>
+                <div class="text-gray-200 text-sm font-medium">
+                    ${cluster.misses} miss${cluster.misses === 1 ? '' : 'es'} in ${dur}s
+                    <span class="text-gray-500">· ${cluster.total} note${cluster.total === 1 ? '' : 's'} total</span>
+                </div>
+                <div class="text-[11px] text-gray-500">
+                    Mostly: <span style="color:${info.color}">${info.label}</span> ×${dominantCount}
+                </div>
             </div>
-            <button data-drill-section="${encodeURIComponent(name)}"
+            <button data-drill-cluster="${idx}"
                     class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-800 rounded text-xs text-blue-200 shrink-0">
                 Drill this
             </button>
@@ -5950,14 +6137,12 @@ async function _ndShowCoachingReview({ playId, source }) {
         : '—';
     const combinedColor = _ndScoreColor(summary.combinedWeightedScore);
 
-    // Sort sections by combined score ascending (worst first); skip empties
-    // and the synthetic "(unsectioned)" bucket — those notes have no real
-    // chart section to drill back into (older plays predate sectionName
-    // tagging) and clicking Drill on them no-ops with a warning.
-    const trouble = [...perSection.entries()]
-        .filter(([name, row]) => row.total > 0 && name !== '(unsectioned)')
-        .map(([name, row]) => ({ name, row, score: row.weighted / row.max }))
-        .sort((a, b) => a.score - b.score);
+    // Trouble spots are miss-density clusters — NOT chart sections.
+    // Reason: many CDLCs have very few sections (e.g., Gasoline has 2 for
+    // a 3:46 song), so section-level drilling effectively loops the whole
+    // song. Cluster-level drilling gives tight 5–10s windows around the
+    // densest miss zones regardless of where chart sections fall.
+    const clusters = _ndFindMissClusters(play.noteResults);
 
     const modal = document.createElement('div');
     modal.id = 'nd-review-modal';
@@ -6001,11 +6186,11 @@ async function _ndShowCoachingReview({ playId, source }) {
             </div>` : ''}
 
             <div class="px-5 py-4 border-b border-gray-700">
-                <div class="text-gray-400 text-xs mb-2">Trouble spots — worst first</div>
+                <div class="text-gray-400 text-xs mb-2">Trouble spots — densest miss clusters</div>
                 <div class="space-y-1.5">
-                    ${trouble.length === 0
-                        ? '<div class="text-gray-500 text-xs italic">No trouble spots — clean play.</div>'
-                        : trouble.map(t => _ndRenderTroubleSpotRow(t.name, t.row)).join('')
+                    ${clusters.length === 0
+                        ? '<div class="text-gray-500 text-xs italic">No trouble clusters — clean play.</div>'
+                        : clusters.map((c, i) => _ndRenderClusterRow(c, i)).join('')
                     }
                 </div>
             </div>
@@ -6031,17 +6216,17 @@ async function _ndShowCoachingReview({ playId, source }) {
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     document.addEventListener('keydown', escHandler);
 
-    // Drill buttons — defer to _ndStartDrill (Phase 5). Stub-safe: if the
-    // function isn't defined yet, log instead of crashing.
-    modal.querySelectorAll('[data-drill-section]').forEach(btn => {
+    // Cluster Drill buttons — start a tight loop on the cluster's range.
+    modal.querySelectorAll('[data-drill-cluster]').forEach(btn => {
         btn.onclick = () => {
-            const name = decodeURIComponent(btn.getAttribute('data-drill-section'));
-            close();
-            if (typeof _ndStartDrill === 'function') {
-                _ndStartDrill(name);
-            } else {
-                console.warn('[note_detect] _ndStartDrill not defined yet; drill request ignored:', name);
+            const idx = parseInt(btn.getAttribute('data-drill-cluster'), 10);
+            const cluster = clusters[idx];
+            if (!cluster) {
+                console.warn('[note_detect] cluster idx not found:', idx);
+                return;
             }
+            close();
+            _ndStartDrillRange(cluster.startSec, cluster.endSec, `cluster ${idx + 1}`);
         };
     });
 
@@ -6227,6 +6412,41 @@ async function _ndFetchMostRecentDrillPlayId() {
 // A-B loop to bracket the section, auto-enables Detect, and flags the
 // next plays as drill_section in the DB so the historical view can
 // distinguish them from full song-pass plays.
+// Drill a specific [start, end] range — used by cluster-based trouble spots.
+// Cleaner than _ndStartDrill (which had to look up sections by name and
+// compute a range from chart structure that can be too coarse).
+function _ndStartDrillRange(startSec, endSec, label) {
+    const audio = document.getElementById('audio');
+    const songInfo = (highway.getSongInfo && highway.getSongInfo()) || {};
+    const totalDuration = songInfo.duration
+        || (audio && Number.isFinite(audio.duration) ? audio.duration : null);
+    if (!totalDuration) {
+        console.warn('[note_detect] _ndStartDrillRange: no duration available — aborting');
+        return;
+    }
+    // Clamp the range to within the song so loopB doesn't sit past
+    // audio.duration (the audio.currentTime>=loopB trigger never fires
+    // if loopB is unreachable — that was the "loop = entire song" bug).
+    const start = Math.max(0, startSec);
+    const end = Math.min(totalDuration - 0.05, endSec);
+    if (end - start < 0.5) {
+        console.warn(`[note_detect] _ndStartDrillRange: range too short (${(end - start).toFixed(2)}s) — aborting`);
+        return;
+    }
+
+    _ndDrillActive = true;
+    _ndDrillSectionName = label || `${start.toFixed(1)}-${end.toFixed(1)}s`;
+    _ndResetScoring();
+
+    if (typeof window.setActiveLoop === 'function') {
+        window.setActiveLoop(start, end);
+    } else {
+        console.warn('[note_detect] _ndStartDrillRange: window.setActiveLoop missing');
+    }
+    if (!_ndEnabled) _ndToggle();
+    console.log(`[note_detect] Drill range "${label}" ${start.toFixed(1)}–${end.toFixed(1)}s (${(end - start).toFixed(1)}s long)`);
+}
+
 function _ndStartDrill(sectionName) {
     const sections = (highway.getSections && highway.getSections()) || [];
     console.log(`[note_detect] _ndStartDrill("${sectionName}") — ${sections.length} sections:`,
@@ -14032,6 +14252,38 @@ window.slopsmith.ndDiag = {
             out.getOnePlay = { status: g.status, hasNoteResults: Array.isArray(gData?.noteResults) };
             console.log('[nd-diag] server (GET /play/<id>):', out.getOnePlay);
         }
+        return out;
+    },
+
+    // Compute miss clusters for the most recent play and report each
+    // cluster's range + miss count + total notes inside. Lets us verify
+    // the cluster algorithm produces tight ranges (vs. the old section-
+    // based drill which gave whole-song loops on coarse charts) WITHOUT
+    // playing through the song.
+    async clusters() {
+        const songId = _ndCurrentSongId();
+        if (!songId) { console.warn('[nd-diag] no current song'); return null; }
+        const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=1`);
+        const data = await r.json();
+        if (!data.plays || !data.plays.length) {
+            console.warn('[nd-diag] no plays for current song'); return null;
+        }
+        const play = data.plays[0];
+        const clusters = _ndFindMissClusters(play.noteResults);
+        const out = {
+            playId: play.id,
+            totalNotes: (play.noteResults || []).length,
+            clusterCount: clusters.length,
+            clusters: clusters.map((c, i) => ({
+                idx: i,
+                range: `${c.startSec.toFixed(1)}–${c.endSec.toFixed(1)}s`,
+                durationSec: +(c.endSec - c.startSec).toFixed(1),
+                misses: c.misses,
+                total: c.total,
+                missRate: +(c.misses / c.total).toFixed(2),
+            })),
+        };
+        console.log('[nd-diag] clusters:', out);
         return out;
     },
 
