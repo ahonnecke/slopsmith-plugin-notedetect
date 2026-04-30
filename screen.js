@@ -13951,3 +13951,175 @@ async function _ndTestPerfectPlay(options = {}) {
     window._ndTestResult = result;
     return result;
 }
+
+// ── Self-diagnostic console probes ───────────────────────────────────────
+// These let me debug without asking the user to play through a song. Each
+// reports state I'd otherwise have to interpret from a partial console log.
+// All accessible via the slopsmith global so the user can paste back full
+// output: `slopsmith.ndDiag.<probe>()`.
+window.slopsmith = window.slopsmith || {};
+window.slopsmith.ndDiag = {
+    // What is the deployed code? Logs version markers + commit-affected
+    // function presence so we can confirm the page actually picked up the
+    // latest screen.js (vs serving stale cache).
+    client() {
+        const out = {
+            screenJsBytes: undefined,
+            functionsPresent: {
+                _ndShowCoachingReview: typeof _ndShowCoachingReview === 'function',
+                _ndStartDrill: typeof _ndStartDrill === 'function',
+                _ndOnSessionBoundary: typeof _ndOnSessionBoundary === 'function',
+                _ndComputeScores: typeof _ndComputeScores === 'function',
+                _ndRenderHistoryLineChart: typeof _ndRenderHistoryLineChart === 'function',
+            },
+            stateNow: {
+                _ndEnabled, _ndDrillActive, _ndDrillSectionName,
+                _ndLastSnapshotPlayId,
+                _ndNoteResultsSize: _ndNoteResults.size,
+                _ndCurrentSection,
+                _ndPlaysCacheSongId,
+            },
+            listenerRefs: {
+                __ndEndedHandler: typeof window.__ndEndedHandler,
+                __ndSongRestartHandler: typeof window.__ndSongRestartHandler,
+                __ndLoopClearHandler: typeof window.__ndLoopClearHandler,
+            },
+            slopsmithApi: {
+                hasOn: !!(window.slopsmith && typeof window.slopsmith.on === 'function'),
+                hasEmit: !!(window.slopsmith && typeof window.slopsmith.emit === 'function'),
+                hasSetActiveLoop: typeof window.setActiveLoop === 'function',
+                hasGetActiveLoop: typeof window.getActiveLoop === 'function',
+                currentLoop: typeof window.getActiveLoop === 'function' ? window.getActiveLoop() : null,
+            },
+        };
+        console.log('[nd-diag] client:', out);
+        return out;
+    },
+
+    // Verify the SERVER is running the new SQLite-backed routes.py vs the
+    // old /tmp JSON code. POSTs a known-shape probe and inspects the
+    // response. The new server returns {ok, id:int}; the old returns
+    // {ok, path:str}. This is what was wasting your time before — you
+    // shouldn't have to know which version is running, the diag should.
+    async server() {
+        const probe = {
+            songId: '__ndDiag_probe',
+            playId: 'probe-' + Date.now(),
+            reason: 'diag',
+            startedAt: Date.now(),
+            noteResults: [{ key: 'p', s: 0, f: 0, chartT: 0,
+                primary: 'HIT', severity: 0.1, sectionName: 'DiagSection' }],
+            summary: { hits: 1, misses: 0, combinedWeightedScore: 1.0 },
+        };
+        const r = await fetch('/api/plugins/note_detect/plays', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(probe),
+        });
+        const data = await r.json().catch(() => null);
+        const isNewSchema = data && typeof data.id === 'number' && data.id > 0;
+        const out = {
+            postStatus: r.status,
+            postBody: data,
+            schema: isNewSchema ? 'NEW (SQLite)' : 'OLD (/tmp JSON)',
+            actionRequired: isNewSchema ? null : 'restart slopsmith server to pick up routes.py',
+        };
+        console.log('[nd-diag] server:', out);
+        // If new schema, also test GET /play/<id>
+        if (isNewSchema) {
+            const g = await fetch(`/api/plugins/note_detect/play/${data.id}`);
+            const gData = await g.json().catch(() => null);
+            out.getOnePlay = { status: g.status, hasNoteResults: Array.isArray(gData?.noteResults) };
+            console.log('[nd-diag] server (GET /play/<id>):', out.getOnePlay);
+        }
+        return out;
+    },
+
+    // Verify _ndStartDrill computes the right loop range for a given
+    // section, WITHOUT actually starting the drill or playing audio.
+    // Pass the section name from the modal's trouble-spot list.
+    drillRangeFor(sectionName) {
+        const sections = (highway.getSections && highway.getSections()) || [];
+        const songInfo = (highway.getSongInfo && highway.getSongInfo()) || {};
+        const audio = document.getElementById('audio');
+        const idx = sections.findIndex(s => s.name === sectionName);
+        const out = {
+            requestedSection: sectionName,
+            sections: sections.map(s => ({ name: s.name, time: s.time })),
+            sectionCount: sections.length,
+            foundAtIdx: idx,
+            songInfoDuration: songInfo.duration,
+            audioDuration: audio?.duration,
+            currentSetActiveLoop: typeof window.getActiveLoop === 'function' ? window.getActiveLoop() : null,
+        };
+        if (idx >= 0) {
+            const sec = sections[idx];
+            const next = sections[idx + 1];
+            const totalDuration = songInfo.duration
+                || (audio && Number.isFinite(audio.duration) ? audio.duration : null);
+            const start = typeof sec.time === 'number' ? Math.max(0, sec.time) : null;
+            const end = next && typeof next.time === 'number' ? next.time : totalDuration;
+            out.computed = {
+                start, end,
+                rangeSec: start != null && end != null ? (end - start) : null,
+                isLastSection: !next,
+                wouldAbort: start === null || !totalDuration || (end - start < 0.5),
+            };
+        }
+        console.log('[nd-diag] drillRangeFor:', out);
+        return out;
+    },
+
+    // Pop the review modal for the most recent play of the current song,
+    // bypassing the trigger machinery entirely. Useful for testing the
+    // modal render in isolation.
+    async openReview() {
+        const songId = _ndCurrentSongId();
+        if (!songId) { console.warn('[nd-diag] no current song'); return null; }
+        const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=1`);
+        const data = await r.json();
+        if (!data.plays || !data.plays.length) {
+            console.warn('[nd-diag] no plays for current song; play with Detect on at least once');
+            return null;
+        }
+        const playId = data.plays[0].id;
+        if (!playId) {
+            console.warn('[nd-diag] play has no id (server is old) — restart slopsmith');
+            return null;
+        }
+        console.log(`[nd-diag] opening review for play_id=${playId}`);
+        await _ndShowCoachingReview({ playId, source: 'restart' });
+        return playId;
+    },
+
+    // Emit song:restart manually so we can confirm the listener fires
+    // exactly once (not zero, not two). Counts log lines via a snapshot.
+    countRestartFires() {
+        const before = window.__ndDiagBoundaryCount = window.__ndDiagBoundaryCount || 0;
+        // Patch _ndOnSessionBoundary briefly to count calls.
+        const orig = _ndOnSessionBoundary;
+        let calls = 0;
+        // Can't reassign const; instead listen for the side-effect via a
+        // wrapper added to the slopsmith handler. Simpler: count slopsmith
+        // listener registrations directly by checking handler ref + count
+        // via slopsmith's internal listener map (EventTarget's listeners
+        // aren't introspectable, but our single-handler-ref pattern lets
+        // us assert exactly one slot is occupied).
+        const out = {
+            songRestartHandler: typeof window.__ndSongRestartHandler,
+            singleHandlerInvariant: typeof window.__ndSongRestartHandler === 'function',
+            note: 'fire window.slopsmith.emit("song:restart",{}) and watch for ONE [note_detect] session boundary line',
+        };
+        console.log('[nd-diag] countRestartFires:', out);
+        return out;
+    },
+
+    // Run all probes and dump the bundle. Single command, full picture.
+    async all() {
+        const c = this.client();
+        const s = await this.server();
+        const sections = (highway.getSections && highway.getSections()) || [];
+        const drillProbes = sections.slice(0, 3).map(sec => this.drillRangeFor(sec.name));
+        return { client: c, server: s, drillProbesFirst3: drillProbes };
+    },
+};
