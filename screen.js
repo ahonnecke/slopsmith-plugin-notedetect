@@ -467,6 +467,12 @@ let _ndCurrentSection = null;
 let _ndDrillActive = false;
 let _ndDrillSectionName = null;
 
+// Last play_id snapshotted for this song. Used by _ndOnSessionBoundary as
+// a fallback so the review modal still pops on Restart / loop-clear /
+// detect-off when the in-memory results map was already drained by an
+// earlier loop_restart snapshot. Cleared on song change.
+let _ndLastSnapshotPlayId = null;
+
 // Compound judgment counters (docs/NOTE_FAILURE_SPEC.md). A HIT can still
 // have timing/pitch labels if the detection was within tolerance but not
 // perfectly aligned. These counters tally label occurrences, not unique
@@ -918,6 +924,7 @@ function _ndSnapshotPlay(reason) {
     }).then(r => r.json())
       .then(data => {
         const id = data && data.id;
+        if (id) _ndLastSnapshotPlayId = id;
         console.log(`[note_detect] Play snapshot saved (${reason}, ${noteResults.length} notes, id=${id})`);
         // Refresh the trouble map from the cross-loop aggregate now that
         // the new snapshot is on disk. Single-play map (set above) was
@@ -6155,21 +6162,36 @@ function _ndRenderSectionTrends(sectionsData) {
 // _ndEnabled has flipped false, and song_end fires whether Detect is on or
 // off. The empty-results check handles the Detect-was-never-on case.
 async function _ndOnSessionBoundary(source) {
+    console.log(`[note_detect] session boundary: ${source} (results=${_ndNoteResults.size}, lastId=${_ndLastSnapshotPlayId}, drill=${_ndDrillActive})`);
     // Suppress non-loop pops while drilling — the user is mid-practice
     // session and a modal would be a distraction. Only loop_clear and
     // detect_off (the explicit "done drilling" signals) pop.
-    if (_ndDrillActive && source !== 'loop_clear' && source !== 'detect_off') return null;
+    if (_ndDrillActive && source !== 'loop_clear' && source !== 'detect_off') {
+        console.log('[note_detect] suppressed (drill active)');
+        return null;
+    }
 
     let playId = null;
     if (_ndNoteResults.size > 0) {
         playId = await _ndSnapshotPlay(source);
-    } else if ((source === 'loop_clear' || source === 'detect_off') && _ndDrillActive) {
+    } else if (_ndDrillActive && (source === 'loop_clear' || source === 'detect_off')) {
         // Drill ended after a `loop_restart` snapshot cleared the results
         // map. Fall back to the most recent drill play for this section so
         // the user still sees a review of the just-finished drill session.
         playId = await _ndFetchMostRecentDrillPlayId();
+    } else if (_ndLastSnapshotPlayId) {
+        // No fresh notes (most common case: a loop_restart already
+        // snapshotted whatever the user played). Show the most recent
+        // play from this song's session so Restart / detect-off / song-end
+        // still pops a review the user expects to see.
+        playId = _ndLastSnapshotPlayId;
     }
-    if (playId) _ndShowCoachingReview({ playId, source });
+    if (playId) {
+        console.log(`[note_detect] opening review for play_id=${playId} source=${source}`);
+        _ndShowCoachingReview({ playId, source });
+    } else {
+        console.log(`[note_detect] no playId resolved — skipping review (source=${source})`);
+    }
 
     // Any session boundary ends drill mode — the explicit ones (loop_clear,
     // detect_off) and the implicit ones (song_end, restart). Reset both
@@ -12861,6 +12883,7 @@ setInterval(() => {
         // wrong positions until the new map loads.
         _ndTroubleNotes = new Map();
         _ndPlaysCacheSongId = null;
+        _ndLastSnapshotPlayId = null;
         await origPlaySong(filename, arrangement);
         _ndInjectButton();
         _ndAttachAutoDetectListener();
