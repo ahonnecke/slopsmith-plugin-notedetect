@@ -7929,21 +7929,22 @@ function _ndAttachAutoDetectListener() {
     audio.addEventListener('pause', ()    => { _ndClickTrackScheduled.clear(); });
 
     // ── Coaching-review session boundaries ──────────────────────────────
-    // Song-end pops the review (drill-mode is suppressed inside
-    // _ndOnSessionBoundary). Listening on the audio element directly
-    // because window.slopsmith.on('song:ended') is also a thing but the
-    // audio event fires unconditionally even before slopsmith plumbs it.
-    audio.addEventListener('ended', () => { _ndOnSessionBoundary('song_end'); });
-
-    // Slopsmith emits song:restart from the new Restart Song button (Phase 4).
-    // Subscribe defensively so the listener exists even before the button
-    // is wired — it's a no-op until the event fires.
-    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+    // Each hook below uses its OWN guard rather than relying solely on the
+    // audio.dataset.ndAutoDetect guard above. Reason: the user's logs
+    // showed two `session boundary: restart` lines for one Restart click
+    // — meaning two song:restart listeners somehow accumulated across
+    // plugin reloads or multiple wrapper calls. Per-hook guards (window
+    // flags / element datasets) make double-registration impossible
+    // regardless of how this function gets called.
+    if (!audio.dataset.ndEndedWired) {
+        audio.dataset.ndEndedWired = '1';
+        audio.addEventListener('ended', () => { _ndOnSessionBoundary('song_end'); });
+    }
+    if (!window.__ndSongRestartHookAttached
+            && window.slopsmith && typeof window.slopsmith.on === 'function') {
+        window.__ndSongRestartHookAttached = true;
         window.slopsmith.on('song:restart', () => { _ndOnSessionBoundary('restart'); });
     }
-
-    // Clearing the A-B loop ends a looping session — pop a review for the
-    // notes played during that loop (drill or otherwise).
     const clearBtn = document.getElementById('btn-loop-clear');
     if (clearBtn && clearBtn.dataset.ndReviewWired !== '1') {
         clearBtn.dataset.ndReviewWired = '1';
