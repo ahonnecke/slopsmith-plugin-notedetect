@@ -2152,23 +2152,6 @@ const _ND_REATTACK_REFRACTORY_SEC = 0.200;
 // every pluck instead of dropping every other one to refractory.
 const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
 const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
-// Spectral-flux supplemental onset gate (HFC = high-frequency content).
-// Bass attacks have a click in the 1–5 kHz band from finger/string contact
-// that's a pure transient — present at the attack moment, absent during
-// sustain. RMS-based gates miss attacks during sustain bleed because the
-// previous note's RMS is still high; HFC sees the click regardless. Used
-// as a SUPPLEMENT to RMS (only fires when RMS is in-note + refractory
-// passed + ratio gate didn't fire), so RMS handles silence→playing in its
-// strong regime and HFC plugs the sustain-bleed hole.
-//
-// Validated via test/spectral-flux-sim.js across 5 fixtures (K=6,
-// refractory=0.250s): Gasoline +19 HIT, Mexico +5, Take +6, Level
-// fixtures within ±2 noise. RMS-only baseline → +27 net HIT across the
-// roster.
-const _ND_HFC_K = 6;                  // adaptive threshold = K × rolling median
-const _ND_HFC_REFRACTORY_SEC = 0.250; // stricter than baseline 200ms
-const _ND_HFC_MEDIAN_WINDOW = 23;     // ~23 chunks × 43ms ≈ 1s rolling history
-const _ND_HFC_MIN_FLUX = 0.01;        // absolute floor; suppresses fires on silence
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
 // Release-before-retrigger: after any onset fires, another re-attack can't
@@ -2200,14 +2183,6 @@ let _ndInNote = false;                // are we currently inside a detected note
 let _ndPendingOnsetChartT = null;     // chart time of the most recent onset, cleared when consumed by _ndMatchNotes
 let _ndLastOnsetPerfNow = 0;          // performance.now()/1000 of the last onset (for refractory)
 let _ndReattackRmsBuf = [];           // running RMS window for the re-attack detector
-// HFC supplemental gate state. _ndHfcPrevMag holds the previous chunk's
-// magnitude spectrum for the frame-to-frame difference; _ndHfcRecentFlux
-// is the rolling history used to compute the adaptive threshold.
-let _ndHfcPrevMag = null;
-let _ndHfcRecentFlux = [];
-let _ndHfcHann = null;                // lazy-initialized when frame size is known
-let _ndHfcScratchRe = null;
-let _ndHfcScratchIm = null;
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -2531,81 +2506,6 @@ function _ndApplyStrictness(level) {
         _ndPerfectPitchCent = preset.perfectPitchCent;
     }
 })();
-
-// ── Spectral-flux primitives (HFC supplemental onset) ─────────────────────
-// In-place radix-2 Cooley-Tukey FFT. re[] and im[] must be length 2^k.
-// Used by the HFC supplemental onset gate; not on YIN's path.
-function _ndFftInPlace(re, im) {
-    const n = re.length;
-    for (let i = 1, j = 0; i < n; i++) {
-        let bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            const tr = re[i]; re[i] = re[j]; re[j] = tr;
-            const ti = im[i]; im[i] = im[j]; im[j] = ti;
-        }
-    }
-    for (let size = 2; size <= n; size <<= 1) {
-        const half = size >> 1;
-        const phaseStep = -2 * Math.PI / size;
-        for (let i = 0; i < n; i += size) {
-            for (let k = 0; k < half; k++) {
-                const phase = phaseStep * k;
-                const wRe = Math.cos(phase);
-                const wIm = Math.sin(phase);
-                const a = i + k;
-                const b = a + half;
-                const tRe = wRe * re[b] - wIm * im[b];
-                const tIm = wRe * im[b] + wIm * re[b];
-                re[b] = re[a] - tRe; im[b] = im[a] - tIm;
-                re[a] = re[a] + tRe; im[a] = im[a] + tIm;
-            }
-        }
-    }
-}
-
-// Lazy-init Hann window + FFT scratch buffers sized to the audio chunk.
-// First call costs O(n) for the window; subsequent calls reuse buffers.
-function _ndHfcEnsureBuffers(n) {
-    if (_ndHfcHann && _ndHfcHann.length === n) return;
-    _ndHfcHann = new Float32Array(n);
-    for (let i = 0; i < n; i++) _ndHfcHann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
-    _ndHfcScratchRe = new Float32Array(n);
-    _ndHfcScratchIm = new Float32Array(n);
-}
-
-// HFC flux for the current chunk vs the previous chunk's spectrum.
-// Returns { flux, mag } — caller stores mag for next call's diff.
-function _ndHfcComputeFlux(input) {
-    _ndHfcEnsureBuffers(input.length);
-    for (let i = 0; i < input.length; i++) {
-        _ndHfcScratchRe[i] = input[i] * _ndHfcHann[i];
-        _ndHfcScratchIm[i] = 0;
-    }
-    _ndFftInPlace(_ndHfcScratchRe, _ndHfcScratchIm);
-    const half = (input.length >> 1) + 1;
-    const mag = new Float32Array(half);
-    for (let k = 0; k < half; k++) {
-        mag[k] = Math.sqrt(_ndHfcScratchRe[k] * _ndHfcScratchRe[k]
-                         + _ndHfcScratchIm[k] * _ndHfcScratchIm[k]) / input.length;
-    }
-    let flux = 0;
-    if (_ndHfcPrevMag && _ndHfcPrevMag.length === half) {
-        for (let k = 1; k < half; k++) {  // skip DC bin
-            const d = mag[k] - _ndHfcPrevMag[k];
-            if (d > 0) flux += k * d;       // HFC weighting: higher bins matter more
-        }
-    }
-    return { flux, mag };
-}
-
-// Median of a small array. Used for HFC's adaptive threshold.
-function _ndMedian(arr) {
-    if (arr.length === 0) return 0;
-    const sorted = arr.slice().sort((a, b) => a - b);
-    return sorted[Math.floor((sorted.length - 1) * 0.5)];
-}
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
@@ -3550,14 +3450,6 @@ function _ndProcessAudioChunk(input) {
     // fresh pluck rather than body-peak noise from the ongoing note.
     if (rms < _ND_REATTACK_REARM_LEVEL) _ndReattackArmed = true;
 
-    // HFC flux — computed every chunk so prevMag and the rolling-history
-    // window track even when no onset fires. The flux value drives the
-    // Trigger 3 supplemental gate below.
-    const { flux: hfcFlux, mag: hfcMag } = _ndHfcComputeFlux(input);
-    _ndHfcPrevMag = hfcMag;
-    _ndHfcRecentFlux.push(hfcFlux);
-    if (_ndHfcRecentFlux.length > _ND_HFC_MEDIAN_WINDOW) _ndHfcRecentFlux.shift();
-
     let fireOnset = false;
     // Trigger 1: silence → playing (fresh note after a rest).
     if (rms > _ND_ONSET_LEVEL && !_ndInNote && refractoryOk) {
@@ -3578,20 +3470,6 @@ function _ndProcessAudioChunk(input) {
     // Exit — hysteresis gap prevents re-fire on sustain noise.
     else if (rms < _ND_ONSET_EXIT_LEVEL) {
         _ndInNote = false;
-    }
-
-    // Trigger 3: HFC supplemental — fires only when (a) RMS is in-note
-    // (we ARE in a sustained note), (b) Triggers 1 and 2 didn't fire
-    // (RMS gate couldn't see the attack), and (c) HFC flux exceeds
-    // K × rolling-median + an absolute floor. This is the sustain-bleed
-    // regime where previous-note RMS dominates the envelope but the new
-    // attack's high-frequency click is still a clean transient. Stricter
-    // refractory (250ms vs 200ms baseline) keeps HFC conservative.
-    if (!fireOnset && _ndInNote && refractoryOk
-        && (nowPerfSec - _ndLastOnsetPerfNow) > _ND_HFC_REFRACTORY_SEC
-        && hfcFlux >= _ND_HFC_MIN_FLUX) {
-        const med = _ndMedian(_ndHfcRecentFlux);
-        if (med > 0 && hfcFlux > med * _ND_HFC_K) fireOnset = true;
     }
 
     if (fireOnset) {
@@ -3652,52 +3530,29 @@ function _ndProcessAudioChunk(input) {
 
 async function _ndStartAudio() {
     try {
-        const raw = localStorage.getItem(_ND_STORAGE_KEY);
-        if (raw) {
-            const s = JSON.parse(raw);
-            if (s.deviceId !== undefined) selectedDeviceId = s.deviceId;
-            // Allowlist channel — a manually-edited or future-version
-            // storage value would otherwise fall through `startAudio`'s
-            // `selectedChannel === 'left' ? 0 : 1` check and silently
-            // default to the right channel. Same defensive shape as
-            // the method allowlist below.
-            if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
-            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
-            // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
-            // before deriving hit thresholds so a stale or manually-edited
-            // stored value can't produce an invalid range input or a hit
-            // threshold that exceeds the tolerance ceiling.
-            if (s.timingTolerance !== undefined) timingTolerance = Math.max(0.03, Math.min(0.3, s.timingTolerance));
-            if (s.pitchTolerance !== undefined) pitchTolerance = Math.max(10, Math.min(100, s.pitchTolerance));
-            if (s.timingHitThreshold !== undefined) timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, s.timingHitThreshold));
-            // Chord threshold clamp: at least the single-note strict threshold
-            // (chords shouldn't be stricter than single notes), at most the
-            // outer timing tolerance (we're widening within the existing
-            // candidate window, not pushing past it).
-            if (s.chordTimingHitThreshold !== undefined) chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, s.chordTimingHitThreshold));
-            if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
-            if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
-            if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
-            if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
-            if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
-            // Persisted on/off preference. Absence keeps the default
-            // (true), so fresh installs get Detect on out of the box.
-            if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
-            if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
-            if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
-            if (s.inputGain !== undefined) inputGain = s.inputGain;
-            if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
-            // Clamp to the slider's range so a stale persisted value
-            // (older build, manual edit) can't put scoring in a state the
-            // UI can't represent.
-            if (s.chordHitRatio !== undefined) chordHitRatio = Math.max(0.25, Math.min(1, s.chordHitRatio));
-            // Detection confidence floor — clamp to a sensible range.
-            // Below 0.05, even pure noise becomes a "detection"; above
-            // 0.50, even confident YIN/CREPE frames get rejected on
-            // typical guitar signals.
-            if (s.detectionConfidenceMin !== undefined) {
-                detectionConfidenceMin = Math.max(0.05, Math.min(0.50, s.detectionConfidenceMin));
+        const constraints = {
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
             }
+        };
+        // Only force a 2-channel stream when the user has explicitly
+        // selected a non-mono channel (e.g. Left/Right of a multi-FX
+        // pedal sending dry/wet). Forcing channelCount:2 on a mono
+        // device — like the USB-Guitar Hercules adapter the user has
+        // — makes PipeWire insert a mono→stereo upmix node, which
+        // renegotiates the source's format. Any other consumer of
+        // that source (specifically: the system-level pactl loopback
+        // piping USB-guitar → speakers) gets corked during the
+        // renegotiation, which is the "Detect disables USB audio
+        // out" bug. Letting Firefox deliver the device's native
+        // channel count avoids the renegotiation entirely.
+        if (_ndSelectedChannel === 'left' || _ndSelectedChannel === 'right') {
+            constraints.audio.channelCount = 2;
+        }
+        if (_ndSelectedDeviceId) {
+            constraints.audio.deviceId = { exact: _ndSelectedDeviceId };
         }
     } catch (e) { /* localStorage unavailable */ }
     // Chord window invariant — single-note strict can't exceed chord
