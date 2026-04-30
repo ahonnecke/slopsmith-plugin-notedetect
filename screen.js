@@ -6166,11 +6166,13 @@ function _ndRenderSectionTrends(sectionsData) {
 // off. The empty-results check handles the Detect-was-never-on case.
 async function _ndOnSessionBoundary(source) {
     console.log(`[note_detect] session boundary: ${source} (results=${_ndNoteResults.size}, lastId=${_ndLastSnapshotPlayId}, drill=${_ndDrillActive})`);
-    // Suppress non-loop pops while drilling — the user is mid-practice
-    // session and a modal would be a distraction. Only loop_clear and
-    // detect_off (the explicit "done drilling" signals) pop.
-    if (_ndDrillActive && source !== 'loop_clear' && source !== 'detect_off') {
-        console.log('[note_detect] suppressed (drill active)');
+    // Drill mode suppresses ONLY song_end — that fires on the natural
+    // "song reached its end" event, which during a drill loop is just an
+    // iteration boundary (the loop machinery seeks back to loopA). Every
+    // other boundary — loop_clear, detect_off, restart — is the user
+    // explicitly saying "I'm done with this session, show me the review."
+    if (_ndDrillActive && source === 'song_end') {
+        console.log('[note_detect] suppressed (song_end during drill is just an iteration end)');
         return null;
     }
 
@@ -7958,32 +7960,38 @@ function _ndAttachAutoDetectListener() {
     audio.addEventListener('pause', ()    => { _ndClickTrackScheduled.clear(); });
 
     // ── Coaching-review session boundaries ──────────────────────────────
-    // Each hook below uses its OWN guard rather than relying solely on the
-    // audio.dataset.ndAutoDetect guard above. Reason: the user's logs
-    // showed two `session boundary: restart` lines for one Restart click
-    // — meaning two song:restart listeners somehow accumulated across
-    // plugin reloads or multiple wrapper calls. Per-hook guards (window
-    // flags / element datasets) make double-registration impossible
-    // regardless of how this function gets called.
-    if (!audio.dataset.ndEndedWired) {
-        audio.dataset.ndEndedWired = '1';
-        audio.addEventListener('ended', () => { _ndOnSessionBoundary('song_end'); });
+    // Each hook is registered with detach-old-then-attach-new so the
+    // listener count is provably 1 even if this function runs multiple
+    // times in the same browser session (plugin script reload, song
+    // change, etc). Window-scoped handler refs survive script reloads
+    // because they're stored on the persistent window object.
+    if (window.__ndEndedHandler) {
+        audio.removeEventListener('ended', window.__ndEndedHandler);
     }
-    if (!window.__ndSongRestartHookAttached
-            && window.slopsmith && typeof window.slopsmith.on === 'function') {
-        window.__ndSongRestartHookAttached = true;
-        window.slopsmith.on('song:restart', () => { _ndOnSessionBoundary('restart'); });
+    window.__ndEndedHandler = () => { _ndOnSessionBoundary('song_end'); };
+    audio.addEventListener('ended', window.__ndEndedHandler);
+
+    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        if (window.__ndSongRestartHandler && typeof window.slopsmith.off === 'function') {
+            window.slopsmith.off('song:restart', window.__ndSongRestartHandler);
+        }
+        window.__ndSongRestartHandler = () => { _ndOnSessionBoundary('restart'); };
+        window.slopsmith.on('song:restart', window.__ndSongRestartHandler);
     }
+
     const clearBtn = document.getElementById('btn-loop-clear');
-    if (clearBtn && clearBtn.dataset.ndReviewWired !== '1') {
-        clearBtn.dataset.ndReviewWired = '1';
-        clearBtn.addEventListener('click', () => {
+    if (clearBtn) {
+        if (window.__ndLoopClearHandler) {
+            clearBtn.removeEventListener('click', window.__ndLoopClearHandler);
+        }
+        window.__ndLoopClearHandler = () => {
             // Slopsmith's own click handler nulls loopA/loopB synchronously
             // before any 'click' bubbles continue, so by the time we read
             // window.getActiveLoop() it returns null. Snapshot regardless —
             // _ndOnSessionBoundary skips when no notes were attempted.
             _ndOnSessionBoundary('loop_clear');
-        });
+        };
+        clearBtn.addEventListener('click', window.__ndLoopClearHandler);
     }
 }
 
@@ -12914,6 +12922,11 @@ setInterval(() => {
         _ndTroubleNotes = new Map();
         _ndPlaysCacheSongId = null;
         _ndLastSnapshotPlayId = null;
+        // Drill state is per-song. Switching songs resets it so a leftover
+        // _ndDrillActive=true from the previous song doesn't suppress
+        // session-boundary events here.
+        _ndDrillActive = false;
+        _ndDrillSectionName = null;
         await origPlaySong(filename, arrangement);
         _ndInjectButton();
         _ndAttachAutoDetectListener();
