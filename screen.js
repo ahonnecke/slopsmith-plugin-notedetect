@@ -5950,9 +5950,12 @@ async function _ndShowCoachingReview({ playId, source }) {
         : '—';
     const combinedColor = _ndScoreColor(summary.combinedWeightedScore);
 
-    // Sort sections by combined score ascending (worst first); skip empties.
+    // Sort sections by combined score ascending (worst first); skip empties
+    // and the synthetic "(unsectioned)" bucket — those notes have no real
+    // chart section to drill back into (older plays predate sectionName
+    // tagging) and clicking Drill on them no-ops with a warning.
     const trouble = [...perSection.entries()]
-        .filter(([_, row]) => row.total > 0)
+        .filter(([name, row]) => row.total > 0 && name !== '(unsectioned)')
         .map(([name, row]) => ({ name, row, score: row.weighted / row.max }))
         .sort((a, b) => a.score - b.score);
 
@@ -6224,19 +6227,45 @@ async function _ndFetchMostRecentDrillPlayId() {
 // distinguish them from full song-pass plays.
 function _ndStartDrill(sectionName) {
     const sections = (highway.getSections && highway.getSections()) || [];
+    console.log(`[note_detect] _ndStartDrill("${sectionName}") — ${sections.length} sections:`,
+        sections.map(s => `${s.name}@${s.time?.toFixed?.(1) ?? s.time}`).join(', '));
     if (!sections.length) {
-        console.warn('[note_detect] _ndStartDrill: no sections available');
+        console.warn('[note_detect] _ndStartDrill: no sections available — aborting');
         return;
     }
     const idx = sections.findIndex(s => s.name === sectionName);
     if (idx === -1) {
-        console.warn(`[note_detect] _ndStartDrill: section "${sectionName}" not found`);
+        console.warn(`[note_detect] _ndStartDrill: section "${sectionName}" not in chart — aborting (likely "(unsectioned)" bucket; nothing to drill)`);
         return;
     }
     const songInfo = (highway.getSongInfo && highway.getSongInfo()) || {};
-    const totalDuration = songInfo.duration || 600;
-    const start = sections[idx].time || 0;
-    const end = idx + 1 < sections.length ? (sections[idx + 1].time || totalDuration) : totalDuration;
+    // Guard the totalDuration fallback: the previous default (600) was a
+    // silent landmine. If the song is missing duration AND we're on the
+    // last section, end-of-loop fell to 600s which read as "loop the
+    // whole song" because the actual song ended before reaching loopB.
+    // Fall back to audio.duration via the host element instead, which is
+    // always populated once the song is playable.
+    const audio = document.getElementById('audio');
+    const totalDuration = songInfo.duration
+        || (audio && Number.isFinite(audio.duration) ? audio.duration : null);
+    if (!totalDuration) {
+        console.warn('[note_detect] _ndStartDrill: no song duration available — aborting');
+        return;
+    }
+    const sec = sections[idx];
+    const next = sections[idx + 1];
+    const startRaw = typeof sec.time === 'number' ? sec.time : null;
+    const endRaw = next && typeof next.time === 'number' ? next.time : totalDuration;
+    if (startRaw === null) {
+        console.warn(`[note_detect] _ndStartDrill: section "${sectionName}" has no time field — aborting`);
+        return;
+    }
+    const start = Math.max(0, startRaw);
+    const end = endRaw;
+    if (end - start < 0.5) {
+        console.warn(`[note_detect] _ndStartDrill: section "${sectionName}" is too short (${(end - start).toFixed(2)}s) — aborting`);
+        return;
+    }
 
     _ndDrillActive = true;
     _ndDrillSectionName = sectionName;
@@ -6254,7 +6283,7 @@ function _ndStartDrill(sectionName) {
 
     if (!_ndEnabled) _ndToggle();  // fire-and-forget; _ndStartAudio is async
 
-    console.log(`[note_detect] Drill "${sectionName}" ${start.toFixed(1)}–${end.toFixed(1)}s`);
+    console.log(`[note_detect] Drill "${sectionName}" ${start.toFixed(1)}–${end.toFixed(1)}s (${(end - start).toFixed(1)}s long, idx=${idx}/${sections.length})`);
 }
 
 function _ndUpdateHUD() {
