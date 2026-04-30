@@ -4737,6 +4737,7 @@ function _ndMatchNotes(tOverride) {
         s: cn.s,
         f: cn.f,
         chartT: cn.t,
+        sectionName: _ndCurrentSection,
     });
     _ndHits++;
     _ndStreak++;
@@ -5201,6 +5202,7 @@ function _ndCheckMisses() {
                 s,
                 f,
                 chartT: noteTime,
+                sectionName: _ndCurrentSection,
                 // Flag distinguishes "user didn't pluck / onset didn't fire"
                 // from "user plucked, but the matcher gave the onset to a
                 // same-pitch sibling chart note instead of this one." The
