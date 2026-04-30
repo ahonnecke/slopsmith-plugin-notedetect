@@ -5956,26 +5956,37 @@ const _ND_REVIEW_SOURCE_LABELS = {
     detect_off: 'Detect off',
 };
 
-// Sliding-window miss-cluster finder for a single play's noteResults.
-// Sister to _ndSuggestLoops (which works across plays for the report
-// panel). Output is cluster windows with start/end seconds, miss counts,
-// dominant failure modes, and the notes inside — ready to drive the
-// review modal's Drill buttons. Cluster ranges respect chart sparsity:
-// they're always tight even when chart sections are coarse (e.g.,
-// the Gasoline CDLC has 2 sections for a 3:46 song).
+// Sliding-window cluster finder for a single play's noteResults. Picks
+// dense pockets of OFF-TARGET notes — anything that isn't a clean HIT,
+// so timing-sloppy plays (HIT with EARLY/LATE label) cluster too even
+// though they're hits. A user with 100% pitch but consistently late
+// timing should see clusters; the previous miss-only algorithm reported
+// "no trouble clusters" on those plays, which is wrong because there's
+// clearly something to drill.
+//
+// `cluster.misses` keeps the legacy field name to minimize churn at
+// callsites; semantically it now means "off-target note count in this
+// window" (HIT-with-label + DIRTY_HIT + true MISS). Severity differs
+// across those — _ndAnalyzeCluster reads the underlying notes and
+// produces a focus statement that distinguishes timing-slop from
+// pitch-error from no-detection.
 function _ndFindMissClusters(noteResults, opts = {}) {
     const {
-        windowSec = 6,           // tight enough to drill, wide enough to context
+        windowSec = 6,
         slideSec = 0.5,
-        minMissCount = 2,        // skip noise (single one-off miss)
+        minOffTarget = 2,        // 2+ off-target notes in a 6s window
         maxClusters = 8,
-        padHeadSec = 0.5,        // lead-in so the user can ramp up
+        padHeadSec = 0.5,
         padTailSec = 1.0,
-        minGapSec = 1.0,         // merge clusters within this gap
+        minGapSec = 1.0,
     } = opts;
     const judged = (noteResults || []).filter(r => r.primary !== 'IGNORED_DETECTOR_FAILURE');
     if (!judged.length) return [];
-    const isMiss = (r) => r.primary !== 'HIT' && r.primary !== 'DIRTY_HIT';
+    const isOffTarget = (r) => {
+        if (r.primary === 'DIRTY_HIT') return true;
+        if (r.primary === 'HIT') return (r.labels || []).length > 0;  // EARLY/LATE/SHARP/FLAT
+        return true;  // any kind of MISS
+    };
 
     let minT = Infinity, maxT = -Infinity;
     for (const r of judged) {
@@ -5986,17 +5997,14 @@ function _ndFindMissClusters(noteResults, opts = {}) {
     for (let start = minT; start <= maxT; start += slideSec) {
         const end = start + windowSec;
         const inWin = judged.filter(r => r.chartT >= start && r.chartT < end);
-        const misses = inWin.filter(isMiss).length;
-        if (misses >= minMissCount) {
-            candidates.push({ start, end, misses, total: inWin.length, notes: inWin });
+        const offTarget = inWin.filter(isOffTarget).length;
+        if (offTarget >= minOffTarget) {
+            candidates.push({ start, end, offTarget, total: inWin.length, notes: inWin });
         }
     }
     if (!candidates.length) return [];
-    candidates.sort((a, b) => b.misses - a.misses || a.start - b.start);
+    candidates.sort((a, b) => b.offTarget - a.offTarget || a.start - b.start);
 
-    // Greedy non-overlap pick. Two clusters are "overlapping" if their
-    // padded windows touch within minGapSec — prevents two adjacent
-    // drill targets that the user would just merge mentally.
     const selected = [];
     for (const c of candidates) {
         if (selected.length >= maxClusters) break;
@@ -6008,13 +6016,12 @@ function _ndFindMissClusters(noteResults, opts = {}) {
             startSecRaw: c.start, endSecRaw: c.end,
             startSec: Math.max(0, padA),
             endSec: padB,
-            misses: c.misses, total: c.total, notes: c.notes,
+            misses: c.offTarget,  // legacy field name; means off-target count
+            total: c.total,
+            notes: c.notes,
         });
     }
     selected.sort((a, b) => a.startSec - b.startSec);
-    // Attach coaching analysis (focus, goal, dominant mode, recommended
-    // speed) to each cluster so renderers and the drill HUD share one
-    // source of truth.
     for (const c of selected) c.analysis = _ndAnalyzeCluster(c);
     return selected;
 }
@@ -6210,7 +6217,7 @@ function _ndRenderClusterRow(cluster, idx) {
                         <span style="color:${info.color}">${analysis.focus}</span>
                     </div>
                     <div class="text-[11px] text-gray-500">
-                        ${cluster.misses} miss${cluster.misses === 1 ? '' : 'es'} in ${dur}s
+                        ${cluster.misses} off-target in ${dur}s
                         · ${cluster.total} note${cluster.total === 1 ? '' : 's'}
                         · goal: <span class="text-gray-300 font-medium">${goalPct}%</span>
                     </div>
@@ -6276,12 +6283,15 @@ async function _ndShowCoachingReview({ playId, source }) {
     // densest miss zones regardless of where chart sections fall.
     const clusters = _ndFindMissClusters(play.noteResults);
 
-    // Phase 2: pick the single most-actionable cluster as a top-of-modal
-    // "Top fix" callout. Coaching research is consistent: stat-dump-first
-    // layouts produce stat-dump-first thinking; recommendation-first
-    // layouts produce action. Score by miss-rate × cluster size so we
-    // prefer dense clusters over sparse ones, and big clusters over tiny
-    // ones, but neither alone.
+    // Phase 2 — pick the single most-actionable headline:
+    //   1. If there are clusters, prefer the densest (cluster-level fix)
+    //   2. Else fall back to the worst sub-score AXIS (global fix)
+    // Coaching research is consistent: stat-dump-first layouts produce
+    // stat-dump-first thinking; recommendation-first layouts produce
+    // action. A clean play with timing skew (user's "79% with no
+    // clusters" case) shouldn't show "no trouble clusters" alone — it
+    // should say "your timing was consistently off by Xms; here's what
+    // to do." That's the axis-level fallback.
     let topFix = null;
     if (clusters.length) {
         let bestScore = -1, bestIdx = -1;
@@ -6297,10 +6307,58 @@ async function _ndShowCoachingReview({ playId, source }) {
                 && _ND_FAILURE_MODE_INFO[cluster.analysis.dominantMode])
                 || { label: cluster.analysis.dominantMode, color: '#9ca3af', advice: null };
             topFix = {
+                kind: 'cluster',
                 idx: bestIdx,
                 cluster,
                 info,
                 timeStr: _ndFmtMmSs(cluster.startSec),
+            };
+        }
+    } else {
+        // No clusters — the playing was uniform. Pick the weakest
+        // sub-score axis and surface coaching advice on it. Pitch and
+        // coverage thresholds at 95% (those are usually high), timing
+        // threshold at 30ms median (that's a noticeable rhythmic drift).
+        const pitch = summary.pitchScore;
+        const cov = summary.coverage;
+        const timing = summary.timingMedianMs;
+        const candidates = [];
+        if (pitch != null && pitch < 0.95) {
+            candidates.push({
+                axis: 'Pitch',
+                severity: 1 - pitch,
+                focus: `Pitch was off on ${Math.round((1 - pitch) * 100)}% of detected notes`,
+                advice: 'Practice the fingering pattern silently first. Common causes: catching adjacent open strings, octave confusion on bass, or fret-buzz on heavily distorted signals.',
+            });
+        }
+        if (cov != null && cov < 0.95) {
+            candidates.push({
+                axis: 'Coverage',
+                severity: 1 - cov,
+                focus: `${Math.round((1 - cov) * 100)}% of notes produced no detection`,
+                advice: 'Pluck harder, or check your input gain. If the chart is dense (chords, fast runs), the detector may need more attack energy to fire onsets between sustains.',
+            });
+        }
+        if (timing != null && Math.abs(timing) >= 30) {
+            const dir = timing > 0 ? 'late' : 'early';
+            candidates.push({
+                axis: 'Timing',
+                severity: Math.min(1, Math.abs(timing) / 100),
+                focus: `Consistently ${dir} by ~${Math.abs(Math.round(timing))}ms across the song`,
+                advice: timing > 0
+                    ? 'Late skew is usually one of two things: either the A/V offset is uncalibrated (use [/] keys to nudge), or you are reacting to notes instead of anticipating them. Drill at 75% speed to internalize the rhythm.'
+                    : 'Early skew is usually A/V offset uncalibrated (use [/] keys to nudge). If it persists after calibration, you are anticipating ahead of the beat — drill with the click track on to lock the timing.',
+            });
+        }
+        if (candidates.length) {
+            candidates.sort((a, b) => b.severity - a.severity);
+            const c = candidates[0];
+            topFix = {
+                kind: 'axis',
+                axis: c.axis,
+                focus: c.focus,
+                info: { color: '#60a5fa', advice: c.advice },
+                timeStr: c.axis,
             };
         }
     }
@@ -6330,7 +6388,7 @@ async function _ndShowCoachingReview({ playId, source }) {
                 </div>
             </div>
 
-            ${topFix ? `
+            ${topFix ? (topFix.kind === 'cluster' ? `
             <button id="nd-review-topfix" data-jump-cluster="${topFix.idx}"
                     class="w-full text-left px-5 py-3 bg-gradient-to-r from-blue-900/30 to-transparent border-b border-blue-800/40 hover:from-blue-900/50 transition">
                 <div class="flex items-start gap-3">
@@ -6347,7 +6405,22 @@ async function _ndShowCoachingReview({ playId, source }) {
                     </div>
                     <div class="text-blue-400 text-xs shrink-0 mt-1">jump to ↓</div>
                 </div>
-            </button>` : ''}
+            </button>` : `
+            <div class="px-5 py-3 bg-gradient-to-r from-blue-900/30 to-transparent border-b border-blue-800/40">
+                <div class="flex items-start gap-3">
+                    <div class="text-2xl leading-none mt-0.5">🎯</div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${topFix.axis}</div>
+                        <div class="text-gray-100 text-sm font-medium mt-0.5">
+                            ${topFix.focus}
+                        </div>
+                        ${topFix.info.advice ? `
+                        <div class="text-gray-400 text-[12px] mt-1 leading-snug">
+                            ${topFix.info.advice}
+                        </div>` : ''}
+                    </div>
+                </div>
+            </div>`) : ''}
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
                 ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(summary.pitchScore))}
@@ -6396,13 +6469,15 @@ async function _ndShowCoachingReview({ playId, source }) {
     modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     document.addEventListener('keydown', escHandler);
 
-    // Top-fix headline — clicking it scrolls to the matching cluster row
-    // and highlights it briefly so the user can see WHY the recommendation
-    // landed there before deciding to drill.
+    // Top-fix headline — only the cluster-variant is clickable (it
+    // scrolls to and highlights the matching cluster row). The axis-
+    // variant is rendered as a static div with no jump target, so this
+    // listener simply doesn't bind and the div is informational only.
     const topFixBtn = modal.querySelector('#nd-review-topfix');
     if (topFixBtn) {
         topFixBtn.addEventListener('click', () => {
             const idx = parseInt(topFixBtn.getAttribute('data-jump-cluster'), 10);
+            if (!Number.isFinite(idx)) return;
             const target = modal.querySelector(`[data-drill-cluster="${idx}"]`);
             if (target) {
                 const row = target.closest('.bg-dark-700');
