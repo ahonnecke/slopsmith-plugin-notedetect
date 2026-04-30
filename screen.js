@@ -3657,9 +3657,20 @@ async function _ndStartAudio() {
                 echoCancellation: false,
                 noiseSuppression: false,
                 autoGainControl: false,
-                channelCount: 2,  // request stereo for channel selection
             }
         };
+        // Only force a 2-channel stream when the user has explicitly
+        // selected a non-mono channel (Left/Right of a multi-FX pedal
+        // sending dry/wet). Forcing channelCount:2 on a mono device —
+        // like the USB-Guitar Hercules adapter — makes PipeWire insert
+        // a mono→stereo upmix node which renegotiates the source's
+        // format. Any other consumer of that source (specifically the
+        // user's pactl module-loopback piping USB-guitar → speakers)
+        // gets corked during the renegotiation, which is the "Detect
+        // disables USB audio out" bug.
+        if (_ndSelectedChannel === 'left' || _ndSelectedChannel === 'right') {
+            constraints.audio.channelCount = 2;
+        }
         if (_ndSelectedDeviceId) {
             constraints.audio.deviceId = { exact: _ndSelectedDeviceId };
         }
