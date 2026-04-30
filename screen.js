@@ -5891,21 +5891,24 @@ function _ndResultWeight(r) {
     return 0;
 }
 
-// Walk _ndNoteResults once and produce the four numbers the UI cares about:
-//   combined  — coaching-weighted accuracy (0..1, clamped)
-//   pitchPct  — of detections, what fraction were the right pitch
-//   timingMedianMs / timingStdMs — over HITs only
-//   coverage  — fraction of chart notes that produced any detection at all
-// Plus raw hits/misses for backward compat with practice_journal payload.
-function _ndComputeScores() {
+// Single source of truth for play-level scoring math. Takes an iterable
+// of result objects (Map values OR Array elements — same shape) and
+// produces the four numbers the UI cares about plus raw counts. The
+// review modal calls this against play.noteResults from the SQLite
+// fetch; the live HUD calls it against _ndNoteResults; the snapshot
+// summary that gets persisted to the DB calls it too. All three paths
+// use the same function so the displayed score, the persisted score,
+// and the heatmap-derived per-section scores can never drift.
+function _ndScoresFromNotes(notes) {
     const W = _ND_SCORE_WEIGHTS;
     let weightedSum = 0, total = 0;
     let hitCount = 0, wrongPitchCount = 0;
-    let detectedCount = 0;          // HIT, DIRTY_HIT, or MISSED_WRONG_PITCH (player produced something)
+    let detectedCount = 0;
     const hitTimings = [];
 
-    for (const r of _ndNoteResults.values()) {
-        if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;  // not player's fault
+    for (const r of notes) {
+        if (!r) continue;
+        if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;
         total++;
         weightedSum += _ndResultWeight(r);
         if (r.primary === 'HIT' || r.primary === 'DIRTY_HIT') {
@@ -5941,6 +5944,12 @@ function _ndComputeScores() {
         combined, pitchPct, coverage, timingMedianMs, timingStdMs,
         total, hits: hitCount, misses: total - hitCount,
     };
+}
+
+// Live HUD path: scores against the in-flight _ndNoteResults Map.
+// Delegates so the math is identical to the modal/snapshot paths.
+function _ndComputeScores() {
+    return _ndScoresFromNotes(_ndNoteResults.values());
 }
 
 // ── Post-play coaching review modal ────────────────────────────────────
@@ -6182,9 +6191,10 @@ function _ndAnalyzeCluster(cluster) {
     // Goal: aim for an accuracy target on the next attempt. Use a
     // motivating-but-realistic target — at minimum 20 percentage points
     // above the current cluster accuracy, capped at 90% (perfection is
-    // not the practice goal; consistency is).
-    const currentAccuracy = cluster.total > 0
-        ? (cluster.total - cluster.misses) / cluster.total : 0;
+    // not the practice goal; consistency is). Uses the weighted combined
+    // score (same metric as the modal headline) so the goal the user
+    // chases matches the score the user sees rise as they drill.
+    const currentAccuracy = _ndScoresFromNotes(cluster.notes).combined;
     const goal = Math.min(0.9, Math.max(0.5, currentAccuracy + 0.2));
 
     return {
@@ -6195,8 +6205,12 @@ function _ndAnalyzeCluster(cluster) {
 }
 
 function _ndRenderClusterRow(cluster, idx) {
-    const accuracy = cluster.total > 0
-        ? Math.max(0, Math.min(1, (cluster.total - cluster.misses) / cluster.total)) : 0;
+    // Cluster accuracy uses the SAME weighted score as the modal headline,
+    // sub-score tiles, and section heatmap — so a 79% headline can't
+    // coexist with cluster rows showing 92% and confuse the user about
+    // which number is real.
+    const clusterScores = _ndScoresFromNotes(cluster.notes);
+    const accuracy = clusterScores.combined;
     const accColor = _ndScoreColor(accuracy);
     const analysis = cluster.analysis;
     const info = (typeof _ND_FAILURE_MODE_INFO === 'object' && _ND_FAILURE_MODE_INFO[analysis.dominantMode])
@@ -6264,17 +6278,27 @@ async function _ndShowCoachingReview({ playId, source }) {
     const sections = (highway.getSections && highway.getSections()) || [];
     const songInfo = highway.getSongInfo && highway.getSongInfo();
     const totalDuration = (songInfo && songInfo.duration) || 0;
+
+    // SINGLE SOURCE OF TRUTH for everything displayed in this modal.
+    // play.summary is the snapshot computed at write-time and persisted
+    // to the DB — fine for fast list views, but if scoring weights or
+    // coverage logic ever shift between snapshot and view, the summary
+    // and the recomputed clusters/heatmap would disagree. Derive every
+    // number here from play.noteResults via the same _ndScoresFromNotes
+    // function the live HUD and the snapshot writer use, so the headline
+    // score, the three sub-score tiles, the section heatmap, the
+    // clusters, and the axis-fallback advice all share one calculation.
+    const derived = _ndScoresFromNotes(play.noteResults || []);
     const perSection = _ndAggregateBySection(play.noteResults || [], sections);
 
-    const summary = play.summary || {};
-    const pitchPctText = summary.pitchScore != null
-        ? `${Math.round(summary.pitchScore * 100)}%` : '—';
-    const coverageText = summary.coverage != null
-        ? `${Math.round(summary.coverage * 100)}%` : '—';
-    const timingText = summary.timingMedianMs != null
-        ? `${Math.round(summary.timingMedianMs)} ±${Math.round(summary.timingStdMs || 0)}ms`
+    const pitchPctText = derived.pitchPct != null
+        ? `${Math.round(derived.pitchPct * 100)}%` : '—';
+    const coverageText = derived.coverage != null
+        ? `${Math.round(derived.coverage * 100)}%` : '—';
+    const timingText = derived.timingMedianMs != null
+        ? `${Math.round(derived.timingMedianMs)} ±${Math.round(derived.timingStdMs || 0)}ms`
         : '—';
-    const combinedColor = _ndScoreColor(summary.combinedWeightedScore);
+    const combinedColor = _ndScoreColor(derived.combined);
 
     // Trouble spots are miss-density clusters — NOT chart sections.
     // Reason: many CDLCs have very few sections (e.g., Gasoline has 2 for
@@ -6319,9 +6343,12 @@ async function _ndShowCoachingReview({ playId, source }) {
         // sub-score axis and surface coaching advice on it. Pitch and
         // coverage thresholds at 95% (those are usually high), timing
         // threshold at 30ms median (that's a noticeable rhythmic drift).
-        const pitch = summary.pitchScore;
-        const cov = summary.coverage;
-        const timing = summary.timingMedianMs;
+        // Reads from `derived` (recomputed live) NOT from the persisted
+        // summary, so the axis fallback always agrees with the sub-score
+        // tiles and the heatmap.
+        const pitch = derived.pitchPct;
+        const cov = derived.coverage;
+        const timing = derived.timingMedianMs;
         const candidates = [];
         if (pitch != null && pitch < 0.95) {
             candidates.push({
@@ -6381,7 +6408,7 @@ async function _ndShowCoachingReview({ playId, source }) {
                     <div class="text-right">
                         <div class="text-[10px] text-gray-500 uppercase tracking-wide">Score</div>
                         <div class="text-2xl font-bold leading-none" style="color:${combinedColor}">${
-                            summary.combinedWeightedScore != null ? Math.round(summary.combinedWeightedScore * 100) + '%' : '—'
+                            derived.total > 0 ? Math.round(derived.combined * 100) + '%' : '—'
                         }</div>
                     </div>
                     <button id="nd-review-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
@@ -6423,11 +6450,11 @@ async function _ndShowCoachingReview({ playId, source }) {
             </div>`) : ''}
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
-                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(summary.pitchScore))}
+                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct))}
                 ${_ndRenderSubScoreTile('Timing', timingText, _ndScoreColor(
-                    summary.timingMedianMs != null ? Math.max(0, 1 - Math.abs(summary.timingMedianMs) / 100) : null
+                    derived.timingMedianMs != null ? Math.max(0, 1 - Math.abs(derived.timingMedianMs) / 100) : null
                 ))}
-                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(summary.coverage))}
+                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage))}
             </div>
 
             ${sections.length ? `
