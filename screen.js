@@ -377,7 +377,16 @@
     window.slopsmith.notes = api;
 })();
 
-// ── Module-level shared state ──────────────────────────────────────────────
+// ── State ──────────────────────────────────────────────────────────────────
+let _ndEnabled = false;
+let _ndAudioCtx = null;
+let _ndStream = null;
+let _ndStreamSource = null;  // MediaStreamSource captured for explicit disconnect on stop
+let _ndAnalyser = null;
+let _ndWorklet = null;
+let _ndModel = null;       // CREPE TF model
+let _ndModelLoading = false;
+let _ndDetectionMethod = 'yin'; // 'crepe' or 'yin' — start with YIN (instant), user can switch
 
 // Settings
 let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
@@ -4114,6 +4123,7 @@ async function _ndStartAudio() {
         _ndLastAudioFrameAt = performance.now();
 
         const source = _ndAudioCtx.createMediaStreamSource(_ndStream);
+        _ndStreamSource = source;  // captured for explicit disconnect in _ndStopAudio
         const streamChannels = source.channelCount;
 
     // ── Audio pipeline ────────────────────────────────────────────────
@@ -4269,8 +4279,20 @@ function _ndStopAudio() {
     _ndStopLevelMeter();
     if (_ndDetectInterval) { clearInterval(_ndDetectInterval); _ndDetectInterval = null; }
     _ndPendingBuffer = null;
+    // Disconnect the WebAudio graph in pull-source order: source first
+    // (so the input stream stops being consumed), then the worklet (so
+    // the destination stops being driven). Explicit disconnect on the
+    // MediaStreamSource matters because some PipeWire/Firefox combos
+    // glitch the source's loopback consumers (the user's USB-guitar →
+    // speakers monitoring loop) when the input grab tears down at the
+    // same instant the AudioContext closes — splitting the teardown
+    // into discrete steps gives PipeWire a stable graph at each step.
+    if (_ndStreamSource) {
+        try { _ndStreamSource.disconnect(); } catch {}
+        _ndStreamSource = null;
+    }
     if (_ndWorklet) {
-        _ndWorklet.disconnect();
+        try { _ndWorklet.disconnect(); } catch {}
         _ndWorklet = null;
     }
     _ndLevelAnalyser = null;
@@ -4279,7 +4301,13 @@ function _ndStopAudio() {
         _ndStream = null;
     }
     if (_ndAudioCtx) {
-        _ndAudioCtx.close();
+        // close() returns a Promise; fire-and-forget is fine, but ignoring
+        // it left a window where PipeWire saw an in-flight close while
+        // Firefox was already grabbing the source again (user's reported
+        // detect/nodetect/detect/nodetect/detect cascade). We don't await
+        // here because callers don't, but the explicit graph disconnect
+        // above means the close has nothing left to drain.
+        _ndAudioCtx.close().catch(() => {});
         _ndAudioCtx = null;
     }
     _ndInputLevel = 0;
@@ -14363,6 +14391,46 @@ window.slopsmith.ndDiag = {
             note: 'fire window.slopsmith.emit("song:restart",{}) and watch for ONE [note_detect] session boundary line',
         };
         console.log('[nd-diag] countRestartFires:', out);
+        return out;
+    },
+
+    // Capture everything JS can see about the audio path right now. Pair
+    // with `pactl list sink-inputs && pactl list source-outputs` from a
+    // terminal at the same moment to correlate JS state with PipeWire
+    // state when the USB-output bug bites.
+    async audioPath() {
+        const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+        const audioInputs = devices.filter(d => d.kind === 'audioinput');
+        const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
+        const audio = document.getElementById('audio');
+        const tracks = _ndStream && _ndStream.getAudioTracks
+            ? _ndStream.getAudioTracks().map(t => ({
+                  label: t.label, readyState: t.readyState,
+                  muted: t.muted, enabled: t.enabled,
+                  settings: typeof t.getSettings === 'function' ? t.getSettings() : null,
+              }))
+            : [];
+        const out = {
+            ndEnabled: _ndEnabled,
+            ndSelectedDeviceId: typeof _ndSelectedDeviceId !== 'undefined' ? _ndSelectedDeviceId : null,
+            ndSelectedChannel: typeof _ndSelectedChannel !== 'undefined' ? _ndSelectedChannel : null,
+            ndAudioCtx: _ndAudioCtx ? {
+                state: _ndAudioCtx.state,
+                sampleRate: _ndAudioCtx.sampleRate,
+                baseLatency: _ndAudioCtx.baseLatency,
+                outputLatency: _ndAudioCtx.outputLatency,
+            } : null,
+            ndStreamTracks: tracks,
+            hostAudio: audio ? {
+                src: audio.src ? audio.src.slice(-80) : null,
+                paused: audio.paused, muted: audio.muted, volume: audio.volume,
+                readyState: audio.readyState, currentTime: audio.currentTime,
+            } : null,
+            audioInputs: audioInputs.map(d => ({ label: d.label, deviceId: d.deviceId.slice(0, 8) + '…' })),
+            audioOutputs: audioOutputs.map(d => ({ label: d.label, deviceId: d.deviceId.slice(0, 8) + '…' })),
+            instructions: 'In another terminal, run: pactl list sink-inputs && pactl list source-outputs',
+        };
+        console.log('[nd-diag] audioPath:', out);
         return out;
     },
 
