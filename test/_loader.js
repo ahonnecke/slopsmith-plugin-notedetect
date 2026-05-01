@@ -149,6 +149,7 @@ function loadDetectionCore() {
         aggregateBySection: sandbox._ndAggregateBySection,
         computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
         computeScoreDeltas: sandbox._ndComputeScoreDeltas,
+        findOverlappingPriorCluster: sandbox._ndFindOverlappingPriorCluster,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
         classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into

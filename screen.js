@@ -2519,11 +2519,22 @@ function _ndApplyStrictness(level) {
     if (panel) { panel.remove(); _ndShowSettings(); }
 }
 
-// Initial sync — load may have set _ndStrictness; apply that preset's perfect
-// thresholds so the labels match it from the start.
+// Initial sync — _ndLoadSettings ran above and may have loaded a stale
+// _ndPitchTolerance / _ndTimingTolerance from localStorage (e.g., easy
+// mode used to be 100¢ pitch and is now 200¢; saved settings still carry
+// 100¢ until something refreshes them). Treat the strictness preset as
+// the source of truth for a chosen strictness level — re-apply ALL of
+// its values now so preset changes propagate to existing users on next
+// page load. Per-session slider tweaks still work (they mutate the
+// _nd*Tolerance vars directly during play); they get overridden on the
+// next load, which matches user expectation that "easy mode" means the
+// current easy-mode values.
 (function () {
     const preset = _ND_STRICTNESS_PRESETS[_ndStrictness];
     if (preset) {
+        _ndPitchTolerance = preset.pitchTolerance;
+        _ndTimingTolerance = preset.timingTolerance;
+        _ndDirtyHitMaxOffRatio = preset.dirtyHitMaxOffRatio;
         _ndPerfectTimingMs = preset.perfectTimingMs;
         _ndPerfectPitchCent = preset.perfectPitchCent;
     }
@@ -5939,6 +5950,23 @@ function _ndComputeScoreDeltas(current, prior) {
     };
 }
 
+// Find the prior cluster whose time range overlaps a given current
+// cluster the most. Used by per-cluster delta badges: when the user
+// drills the same trouble spot they had last attempt, surface whether
+// they got better at it. Returns null when no prior cluster overlaps.
+// Pure / testable; no DOM access.
+function _ndFindOverlappingPriorCluster(current, priorClusters) {
+    if (!current || !priorClusters || !priorClusters.length) return null;
+    let best = null, bestOverlap = 0;
+    for (const prior of priorClusters) {
+        const start = Math.max(current.startSec, prior.startSec);
+        const end = Math.min(current.endSec, prior.endSec);
+        const overlap = end - start;
+        if (overlap > bestOverlap) { bestOverlap = overlap; best = prior; }
+    }
+    return bestOverlap > 0 ? best : null;
+}
+
 // Time-binned heatmap. Independent of chart section structure (CDLCs
 // with sparse sections — Gasoline has 2 for a 3:46 song — made the
 // section-based heatmap useless). Bins of fixed time width give
@@ -6248,6 +6276,7 @@ function _ndRenderClusterRow(cluster, idx) {
                 <div class="flex-1 min-w-0">
                     <div class="text-gray-200 text-sm font-medium">
                         <span style="color:${info.color}">${analysis.focus}</span>
+                        <span id="nd-cluster-delta-${idx}" class="ml-2 text-[11px]">&nbsp;</span>
                     </div>
                     <div class="text-[11px] text-gray-500">
                         ${cluster.misses} off-target in ${dur}s
@@ -6598,7 +6627,7 @@ async function _ndShowCoachingReview({ playId, source }) {
     // play OTHER than this one for the same song; compute deltas; patch
     // the slots above. Async so it doesn't block modal render — slots
     // start empty (&nbsp;) and populate when the fetch resolves.
-    _ndPatchImprovementDeltas(modal, play, derived).catch(e =>
+    _ndPatchImprovementDeltas(modal, play, derived, clusters).catch(e =>
         console.warn('[note_detect] delta patch failed:', e));
 }
 
@@ -6607,7 +6636,7 @@ async function _ndShowCoachingReview({ playId, source }) {
 // Drills are excluded because comparing a 7s drill loop to a 4-minute
 // full-song play is apples-to-oranges and would surface confusing
 // deltas like "+47% vs last attempt" when the only difference is scope.
-async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived) {
+async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, currentClusters) {
     if (!currentPlay || !currentPlay.songId) return;
     let prior = null;
     try {
@@ -6649,6 +6678,24 @@ async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived) {
             && typeof priorScores.timingMedianMs === 'number') {
         const tightenDelta = Math.abs(currentDerived.timingMedianMs) - Math.abs(priorScores.timingMedianMs);
         set('nd-delta-timing', _ndFmtDeltaBadge(tightenDelta, 'timing'));
+    }
+
+    // Per-cluster deltas: for each current cluster, find the most-
+    // overlapping prior cluster and surface "↑ +Xpp" next to its focus
+    // line if the user got better at the same trouble spot. Silent
+    // when no overlap (the trouble spot is new).
+    if (currentClusters && currentClusters.length) {
+        const priorClusters = _ndFindMissClusters(prior.noteResults || []);
+        for (let i = 0; i < currentClusters.length; i++) {
+            const cur = currentClusters[i];
+            const match = _ndFindOverlappingPriorCluster(cur, priorClusters);
+            if (!match) continue;
+            const curScore = _ndScoresFromNotes(cur.notes).combined;
+            const priorClusterScore = _ndScoresFromNotes(match.notes).combined;
+            const delta = curScore - priorClusterScore;
+            if (Math.abs(delta) < 0.005) continue;  // sub-1pp: don't bother
+            set(`nd-cluster-delta-${i}`, _ndFmtDeltaBadge(delta, 'pct'));
+        }
     }
 }
 

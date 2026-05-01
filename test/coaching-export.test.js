@@ -21,7 +21,7 @@ const { loadDetectionCore } = require('./_loader');
 const core = loadDetectionCore();
 const {
     exportCoachingAnalysis, scoresFromNotes, findMissClusters,
-    computeTimeHeatmap, computeScoreDeltas,
+    computeTimeHeatmap, computeScoreDeltas, findOverlappingPriorCluster,
 } = core;
 
 // ── Synthetic-note builders ───────────────────────────────────────────
@@ -276,6 +276,33 @@ test('improvement deltas: per-axis null when one side lacks data', () => {
     assert.equal(d.timing, null,
         'no timing on one side → timing delta is null, not NaN');
     assert.ok(d.combined != null, 'other axes still computed');
+});
+
+test('overlapping prior cluster: returns the most-overlapping match', () => {
+    const cur = { startSec: 10, endSec: 20 };
+    const priors = [
+        { startSec: 0, endSec: 5 },     // no overlap
+        { startSec: 12, endSec: 14 },   // 2s overlap
+        { startSec: 18, endSec: 25 },   // 2s overlap (ties)
+        { startSec: 11, endSec: 19 },   // 8s overlap — winner
+    ];
+    const match = findOverlappingPriorCluster(cur, priors);
+    assert.equal(match.startSec, 11, 'most-overlapping prior wins');
+});
+
+test('overlapping prior cluster: null when no overlap exists', () => {
+    const cur = { startSec: 50, endSec: 60 };
+    const priors = [
+        { startSec: 0, endSec: 10 },
+        { startSec: 70, endSec: 80 },
+    ];
+    assert.equal(findOverlappingPriorCluster(cur, priors), null);
+});
+
+test('overlapping prior cluster: handles empty / null inputs', () => {
+    assert.equal(findOverlappingPriorCluster(null, [{}]), null);
+    assert.equal(findOverlappingPriorCluster({ startSec: 0, endSec: 1 }, []), null);
+    assert.equal(findOverlappingPriorCluster({ startSec: 0, endSec: 1 }, null), null);
 });
 
 test('per-section accuracy reflects weighted score, not raw hit ratio', () => {
