@@ -99,6 +99,7 @@ function loadDetectionCore() {
         '_ndComputeTop3Prescriptions',
         '_ndChartHasNoteWithin',
         '_ndCalibFromHistory',
+        '_ndApplyStrictness',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
     if (missing.length) {
@@ -133,6 +134,7 @@ function loadDetectionCore() {
         computeTop3Prescriptions: sandbox._ndComputeTop3Prescriptions,
         chartHasNoteWithin: sandbox._ndChartHasNoteWithin,
         calibFromHistory: sandbox._ndCalibFromHistory,
+        applyStrictness: sandbox._ndApplyStrictness,
         aggregateTroubleAcrossPlays: sandbox._ndAggregateTroubleAcrossPlays,
         perNoteCoaching: sandbox._ndPerNoteCoaching,
         computeTimelineBins: sandbox._ndComputeTimelineBins,
@@ -150,6 +152,8 @@ function loadDetectionCore() {
         computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
         computeScoreDeltas: sandbox._ndComputeScoreDeltas,
         findOverlappingPriorCluster: sandbox._ndFindOverlappingPriorCluster,
+        isInDrillJudgment: sandbox._ndIsInDrillJudgment,
+        checkJudgmentRange: sandbox._ndCheckJudgmentRange,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
         classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into

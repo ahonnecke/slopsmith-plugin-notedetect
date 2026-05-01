@@ -22,6 +22,7 @@ const core = loadDetectionCore();
 const {
     exportCoachingAnalysis, scoresFromNotes, findMissClusters,
     computeTimeHeatmap, computeScoreDeltas, findOverlappingPriorCluster,
+    isInDrillJudgment, _sandbox,
 } = core;
 
 // ── Synthetic-note builders ───────────────────────────────────────────
@@ -89,8 +90,8 @@ test('uniform late timing: every HIT carries LATE label', () => {
     const a = exportCoachingAnalysis({ noteResults: notes }, opts);
 
     assert.equal(a.derived.hits, 50, 'all are still hits');
-    assert.equal(Math.round(a.derived.combined * 100), 85,
-        'HIT_TIMING_OFF caps the score at 85%');
+    assert.equal(a.derived.combined, 1.0,
+        'combined is simple HIT/total — labels do not reduce score');
     assert.equal(a.derived.timingMedianMs, 60);
     assert.ok(a.clusters.length > 0,
         'sloppy hits in a band should cluster (off-target density > threshold)');
@@ -203,23 +204,21 @@ test('time heatmap: bins span the full duration regardless of note distribution'
     assert.equal(bins[1].score, null, 'empty bin score is null (renders neutral)');
 });
 
-test('time heatmap: per-bin score uses the same weighted calc as headline', () => {
+test('time heatmap: per-bin score is simple HIT/total ratio', () => {
     // Bin 1 (0–5s): all clean → 100%
-    // Bin 2 (5–10s): all LATE → 85%
-    // Bin 3 (10–15s): mix of clean + miss → some intermediate
+    // Bin 2 (5–10s): all LATE-labeled HITs → 100% (labels don't subtract)
+    // Bin 3 (10–15s): 2 HIT + 2 miss = 50%
     const notes = [
         ...Array.from({ length: 4 }, (_, i) => hit(i + 0.5)),
         ...Array.from({ length: 4 }, (_, i) => lateHit(5 + i, 50)),
         hit(11), hit(12), miss(13, 'MISSED_NO_DETECTION'), miss(14, 'MISSED_NO_DETECTION'),
     ];
     const bins = computeTimeHeatmap(notes, 15, 5);
-    assert.equal(Math.round(bins[0].score * 100), 100,
-        'all-clean bin = 100%');
-    assert.equal(Math.round(bins[1].score * 100), 85,
-        'all-LATE bin = 85% (HIT_TIMING_OFF weight)');
-    // Bin 3: 2 hits (200) + 2 no-detect (-300) = -100, clamped to 0
-    assert.equal(bins[2].score, 0,
-        'half-miss bin clamps to 0% (combined formula floor)');
+    assert.equal(Math.round(bins[0].score * 100), 100, 'all-clean bin = 100%');
+    assert.equal(Math.round(bins[1].score * 100), 100,
+        'all-LATE-labeled HITs bin = 100% — labels do not reduce the simple ratio');
+    assert.equal(Math.round(bins[2].score * 100), 50,
+        'half-miss bin = 50% (2 HIT / 4 total)');
 });
 
 test('time heatmap: bin scores match scoresFromNotes over the same notes', () => {
@@ -252,14 +251,16 @@ test('exportCoachingAnalysis includes timeHeatmap', () => {
 });
 
 test('improvement deltas: positive when current beats prior', () => {
-    const prior = scoresFromNotes(Array.from({ length: 10 }, (_, i) => lateHit(i, 60)));
+    // Combined is now simple HIT/total. Both prior (10 LATE-labeled HITs)
+    // and current (10 clean HITs) score 100% under that formula, so
+    // combined delta = 0. Delta surfaces appear via the timing/pitch
+    // sub-axes (pitch is 100% on both, coverage is 100% on both).
+    const prior = scoresFromNotes(Array.from({ length: 5 }, (_, i) => hit(i))
+        .concat(Array.from({ length: 5 }, (_, i) => miss(5 + i, 'MISSED_NO_DETECTION'))));
     const current = scoresFromNotes(Array.from({ length: 10 }, (_, i) => hit(i)));
     const d = computeScoreDeltas(current, prior);
-    assert.equal(Math.round(d.combined * 100), 15,
-        'all-clean (1.0) vs all-LATE (0.85) = +15 percentage points');
-    assert.equal(d.pitch, 0,
-        'both attempts have 100% pitch — no change');
-    assert.equal(d.coverage, 0);
+    assert.equal(Math.round(d.combined * 100), 50,
+        'all-HIT (100%) vs half-miss (50%) = +50 percentage points');
 });
 
 test('improvement deltas: returns null when either play is empty', () => {
@@ -299,15 +300,46 @@ test('overlapping prior cluster: null when no overlap exists', () => {
     assert.equal(findOverlappingPriorCluster(cur, priors), null);
 });
 
+test('drill judgment range: passes everything when not active', () => {
+    const { checkJudgmentRange } = core;
+    assert.equal(checkJudgmentRange(0, false, 10, 20), true);
+    assert.equal(checkJudgmentRange(100, false, 10, 20), true);
+});
+
+test('drill judgment range: only [start, end) passes when active', () => {
+    const { checkJudgmentRange } = core;
+    assert.equal(checkJudgmentRange(5, true, 10, 16), false, 'before start (lead-in) gated');
+    assert.equal(checkJudgmentRange(9.999, true, 10, 16), false, 'just before start gated');
+    assert.equal(checkJudgmentRange(10, true, 10, 16), true, 'start inclusive');
+    assert.equal(checkJudgmentRange(13, true, 10, 16), true, 'mid passes');
+    assert.equal(checkJudgmentRange(15.999, true, 10, 16), true, 'just before end passes');
+    assert.equal(checkJudgmentRange(16, true, 10, 16), false, 'end exclusive');
+    assert.equal(checkJudgmentRange(20, true, 10, 16), false, 'after end gated');
+});
+
+test('drill judgment range: defensive when bounds missing', () => {
+    const { checkJudgmentRange } = core;
+    // If drill is somehow active without bounds, don't suppress every
+    // judgment — defensive default is "pass".
+    assert.equal(checkJudgmentRange(50, true, null, null), true);
+    assert.equal(checkJudgmentRange(50, true, 10, null), true);
+    assert.equal(checkJudgmentRange(50, true, null, 20), true);
+});
+
 test('overlapping prior cluster: handles empty / null inputs', () => {
     assert.equal(findOverlappingPriorCluster(null, [{}]), null);
     assert.equal(findOverlappingPriorCluster({ startSec: 0, endSec: 1 }, []), null);
     assert.equal(findOverlappingPriorCluster({ startSec: 0, endSec: 1 }, null), null);
 });
 
-test('per-section accuracy reflects weighted score, not raw hit ratio', () => {
-    // Section A: 10 hits, all clean → 100%
-    // Section B: 5 sloppy LATE hits → 85% (each hit counts 0.85 of a HIT_CLEAN)
+test('per-section accuracy is the simple HIT/total ratio', () => {
+    // Section A: 10 clean HITs → 100%
+    // Section B: 5 LATE-labeled HITs (still HITs) → 100%
+    // Sloppy timing/pitch labels stay HITs and don't subtract — the
+    // weighted formula that used to give B = 85% was replaced with
+    // simple accuracy when the dual-scoring confusion was collapsed
+    // (see _ndScoresFromNotes; was a 12pp HUD-vs-report mismatch in
+    // the live UI before the rewrite).
     const notes = [];
     for (let i = 0; i < 10; i++) notes.push(hit(i, { sectionName: 'A' }));
     for (let i = 0; i < 5; i++) notes.push(lateHit(20 + i, 50, { sectionName: 'B' }));
@@ -317,8 +349,7 @@ test('per-section accuracy reflects weighted score, not raw hit ratio', () => {
 
     const A = a.perSection.A;
     const B = a.perSection.B;
-    assert.equal(Math.round(A.accuracy * 100), 100,
-        'all-clean section reads 100%');
-    assert.equal(Math.round(B.accuracy * 100), 85,
-        'all-sloppy section reads 85%, matching HIT_TIMING_OFF weight');
+    assert.equal(Math.round(A.accuracy * 100), 100, 'all-clean section is 100%');
+    assert.equal(Math.round(B.accuracy * 100), 100,
+        'all-LATE-labeled HITs section is also 100% — labels do not reduce HIT count');
 });

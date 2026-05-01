@@ -389,16 +389,27 @@ let _ndModelLoading = false;
 let _ndDetectionMethod = 'yin'; // 'crepe' or 'yin' — start with YIN (instant), user can switch
 
 // Settings
-let _ndTimingTolerance = 0.150;  // seconds (wider default for real-world play)
-let _ndPitchTolerance = 50;      // cents
+// Initial values match the 'easy' strictness preset. The post-preset IIFE
+// re-applies these from _ND_STRICTNESS_PRESETS[_ndStrictness] anyway, but
+// keeping the initial literals in sync avoids mid-load reads against
+// stale defaults.
+let _ndTimingTolerance = 0.300;  // seconds — easy preset
+let _ndPitchTolerance = 200;     // cents — easy preset
 // Strictness: a single dial that bundles (pitchTol, timingTol, dirty-hit
 // policy) into three named presets. Off-target-frame ratio = fraction of
 // YIN frames in the hit window whose pitch didn't match expected. When
 // it crosses the dirty threshold, the HIT is downgraded to DIRTY_HIT
 // (e.g., open string ringing alongside the intended note). easy mode
 // disables the dirty check; strict mode trips on minor leakage.
-let _ndStrictness = 'default';     // 'easy' | 'default' | 'strict'
-let _ndDirtyHitMaxOffRatio = 0.5;  // off-target frames > this → DIRTY_HIT (default preset)
+// Default strictness is 'easy' — for instrument-via-mic capture where some
+// sustain bleed is unavoidable, the 'default' preset's 50¢/150ms is too
+// tight and produces user-unfriendly scores out of the box. 'easy' (200¢,
+// 300ms) is the realistic baseline; a user can opt up to 'default' or
+// 'strict' explicitly through the strictness UI when they want mastery
+// validation. (Was 'default' until 2026-05-01; legacy users who saved a
+// different strictness keep it via _ndLoadSettings.)
+let _ndStrictness = 'easy';        // 'rocksmith' | 'easy' | 'default' | 'strict'
+let _ndDirtyHitMaxOffRatio = 1.0;  // matches easy preset; rebound by _ndApplyStrictness
 let _ndInputGain = 1.0;
 let _ndSelectedDeviceId = '';
 let _ndSelectedChannel = 'mono'; // 'mono' | 'left' | 'right'
@@ -475,6 +486,13 @@ let _ndCurrentSection = null;
 // summary payload, so they must exist whether drill mode has been used or not.
 let _ndDrillActive = false;
 let _ndDrillSectionName = null;
+// Drill judgment window — the cluster's TRUE chart-time range. The
+// audio loop runs over a wider window (with a lead-in before judgeStart)
+// so the user has runway to anticipate the trouble spot, but only notes
+// inside [judgeStart, judgeEnd) actually count toward score.
+let _ndDrillJudgeStart = null;
+let _ndDrillJudgeEnd = null;
+const _ND_DRILL_LEAD_IN_SEC = 5;  // audio plays this far before judgment kicks in
 // Drill-HUD state (Phase 4). Populated by _ndStartDrillRange and
 // updated on each loop_restart so the HUD can show iteration count,
 // per-iteration score, best-so-far, and progress toward the goal.
@@ -509,23 +527,6 @@ let _ndEarly = 0, _ndLate = 0, _ndSharp = 0, _ndFlat = 0;
 // Set initially to default-preset values; _ndApplyStrictness rebinds them.
 let _ndPerfectTimingMs  = 50;
 let _ndPerfectPitchCent = 20;
-
-// Coaching-mode score weights. The user's headline complaint was that
-// "missing a note by 10 ms costs the same as playing the wrong string."
-// These weights split those cases: a HIT with timing/pitch labels still
-// gets ~85% of a clean HIT (it's still a hit, just sloppy), while a
-// MISS_WRONG_PITCH costs roughly 3× a baseline timing miss because it's
-// a categorically different error — wrong note, not wrong moment.
-// The combined score is sum(weight) / (total * HIT_CLEAN), clamped [0,1].
-const _ND_SCORE_WEIGHTS = {
-    HIT_CLEAN:        1.00,
-    HIT_TIMING_OFF:   0.85,   // HIT with EARLY/LATE label
-    HIT_PITCH_OFF:    0.85,   // HIT with SHARP/FLAT label
-    DIRTY_HIT:        0.60,   // HIT downgraded by hygiene (off-target frame ratio)
-    MISS_NO_DETECT:  -1.50,   // ~2× baseline — no pluck or onset never fired
-    MISS_WRONG_PITCH:-2.50,   // ~3× — the coaching headline
-    IGNORED_FAILURE:  0.00,   // detector fault, not player's — exclude from total
-};
 
 // Adaptive drift estimate. Real-world recordings (especially CDLC and
 // charts of live human performances) have rubato — the audio's note
@@ -1209,18 +1210,27 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0, micLat
     // audio run) before computing the median. timingError = real player
     // offset + mic_capture_latency; without this subtraction, prescriptions
     // fire on hardware delay the player can't act on.
+    const rawTimingErrors = [];
     const timingErrors = [];
     for (const p of plays) {
         for (const r of p.noteResults || []) {
             if ((r.primary === 'HIT' || r.primary === 'DIRTY_HIT')
                     && typeof r.timingError === 'number' && isFinite(r.timingError)) {
+                rawTimingErrors.push(r.timingError);
                 timingErrors.push(r.timingError - micLatencyMs);
             }
         }
     }
-    if (timingErrors.length >= 5) {
+    // Need a meaningful sample size before scolding the player about a
+    // systematic bias. Was 5 (a fraction of one play) which fired on
+    // single-play noise — user reported "consistently early" prescriptions
+    // they disagreed with. Bump to 30 — about a verse of bass — so the
+    // median represents real player behaviour, not noise.
+    if (timingErrors.length >= 30) {
         timingErrors.sort((a, b) => a - b);
+        rawTimingErrors.sort((a, b) => a - b);
         const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
+        const rawMedian = rawTimingErrors[Math.floor((rawTimingErrors.length - 1) * 0.5)];
         const absMedian = Math.abs(median);
         // Match the active strictness preset's "perfect" timing window
         // — don't issue a prescription for timings the strictness mode
@@ -1234,11 +1244,21 @@ function _ndComputeTop3Prescriptions(plays, songFilename, avOffsetMs = 0, micLat
             const action = median > 0
                 ? 'You\'re consistently behind the beat. Anticipate the click instead of waiting for the visual cue.'
                 : 'You\'re consistently ahead of the beat. Hold the upbeat for one extra moment before plucking.';
+            // Surface the math in the detail line so the user can
+            // sanity-check whether the prescription reflects real player
+            // behaviour or a calibration artifact. Without this, an
+            // overcalibrated mic latency reads as "you're playing wrong"
+            // when the calibration just wants tuning.
+            const detailParts = [`Median ${Math.round(median)}ms across ${timingErrors.length} hits`];
+            if (micLatencyMs > 0) {
+                detailParts.push(`raw ${Math.round(rawMedian)}ms − mic ${Math.round(micLatencyMs)}ms`);
+            } else {
+                detailParts.push(`mic latency uncalibrated — tune avOffset with [/] keys if this looks wrong`);
+            }
+            detailParts.push(`threshold ${Math.round(timingFloor)}ms (${_ndStrictness} preset)`);
             candidates.push({
                 text: `You\'re ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
-                detail: micLatencyMs > 0
-                    ? `Median across ${timingErrors.length} hits (mic latency ${Math.round(micLatencyMs)}ms subtracted)`
-                    : `Median across ${timingErrors.length} hits — calibrate mic latency for cleaner reading`,
+                detail: detailParts.join(' · '),
                 action: { kind: 'open_report', label: 'Open report', payload: { anchor: 'latency-stack' } },
                 score: absMedian * Math.min(timingErrors.length, 50) / 100,
                 signal: 'timing_bias',
@@ -2208,8 +2228,10 @@ function _ndSaveSettings() {
             deviceId: _ndSelectedDeviceId,
             channel: _ndSelectedChannel,
             method: _ndDetectionMethod,
-            timingTolerance: _ndTimingTolerance,
-            pitchTolerance: _ndPitchTolerance,
+            // pitchTolerance/timingTolerance no longer persisted — they're
+            // derived from `strictness` via _ND_STRICTNESS_PRESETS, applied
+            // by _ndApplyStrictness on click and by the post-preset IIFE
+            // on load.
             inputGain: _ndInputGain,
             latencyOffset: _ndDetectionLatencySec,
             silenceGate: _ndSilenceGate,
@@ -2232,8 +2254,11 @@ function _ndLoadSettings() {
         if (s.deviceId !== undefined) _ndSelectedDeviceId = s.deviceId;
         if (s.channel) _ndSelectedChannel = s.channel;
         if (s.method) _ndDetectionMethod = s.method;
-        if (s.timingTolerance !== undefined) _ndTimingTolerance = s.timingTolerance;
-        if (s.pitchTolerance !== undefined) _ndPitchTolerance = s.pitchTolerance;
+        // s.timingTolerance / s.pitchTolerance intentionally NOT loaded —
+        // tolerances are now driven by strictness preset only. Legacy
+        // saved values from before the collapse are read but ignored;
+        // the post-preset IIFE below will apply the strictness's preset
+        // values, overwriting whatever stale values were in memory.
         if (s.inputGain !== undefined) _ndInputGain = s.inputGain;
         if (s.latencyOffset !== undefined) {
             // Legacy field. The old calibration-wizard flow set this to ~500-
@@ -2519,16 +2544,18 @@ function _ndApplyStrictness(level) {
     if (panel) { panel.remove(); _ndShowSettings(); }
 }
 
-// Initial sync — _ndLoadSettings ran above and may have loaded a stale
-// _ndPitchTolerance / _ndTimingTolerance from localStorage (e.g., easy
-// mode used to be 100¢ pitch and is now 200¢; saved settings still carry
-// 100¢ until something refreshes them). Treat the strictness preset as
-// the source of truth for a chosen strictness level — re-apply ALL of
-// its values now so preset changes propagate to existing users on next
-// page load. Per-session slider tweaks still work (they mutate the
-// _nd*Tolerance vars directly during play); they get overridden on the
-// next load, which matches user expectation that "easy mode" means the
-// current easy-mode values.
+// Initial sync — strictness preset is now the single source of truth for
+// tolerances and label thresholds. _ndLoadSettings ignored any saved
+// pitchTolerance/timingTolerance (those fields are no longer persisted).
+// _ndStrictness was loaded if present, otherwise it stays at its default
+// initial value 'default'. Apply the preset's full set so the in-memory
+// tolerance vars match the user's chosen strictness from frame 0.
+//
+// Now safe to do: there's no slider UI writing custom tolerance values
+// to memory anymore (the standalone sliders were removed when the
+// scoring formula was unified). Earlier this same IIFE expansion broke
+// users who'd customized the slider away from the preset value, but
+// that path no longer exists.
 (function () {
     const preset = _ND_STRICTNESS_PRESETS[_ndStrictness];
     if (preset) {
@@ -4678,12 +4705,15 @@ function _ndMatchNotes(tOverride) {
 
     // Candidate notes sit within [tCenter - lateWindow, tCenter + earlyWindow]
     // around the detection-adjusted, drift-compensated chart time.
+    // _ndIsInDrillJudgment gates notes during a drill's lead-in (the
+    // user gets warm-up audio without scored judgments).
     if (notes && notes.length > 0) {
         const start = _ndBsearch(notes, tCenter - lateWindowSec);
         for (let i = start; i < notes.length; i++) {
             const n = notes[i];
             if (n.t > tCenter + earlyWindowSec) break;
             if (n.mt) continue; // skip muted notes
+            if (!_ndIsInDrillJudgment(n.t)) continue;
             candidateNotes.push({ s: n.s, f: n.f, t: n.t });
         }
     }
@@ -4692,6 +4722,7 @@ function _ndMatchNotes(tOverride) {
         for (let i = start; i < chords.length; i++) {
             const c = chords[i];
             if (c.t > tCenter + earlyWindowSec) break;
+            if (!_ndIsInDrillJudgment(c.t)) continue;
             for (const cn of (c.notes || [])) {
                 if (cn.mt) continue;
                 candidateNotes.push({ s: cn.s, f: cn.f, t: c.t });
@@ -5190,6 +5221,10 @@ function _ndCheckMisses() {
 
     const checkNote = (s, f, noteTime) => {
         if (noteTime > missDeadline) return; // not yet past window
+        // Drill lead-in: notes outside the cluster's true judgment range
+        // don't get a MISS verdict (they aren't getting a HIT either —
+        // matched in _ndMatchNotes via the same gate). Pure warm-up.
+        if (!_ndIsInDrillJudgment(noteTime)) return;
         const key = _ndNoteKey({ s, f }, noteTime);
         if (!_ndNoteResults.has(key)) {
             // Distinguish "pitch miss" (detection fired in window but pitch
@@ -5561,18 +5596,8 @@ function _ndShowSettings() {
                 title="Show the post-session report: most-missed notes ranked across the last 10 plays of this song.">View Report</button>
         </div>
         <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-            <strong>Note:</strong> after the onset-gated matching change, the pipeline scores at the acoustic attack transient, not at the stable-MIDI vote. Latency-slider and Calibration Wizard are dead weight on that path — disabled until the dials are re-scoped. Pitch/timing tolerance sliders below still do what they always did.
+            <strong>Note:</strong> after the onset-gated matching change, the pipeline scores at the acoustic attack transient, not at the stable-MIDI vote. Latency-slider and Calibration Wizard are dead weight on that path — disabled until the dials are re-scoped. Pitch and timing tolerances are now driven by the strictness preset (Rocksmith / Easy / Default / Strict) — pick a strictness, the tolerances follow. The standalone tolerance sliders are gone.
         </div>
-
-        <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span id="nd-timing-val">${Math.round(_ndTimingTolerance * 1000)}</span>ms</label>
-        <input type="range" min="30" max="300" value="${Math.round(_ndTimingTolerance * 1000)}"
-               class="w-full accent-green-400 mb-3"
-               oninput="_ndTimingTolerance=this.value/1000;document.getElementById('nd-timing-val').textContent=this.value;_ndSaveSettings()">
-
-        <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span id="nd-pitch-val">${_ndPitchTolerance}</span> cents</label>
-        <input type="range" min="10" max="100" value="${_ndPitchTolerance}"
-               class="w-full accent-green-400 mb-3"
-               oninput="_ndPitchTolerance=+this.value;document.getElementById('nd-pitch-val').textContent=this.value;_ndSaveSettings()">
 
         <label class="block text-gray-400 text-xs mb-1">Pitch Offset: <span id="nd-poffset-val">${_ndPitchOffset >= 0 ? '+' : ''}${_ndPitchOffset}</span> semitones</label>
         <input type="range" min="-5" max="5" value="${_ndPitchOffset}"
@@ -5768,26 +5793,6 @@ function _ndStopHUD() {
     _ndRemoveHUD();
 }
 
-// Per-result weight under the coaching-mode score model.
-// HITs with EARLY/LATE/SHARP/FLAT labels are still hits but capped at 85%
-// (partial credit for timing/pitch sloppiness within the tolerance window).
-// IGNORED_DETECTOR_FAILURE returns 0 and is also excluded from the total
-// at the call site so it doesn't pull the denominator.
-function _ndResultWeight(r) {
-    const W = _ND_SCORE_WEIGHTS;
-    if (r.primary === 'IGNORED_DETECTOR_FAILURE') return W.IGNORED_FAILURE;
-    if (r.primary === 'DIRTY_HIT') return W.DIRTY_HIT;
-    if (r.primary === 'HIT') {
-        const labels = r.labels || [];
-        if (labels.includes('SHARP') || labels.includes('FLAT')) return W.HIT_PITCH_OFF;
-        if (labels.includes('LATE')  || labels.includes('EARLY')) return W.HIT_TIMING_OFF;
-        return W.HIT_CLEAN;
-    }
-    if (r.primary === 'MISSED_NO_DETECTION') return W.MISS_NO_DETECT;
-    if (r.primary === 'MISSED_WRONG_PITCH')  return W.MISS_WRONG_PITCH;
-    return 0;
-}
-
 // Single source of truth for play-level scoring math. Takes an iterable
 // of result objects (Map values OR Array elements — same shape) and
 // produces the four numbers the UI cares about plus raw counts. The
@@ -5797,8 +5802,7 @@ function _ndResultWeight(r) {
 // use the same function so the displayed score, the persisted score,
 // and the heatmap-derived per-section scores can never drift.
 function _ndScoresFromNotes(notes) {
-    const W = _ND_SCORE_WEIGHTS;
-    let weightedSum = 0, total = 0;
+    let total = 0;
     let hitCount = 0, wrongPitchCount = 0;
     let detectedCount = 0;
     const hitTimings = [];
@@ -5807,7 +5811,6 @@ function _ndScoresFromNotes(notes) {
         if (!r) continue;
         if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;
         total++;
-        weightedSum += _ndResultWeight(r);
         if (r.primary === 'HIT' || r.primary === 'DIRTY_HIT') {
             hitCount++;
             detectedCount++;
@@ -5818,9 +5821,16 @@ function _ndScoresFromNotes(notes) {
         }
     }
 
-    const maxPossible = total * W.HIT_CLEAN;
-    const combined = total === 0 ? 0
-        : Math.max(0, Math.min(1, weightedSum / maxPossible));
+    // Combined score is now simple HIT rate. The previous weighted formula
+    // (HIT × 0.85-1.0, MISS × −1.5 to −2.5, clamped to [0,1]) confused users
+    // because it diverged sharply from the highway markers and HUD: an
+    // 87% hit rate produced ~54% combined, a worse play crashed to 12%.
+    // Killing the negatives + label partial credit gets one number across
+    // HUD, summary modal, coaching review, drill iteration score, history
+    // graph, and section heatmap. Per-note labels (LATE/EARLY/SHARP/FLAT,
+    // DIRTY_HIT) still appear in the noteResults and downstream coaching
+    // text, just no longer as a separate top-level score.
+    const combined = total === 0 ? 0 : hitCount / total;
     const pitchDenom = hitCount + wrongPitchCount;
     const pitchPct = pitchDenom === 0 ? null : hitCount / pitchDenom;
     const coverage = total === 0 ? null : detectedCount / total;
@@ -5950,6 +5960,24 @@ function _ndComputeScoreDeltas(current, prior) {
     };
 }
 
+// Pure parameterized version — testable without mutating module state.
+// Returns true when a chartT should be judged given (active, start, end):
+//   - drill not active → always pass (normal judgment everywhere)
+//   - drill active but window unset → defensive pass
+//   - drill active with window → only chartT in [start, end) passes
+function _ndCheckJudgmentRange(chartT, active, start, end) {
+    if (!active) return true;
+    if (start == null || end == null) return true;
+    return chartT >= start && chartT < end;
+}
+
+// Module-state-bound wrapper used by _ndMatchNotes and _ndCheckMisses.
+// Notes during the drill lead-in (loopStart .. judgeStart) get neither
+// HIT nor MISS verdicts — they're just warm-up audio.
+function _ndIsInDrillJudgment(chartT) {
+    return _ndCheckJudgmentRange(chartT, _ndDrillActive, _ndDrillJudgeStart, _ndDrillJudgeEnd);
+}
+
 // Find the prior cluster whose time range overlaps a given current
 // cluster the most. Used by per-cluster delta badges: when the user
 // drills the same trouble spot they had last attempt, surface whether
@@ -6010,7 +6038,7 @@ function _ndAggregateBySection(noteResults, sections) {
     const ensure = (name) => {
         let row = byName.get(name);
         if (!row) {
-            row = { hits: 0, misses: 0, total: 0, weighted: 0, max: 0,
+            row = { hits: 0, misses: 0, total: 0,
                     failureModeCounts: new Map(), timingErrors: [] };
             byName.set(name, row);
         }
@@ -6024,8 +6052,6 @@ function _ndAggregateBySection(noteResults, sections) {
         const row = ensure(name);
         if (r.primary === 'IGNORED_DETECTOR_FAILURE') continue;
         row.total++;
-        row.weighted += _ndResultWeight(r);
-        row.max += _ND_SCORE_WEIGHTS.HIT_CLEAN;
         if (r.primary === 'HIT' || r.primary === 'DIRTY_HIT') {
             row.hits++;
             if (typeof r.timingError === 'number') row.timingErrors.push(r.timingError);
@@ -6405,9 +6431,7 @@ function _ndExportCoachingAnalysis(play, opts = {}) {
             hits: row.hits,
             misses: row.misses,
             total: row.total,
-            weighted: row.weighted,
-            max: row.max,
-            accuracy: row.total > 0 ? Math.max(0, Math.min(1, row.weighted / row.max)) : null,
+            accuracy: row.total > 0 ? row.hits / row.total : null,
         };
     }
 
@@ -6884,6 +6908,12 @@ function _ndStartDrillRange(startSec, endSec, label, opts = {}) {
     _ndDrillIterScores = [];
     _ndDrillBestScore = 0;
     _ndDrillGoalReached = false;
+    // Judgment window = the cluster's true range. The audio loop range
+    // (set on setActiveLoop below) extends this earlier by the lead-in
+    // so the user has runway, but score-affecting judgments only fire
+    // when chartT falls inside [judgeStart, judgeEnd).
+    _ndDrillJudgeStart = start;
+    _ndDrillJudgeEnd = end;
     _ndResetScoring();
 
     // Speed scaffolding: drilling at 75% locks in motor patterns when the
@@ -6897,15 +6927,21 @@ function _ndStartDrillRange(startSec, endSec, label, opts = {}) {
         _ndDrillSpeedMul = speedMul;
     }
 
+    // Audio loop extends the lead-in BEFORE the cluster start so the
+    // user gets ~5s of context to anticipate the trouble spot. Detection
+    // runs through the lead-in but judgment is gated above (see
+    // _ndIsInDrillJudgment).
+    const loopStart = Math.max(0, start - _ND_DRILL_LEAD_IN_SEC);
+    const loopEnd = end;
     if (typeof window.setActiveLoop === 'function') {
-        window.setActiveLoop(start, end);
+        window.setActiveLoop(loopStart, loopEnd);
     } else {
         console.warn('[note_detect] _ndStartDrillRange: window.setActiveLoop missing');
     }
     if (!_ndEnabled) _ndToggle();
 
     _ndShowDrillHud();
-    console.log(`[note_detect] Drill range "${label}" ${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (${(end - start).toFixed(1)}s long)`);
+    console.log(`[note_detect] Drill range "${label}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (lead-in ${(start - loopStart).toFixed(1)}s)`);
 }
 
 // ── Drill HUD (Phase 4) ────────────────────────────────────────────────
@@ -6993,6 +7029,8 @@ function _ndEndDrill() {
     _ndDrillSavedSpeed = null;
     _ndDrillSpeedMul = 1.0;
     _ndDrillGoalReached = false;
+    _ndDrillJudgeStart = null;
+    _ndDrillJudgeEnd = null;
 }
 
 // Called from _ndSnapshotPlay when reason==='loop_restart' during drill.
