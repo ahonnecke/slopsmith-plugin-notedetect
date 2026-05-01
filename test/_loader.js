@@ -148,6 +148,7 @@ function loadDetectionCore() {
         analyzeCluster: sandbox._ndAnalyzeCluster,
         aggregateBySection: sandbox._ndAggregateBySection,
         computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
+        computeScoreDeltas: sandbox._ndComputeScoreDeltas,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
         classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into

@@ -19,7 +19,10 @@ const assert = require('node:assert/strict');
 const { loadDetectionCore } = require('./_loader');
 
 const core = loadDetectionCore();
-const { exportCoachingAnalysis, scoresFromNotes, findMissClusters, computeTimeHeatmap } = core;
+const {
+    exportCoachingAnalysis, scoresFromNotes, findMissClusters,
+    computeTimeHeatmap, computeScoreDeltas,
+} = core;
 
 // ── Synthetic-note builders ───────────────────────────────────────────
 // Match the shape _ndShowCoachingReview / scoresFromNotes consume.
@@ -246,6 +249,33 @@ test('exportCoachingAnalysis includes timeHeatmap', () => {
         { sections, totalDuration: 60, heatmapBinSec: 10 });
     assert.ok(Array.isArray(a.timeHeatmap), 'timeHeatmap is in the output bundle');
     assert.equal(a.timeHeatmap.length, 6, '60s / 10s = 6 bins');
+});
+
+test('improvement deltas: positive when current beats prior', () => {
+    const prior = scoresFromNotes(Array.from({ length: 10 }, (_, i) => lateHit(i, 60)));
+    const current = scoresFromNotes(Array.from({ length: 10 }, (_, i) => hit(i)));
+    const d = computeScoreDeltas(current, prior);
+    assert.equal(Math.round(d.combined * 100), 15,
+        'all-clean (1.0) vs all-LATE (0.85) = +15 percentage points');
+    assert.equal(d.pitch, 0,
+        'both attempts have 100% pitch — no change');
+    assert.equal(d.coverage, 0);
+});
+
+test('improvement deltas: returns null when either play is empty', () => {
+    assert.equal(computeScoreDeltas(null, scoresFromNotes([hit(0)])), null);
+    assert.equal(computeScoreDeltas(scoresFromNotes([hit(0)]), null), null);
+});
+
+test('improvement deltas: per-axis null when one side lacks data', () => {
+    const noTiming = scoresFromNotes([
+        miss(1, 'MISSED_NO_DETECTION'),
+    ]);  // no HITs → no timing data
+    const withTiming = scoresFromNotes(Array.from({ length: 5 }, (_, i) => hit(i)));
+    const d = computeScoreDeltas(withTiming, noTiming);
+    assert.equal(d.timing, null,
+        'no timing on one side → timing delta is null, not NaN');
+    assert.ok(d.combined != null, 'other axes still computed');
 });
 
 test('per-section accuracy reflects weighted score, not raw hit ratio', () => {

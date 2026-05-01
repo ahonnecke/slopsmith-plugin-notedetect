@@ -2166,33 +2166,6 @@ const _ND_REATTACK_REFRACTORY_SEC = 0.200;
 // every pluck instead of dropping every other one to refractory.
 const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
 const _ND_FAST_REPEAT_LOOKAHEAD_SEC    = 0.250;
-// Spectral-flux supplemental onset gate (HFC = high-frequency content).
-// Bass attacks have a click in the 1–5 kHz band from finger/string contact
-// that's a pure transient — present at the attack moment, absent during
-// sustain. RMS-based gates miss attacks during sustain bleed because the
-// previous note's RMS is still high; HFC sees the click regardless. Used
-// as a SUPPLEMENT to RMS (only fires when RMS is in-note + refractory
-// passed + ratio gate didn't fire), so RMS handles silence→playing in its
-// strong regime and HFC plugs the sustain-bleed hole.
-//
-// Validated via test/spectral-flux-sim.js on Gasoline (the fixture where
-// the sim's matcher matches live to within 2.4pp; cross-fixture sim is
-// unreliable due to drift compensation and tier-2 selection differences
-// between sim and live's _ndMatchNotes).
-//
-// K sweep on Gasoline (RMS baseline 267 HIT / 89.3%):
-//   K=6  → 271 HIT (+4), 22 WRONG_PITCH (-3), 381 fires (+136)
-//   K=10 → 272 HIT (+5), 21 WRONG_PITCH (-4), 338 fires (+93)   ← sweet spot
-//   K=12 → 271 HIT (+4), 22 WRONG_PITCH (-3), 324 fires (+79)
-//   K=20 → 267 HIT (0),  25 WRONG_PITCH (0),  291 fires (+46)
-//
-// K=10 picked: same recovery as lower K with 31% fewer extra fires.
-// Below K=8 false-fire rate balloons without recovering more chart
-// notes. Above K=12 we lose the recovery entirely.
-const _ND_HFC_K = 10;                 // adaptive threshold = K × rolling median
-const _ND_HFC_REFRACTORY_SEC = 0.250; // stricter than baseline 200ms
-const _ND_HFC_MEDIAN_WINDOW = 23;     // ~23 chunks × 43ms ≈ 1s rolling history
-const _ND_HFC_MIN_FLUX = 0.01;        // absolute floor; suppresses fires on silence
 const _ND_REATTACK_MIN_LEVEL = 0.04;
 const _ND_REATTACK_WINDOW = 4;
 // Release-before-retrigger: after any onset fires, another re-attack can't
@@ -2224,14 +2197,6 @@ let _ndInNote = false;                // are we currently inside a detected note
 let _ndPendingOnsetChartT = null;     // chart time of the most recent onset, cleared when consumed by _ndMatchNotes
 let _ndLastOnsetPerfNow = 0;          // performance.now()/1000 of the last onset (for refractory)
 let _ndReattackRmsBuf = [];           // running RMS window for the re-attack detector
-// HFC supplemental gate state. _ndHfcPrevMag holds the previous chunk's
-// magnitude spectrum for the frame-to-frame difference; _ndHfcRecentFlux
-// is the rolling history used to compute the adaptive threshold.
-let _ndHfcPrevMag = null;
-let _ndHfcRecentFlux = [];
-let _ndHfcHann = null;                // lazy-initialized when frame size is known
-let _ndHfcScratchRe = null;
-let _ndHfcScratchIm = null;
 
 // ── localStorage Persistence ──────────────────────────────────────────────
 
@@ -2491,9 +2456,17 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 //               by absorbing the ~13% PIPELINE_YIN_DISAGREES bucket
 //               without changing what the player did. Use when the
 //               pipeline is misreading clean playing.
-//   easy     — Rocksmith-ish but with real pitch matching at 100¢.
-//              Catches gross fretting errors (>1 semitone), accepts
-//              YIN minor-third confusion.
+//   easy     — Pitch tolerance 200¢ (±2 semitones). Sustain-bleed analysis
+//              (test/spectral-flux-sim.js WRONG_PITCH autopsy on
+//              Gasoline) showed 67% of WRONG_PITCH cases are YIN locking
+//              on a recently-played chart pitch — the previous bass
+//              string is still ringing when the new note is plucked, so
+//              YIN reads the old fundamental at high confidence. Bumping
+//              from 100¢ to 200¢ absorbs all ±2-semitone bleed errors;
+//              200→300¢ doesn't help further because remaining errors
+//              are ≥5 semitones (different bass strings ringing).
+//              +15 HIT on Gasoline sim vs 100¢. Cost: real ±2-semitone
+//              wrong-fret errors get accepted as HIT.
 //   default  — 50¢ pitch / 150ms timing, dirty trips at 50% off-target.
 //   strict   — 25¢ / 100ms, dirty trips at 30% off-target. Mastery
 //              validation, surfaces every hygiene leak.
@@ -2504,7 +2477,7 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 // fine. perfectTimingMs is roughly window/3 — the "core" of each window.
 const _ND_STRICTNESS_PRESETS = {
     rocksmith: { pitchTolerance: 2400, timingTolerance: 0.400, dirtyHitMaxOffRatio: 1.0, perfectTimingMs: 200, perfectPitchCent: 100 },
-    easy:      { pitchTolerance:  100, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0, perfectTimingMs: 100, perfectPitchCent:  50 },
+    easy:      { pitchTolerance:  200, timingTolerance: 0.300, dirtyHitMaxOffRatio: 1.0, perfectTimingMs: 100, perfectPitchCent: 100 },
     default:   { pitchTolerance:   50, timingTolerance: 0.150, dirtyHitMaxOffRatio: 0.5, perfectTimingMs:  50, perfectPitchCent:  20 },
     strict:    { pitchTolerance:   25, timingTolerance: 0.100, dirtyHitMaxOffRatio: 0.3, perfectTimingMs:  25, perfectPitchCent:  10 },
 };
@@ -2555,81 +2528,6 @@ function _ndApplyStrictness(level) {
         _ndPerfectPitchCent = preset.perfectPitchCent;
     }
 })();
-
-// ── Spectral-flux primitives (HFC supplemental onset) ─────────────────────
-// In-place radix-2 Cooley-Tukey FFT. re[] and im[] must be length 2^k.
-// Used by the HFC supplemental onset gate; not on YIN's path.
-function _ndFftInPlace(re, im) {
-    const n = re.length;
-    for (let i = 1, j = 0; i < n; i++) {
-        let bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            const tr = re[i]; re[i] = re[j]; re[j] = tr;
-            const ti = im[i]; im[i] = im[j]; im[j] = ti;
-        }
-    }
-    for (let size = 2; size <= n; size <<= 1) {
-        const half = size >> 1;
-        const phaseStep = -2 * Math.PI / size;
-        for (let i = 0; i < n; i += size) {
-            for (let k = 0; k < half; k++) {
-                const phase = phaseStep * k;
-                const wRe = Math.cos(phase);
-                const wIm = Math.sin(phase);
-                const a = i + k;
-                const b = a + half;
-                const tRe = wRe * re[b] - wIm * im[b];
-                const tIm = wRe * im[b] + wIm * re[b];
-                re[b] = re[a] - tRe; im[b] = im[a] - tIm;
-                re[a] = re[a] + tRe; im[a] = im[a] + tIm;
-            }
-        }
-    }
-}
-
-// Lazy-init Hann window + FFT scratch buffers sized to the audio chunk.
-// First call costs O(n) for the window; subsequent calls reuse buffers.
-function _ndHfcEnsureBuffers(n) {
-    if (_ndHfcHann && _ndHfcHann.length === n) return;
-    _ndHfcHann = new Float32Array(n);
-    for (let i = 0; i < n; i++) _ndHfcHann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
-    _ndHfcScratchRe = new Float32Array(n);
-    _ndHfcScratchIm = new Float32Array(n);
-}
-
-// HFC flux for the current chunk vs the previous chunk's spectrum.
-// Returns { flux, mag } — caller stores mag for next call's diff.
-function _ndHfcComputeFlux(input) {
-    _ndHfcEnsureBuffers(input.length);
-    for (let i = 0; i < input.length; i++) {
-        _ndHfcScratchRe[i] = input[i] * _ndHfcHann[i];
-        _ndHfcScratchIm[i] = 0;
-    }
-    _ndFftInPlace(_ndHfcScratchRe, _ndHfcScratchIm);
-    const half = (input.length >> 1) + 1;
-    const mag = new Float32Array(half);
-    for (let k = 0; k < half; k++) {
-        mag[k] = Math.sqrt(_ndHfcScratchRe[k] * _ndHfcScratchRe[k]
-                         + _ndHfcScratchIm[k] * _ndHfcScratchIm[k]) / input.length;
-    }
-    let flux = 0;
-    if (_ndHfcPrevMag && _ndHfcPrevMag.length === half) {
-        for (let k = 1; k < half; k++) {  // skip DC bin
-            const d = mag[k] - _ndHfcPrevMag[k];
-            if (d > 0) flux += k * d;       // HFC weighting: higher bins matter more
-        }
-    }
-    return { flux, mag };
-}
-
-// Median of a small array. Used for HFC's adaptive threshold.
-function _ndMedian(arr) {
-    if (arr.length === 0) return 0;
-    const sorted = arr.slice().sort((a, b) => a - b);
-    return sorted[Math.floor((sorted.length - 1) * 0.5)];
-}
 
 // ── Pitch Detection: YIN ───────────────────────────────────────────────────
 // Lightweight monophonic pitch detector — works instantly, no model to load.
@@ -3574,14 +3472,6 @@ function _ndProcessAudioChunk(input) {
     // fresh pluck rather than body-peak noise from the ongoing note.
     if (rms < _ND_REATTACK_REARM_LEVEL) _ndReattackArmed = true;
 
-    // HFC flux — computed every chunk so prevMag and the rolling-history
-    // window track even when no onset fires. The flux value drives the
-    // Trigger 3 supplemental gate below.
-    const { flux: hfcFlux, mag: hfcMag } = _ndHfcComputeFlux(input);
-    _ndHfcPrevMag = hfcMag;
-    _ndHfcRecentFlux.push(hfcFlux);
-    if (_ndHfcRecentFlux.length > _ND_HFC_MEDIAN_WINDOW) _ndHfcRecentFlux.shift();
-
     let fireOnset = false;
     // Trigger 1: silence → playing (fresh note after a rest).
     if (rms > _ND_ONSET_LEVEL && !_ndInNote && refractoryOk) {
@@ -3602,20 +3492,6 @@ function _ndProcessAudioChunk(input) {
     // Exit — hysteresis gap prevents re-fire on sustain noise.
     else if (rms < _ND_ONSET_EXIT_LEVEL) {
         _ndInNote = false;
-    }
-
-    // Trigger 3: HFC supplemental — fires only when (a) RMS is in-note
-    // (we ARE in a sustained note), (b) Triggers 1 and 2 didn't fire
-    // (RMS gate couldn't see the attack), and (c) HFC flux exceeds
-    // K × rolling-median + an absolute floor. This is the sustain-bleed
-    // regime where previous-note RMS dominates the envelope but the new
-    // attack's high-frequency click is still a clean transient. Stricter
-    // refractory (250ms vs 200ms baseline) keeps HFC conservative.
-    if (!fireOnset && _ndInNote && refractoryOk
-        && (nowPerfSec - _ndLastOnsetPerfNow) > _ND_HFC_REFRACTORY_SEC
-        && hfcFlux >= _ND_HFC_MIN_FLUX) {
-        const med = _ndMedian(_ndHfcRecentFlux);
-        if (med > 0 && hfcFlux > med * _ND_HFC_K) fireOnset = true;
     }
 
     if (fireOnset) {
@@ -6045,6 +5921,24 @@ function _ndFindMissClusters(noteResults, opts = {}) {
     return selected;
 }
 
+// Compute deltas between current play's scores and a prior play's.
+// Pure, testable. Returns {combined, pitch, timing, coverage} as
+// signed numbers — null per-field when either side is missing data.
+//   combined / pitch / coverage: signed fractional delta (+0.08 means
+//                                "8 percentage points better")
+//   timing:                       signed ms delta (raw difference;
+//                                renderer interprets tighter=better)
+function _ndComputeScoreDeltas(current, prior) {
+    if (!current || !prior) return null;
+    const sub = (a, b) => (typeof a === 'number' && typeof b === 'number') ? a - b : null;
+    return {
+        combined: sub(current.combined, prior.combined),
+        pitch:    sub(current.pitchPct, prior.pitchPct),
+        timing:   sub(current.timingMedianMs, prior.timingMedianMs),
+        coverage: sub(current.coverage, prior.coverage),
+    };
+}
+
 // Time-binned heatmap. Independent of chart section structure (CDLCs
 // with sparse sections — Gasoline has 2 for a 3:46 song — made the
 // section-based heatmap useless). Bins of fixed time width give
@@ -6133,13 +6027,47 @@ function _ndScoreColor(pct) {
     return '#dc2626';                    // red
 }
 
-function _ndRenderSubScoreTile(label, valueText, color) {
+function _ndRenderSubScoreTile(label, valueText, color, deltaSlotId) {
+    // deltaSlotId is the id of an empty span the prior-play fetch can
+    // patch into. Render the slot empty initially so the modal opens
+    // immediately; the delta badge appears when the prior fetch resolves.
+    const deltaHtml = deltaSlotId
+        ? `<div id="${deltaSlotId}" class="text-[10px] mt-0.5 text-gray-500">&nbsp;</div>`
+        : '';
     return `
         <div class="bg-dark-700 border border-gray-700 rounded-lg px-4 py-3 text-center">
             <div class="text-gray-500 text-[11px] uppercase tracking-wide">${label}</div>
             <div class="text-2xl font-bold mt-1" style="color:${color}">${valueText}</div>
+            ${deltaHtml}
         </div>
     `;
+}
+
+// Format a sub-score delta into a colored badge. tighterIsBetter=true
+// for timing (negative ms = "tighter to chart" = good).
+function _ndFmtDeltaBadge(delta, axis) {
+    if (delta == null) return '<span class="text-gray-600">—</span>';
+    if (Math.abs(delta) < 0.0001 && axis !== 'timing') {
+        return '<span class="text-gray-500">no change</span>';
+    }
+    let text, better;
+    if (axis === 'timing') {
+        // Delta in ms. Better = closer to 0 (tighter). Compare absolute values.
+        // We can't infer "better" from just the delta — need both values.
+        // Caller should pass {delta: |current| - |prior|, axis: 'timing'}.
+        const sign = delta > 0 ? '+' : '';
+        text = `${sign}${Math.round(delta)}ms`;
+        better = delta < 0;  // less |timing| = tighter = better
+    } else {
+        const pp = Math.round(delta * 100);
+        if (pp === 0) return '<span class="text-gray-500">no change</span>';
+        const sign = pp > 0 ? '+' : '';
+        text = `${sign}${pp}pp`;
+        better = pp > 0;
+    }
+    const color = better ? '#10b981' : '#f97316';
+    const arrow = better ? '↑' : '↓';
+    return `<span style="color:${color}">${arrow} ${text}</span> vs last`;
 }
 
 // Time-binned heatmap renderer. Replaces the section-based heatmap
@@ -6517,6 +6445,7 @@ async function _ndShowCoachingReview({ playId, source }) {
                         <div class="text-2xl font-bold leading-none" style="color:${combinedColor}">${
                             derived.total > 0 ? Math.round(derived.combined * 100) + '%' : '—'
                         }</div>
+                        <div id="nd-delta-combined" class="text-[10px] mt-0.5 text-gray-500">&nbsp;</div>
                     </div>
                     <button id="nd-review-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
                 </div>
@@ -6549,11 +6478,11 @@ async function _ndShowCoachingReview({ playId, source }) {
             </div>`) : ''}
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
-                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct))}
+                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct), 'nd-delta-pitch')}
                 ${_ndRenderSubScoreTile('Timing', timingText, _ndScoreColor(
                     derived.timingMedianMs != null ? Math.max(0, 1 - Math.abs(derived.timingMedianMs) / 100) : null
-                ))}
-                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage))}
+                ), 'nd-delta-timing')}
+                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage), 'nd-delta-coverage')}
             </div>
 
             ${timeHeatmap.length ? `
@@ -6664,6 +6593,63 @@ async function _ndShowCoachingReview({ playId, source }) {
             arrow.textContent = '▸';
         }
     };
+
+    // Phase 3: improvement framing. Fetch the most-recent NON-DRILL
+    // play OTHER than this one for the same song; compute deltas; patch
+    // the slots above. Async so it doesn't block modal render — slots
+    // start empty (&nbsp;) and populate when the fetch resolves.
+    _ndPatchImprovementDeltas(modal, play, derived).catch(e =>
+        console.warn('[note_detect] delta patch failed:', e));
+}
+
+// Fetch the prior comparable play for this song and patch delta badges
+// into the modal. Comparable = same songId, NOT a drill, NOT this play.
+// Drills are excluded because comparing a 7s drill loop to a 4-minute
+// full-song play is apples-to-oranges and would surface confusing
+// deltas like "+47% vs last attempt" when the only difference is scope.
+async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived) {
+    if (!currentPlay || !currentPlay.songId) return;
+    let prior = null;
+    try {
+        const r = await fetch(
+            `/api/plugins/note_detect/plays?songId=${encodeURIComponent(currentPlay.songId)}&limit=10`
+        );
+        if (!r.ok) return;
+        const data = await r.json();
+        const plays = (data && data.plays) || [];
+        prior = plays.find(p =>
+            p && p.id !== currentPlay.id && !p.isDrill
+        );
+    } catch (e) {
+        console.warn('[note_detect] prior-play fetch failed:', e);
+        return;
+    }
+    if (!prior) return;  // first attempt — leave slots empty
+    const priorScores = _ndScoresFromNotes(prior.noteResults || []);
+    const deltas = _ndComputeScoreDeltas(currentDerived, priorScores);
+    if (!deltas) return;
+
+    const set = (id, html) => {
+        const el = modal.querySelector('#' + id);
+        if (el) el.innerHTML = html;
+    };
+    // Combined: render as percentage-point delta with arrow + color.
+    set('nd-delta-combined',
+        deltas.combined != null
+            ? _ndFmtDeltaBadge(deltas.combined, 'pct')
+            : '<span class="text-gray-600">first attempt</span>');
+    set('nd-delta-pitch',
+        deltas.pitch != null ? _ndFmtDeltaBadge(deltas.pitch, 'pct') : '');
+    set('nd-delta-coverage',
+        deltas.coverage != null ? _ndFmtDeltaBadge(deltas.coverage, 'pct') : '');
+    // Timing delta needs the |abs| comparison — tighter is better
+    // regardless of sign. Pass the SIGNED absolute-magnitude delta so
+    // _ndFmtDeltaBadge's "less is better" interpretation works.
+    if (typeof currentDerived.timingMedianMs === 'number'
+            && typeof priorScores.timingMedianMs === 'number') {
+        const tightenDelta = Math.abs(currentDerived.timingMedianMs) - Math.abs(priorScores.timingMedianMs);
+        set('nd-delta-timing', _ndFmtDeltaBadge(tightenDelta, 'timing'));
+    }
 }
 
 async function _ndRenderReviewHistory(container, songId) {
