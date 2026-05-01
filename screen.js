@@ -5960,6 +5960,19 @@ function _ndComputeScoreDeltas(current, prior) {
     };
 }
 
+// Pure: does a (start, end) loop range duplicate any in `existingLoops`
+// within `tolSec` on both endpoints? Used by drill auto-save to avoid
+// piling identical loops into the user's saved-loops list each time
+// they re-drill the same trouble spot.
+function _ndIsDuplicateLoop(start, end, existingLoops, tolSec = 0.5) {
+    if (!existingLoops || !existingLoops.length) return false;
+    return existingLoops.some(l =>
+        typeof l.start === 'number' && typeof l.end === 'number'
+        && Math.abs(l.start - start) <= tolSec
+        && Math.abs(l.end - end) <= tolSec
+    );
+}
+
 // Pure parameterized version — testable without mutating module state.
 // Returns true when a chartT should be judged given (active, start, end):
 //   - drill not active → always pass (normal judgment everywhere)
@@ -6941,7 +6954,50 @@ function _ndStartDrillRange(startSec, endSec, label, opts = {}) {
     if (!_ndEnabled) _ndToggle();
 
     _ndShowDrillHud();
+    // Persist this drill loop into slopsmith's saved-loops list so the
+    // user can return to the same trouble spot later via the loop
+    // dropdown. De-duplicates within 0.5s on both endpoints so re-
+    // drilling the same cluster doesn't pile copies. Fire-and-forget;
+    // not waiting on the network keeps drill startup snappy.
+    _ndAutoSaveDrillLoop(loopStart, loopEnd).catch(e =>
+        console.warn('[note_detect] drill auto-save failed:', e));
     console.log(`[note_detect] Drill range "${label}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (lead-in ${(start - loopStart).toFixed(1)}s)`);
+}
+
+async function _ndAutoSaveDrillLoop(loopStart, loopEnd) {
+    const filename = window.currentFilename;
+    if (!filename) return;
+    const decoded = decodeURIComponent(filename);
+    let existing = [];
+    try {
+        const r = await fetch(`/api/loops?filename=${encodeURIComponent(decoded)}`);
+        if (r.ok) existing = await r.json();
+    } catch (e) {
+        console.warn('[note_detect] drill auto-save: GET /api/loops failed:', e);
+        // fall through — without existing list, we'll just save without dedup.
+    }
+    if (_ndIsDuplicateLoop(loopStart, loopEnd, existing)) {
+        console.log(`[note_detect] drill loop already saved: ${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s — skipping`);
+        return;
+    }
+    const name = `Drill: ${_ndFmtMmSs(loopStart)}–${_ndFmtMmSs(loopEnd)}`;
+    try {
+        await fetch('/api/loops', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: decoded, name, start: loopStart, end: loopEnd }),
+        });
+        // Refresh slopsmith's saved-loops <select> so the new drill
+        // loop shows up immediately. window.loadSavedLoops is defined
+        // by slopsmith's app.js; defensive check in case the host
+        // version lacks it.
+        if (typeof window.loadSavedLoops === 'function') {
+            try { await window.loadSavedLoops(); } catch {}
+        }
+        console.log(`[note_detect] drill loop saved: "${name}"`);
+    } catch (e) {
+        console.warn('[note_detect] drill loop save failed:', e);
+    }
 }
 
 // ── Drill HUD (Phase 4) ────────────────────────────────────────────────

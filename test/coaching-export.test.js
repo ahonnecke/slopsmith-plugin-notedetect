@@ -317,6 +317,39 @@ test('drill judgment range: only [start, end) passes when active', () => {
     assert.equal(checkJudgmentRange(20, true, 10, 16), false, 'after end gated');
 });
 
+test('isDuplicateLoop: matches within tolerance on both endpoints', () => {
+    const { isDuplicateLoop } = core;
+    const existing = [
+        { id: 1, name: 'Drill: 0:09–0:16', start: 9.4, end: 16.9 },
+        { id: 2, name: 'Drill: 0:37–0:45', start: 37.5, end: 45.0 },
+    ];
+    // Same-cluster re-drill: start/end shift slightly between attempts
+    // due to small data variance. 0.3s drift on each side should match.
+    assert.equal(isDuplicateLoop(9.5, 17.0, existing), true,
+        'within 0.5s tolerance both endpoints → duplicate');
+    assert.equal(isDuplicateLoop(9.4, 16.9, existing), true,
+        'exact match → duplicate');
+    assert.equal(isDuplicateLoop(20, 30, existing), false,
+        'unrelated range → not a duplicate');
+    assert.equal(isDuplicateLoop(9.4, 50, existing), false,
+        'start matches but end is way off → not a duplicate');
+});
+
+test('isDuplicateLoop: empty / null existing → no duplicates', () => {
+    const { isDuplicateLoop } = core;
+    assert.equal(isDuplicateLoop(10, 20, []), false);
+    assert.equal(isDuplicateLoop(10, 20, null), false);
+    assert.equal(isDuplicateLoop(10, 20, undefined), false);
+});
+
+test('isDuplicateLoop: tolerance is configurable', () => {
+    const { isDuplicateLoop } = core;
+    const existing = [{ start: 10, end: 20 }];
+    // 1.5s shift → outside default 0.5s but inside 2.0s
+    assert.equal(isDuplicateLoop(11.5, 21.5, existing, 0.5), false);
+    assert.equal(isDuplicateLoop(11.5, 21.5, existing, 2.0), true);
+});
+
 test('drill judgment range: defensive when bounds missing', () => {
     const { checkJudgmentRange } = core;
     // If drill is somehow active without bounds, don't suppress every

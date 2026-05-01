@@ -154,6 +154,7 @@ function loadDetectionCore() {
         findOverlappingPriorCluster: sandbox._ndFindOverlappingPriorCluster,
         isInDrillJudgment: sandbox._ndIsInDrillJudgment,
         checkJudgmentRange: sandbox._ndCheckJudgmentRange,
+        isDuplicateLoop: sandbox._ndIsDuplicateLoop,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
         classifyFailureMode: sandbox._ndClassifyFailureMode,
         // Expose the sandbox so tests can mock highway data + reach into
