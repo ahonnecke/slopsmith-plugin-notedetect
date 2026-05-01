@@ -8253,6 +8253,28 @@ function _ndRecordNowlineJudgment(s, f, judgment) {
     if (_ndNowlineJudgments.length > 20) _ndNowlineJudgments.shift();
 }
 
+// Drill-floor highlight (Phase C of the drill+saved-loops feature).
+// When the drill is active AND the current chart time is inside the
+// JUDGMENT window (not the lead-in), paint a subtle blue gradient on
+// the bottom ~30% of the highway. Lead-in has no overlay, so the
+// user sees a visual change exactly when the score-affecting part of
+// the loop begins. No-op when no drill is running.
+highway.addDrawHook(function(ctx, W, H) {
+    if (!_ndDrillActive) return;
+    if (_ndDrillJudgeStart == null || _ndDrillJudgeEnd == null) return;
+    const t = highway.getTime();
+    if (t < _ndDrillJudgeStart || t >= _ndDrillJudgeEnd) return;
+    const top = H * 0.7;
+    const grad = ctx.createLinearGradient(0, top, 0, H);
+    grad.addColorStop(0, 'rgba(96, 165, 250, 0)');
+    grad.addColorStop(0.5, 'rgba(96, 165, 250, 0.06)');
+    grad.addColorStop(1, 'rgba(96, 165, 250, 0.18)');
+    ctx.save();
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, top, W, H - top);
+    ctx.restore();
+});
+
 // 2D highway draw hook — uses project()/fretX() for accurate positioning.
 highway.addDrawHook(function(ctx, W, H) {
     if (!_ndEnabled) return;
