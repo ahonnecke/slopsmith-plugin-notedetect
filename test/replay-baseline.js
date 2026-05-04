@@ -39,7 +39,12 @@ const HEADED = args.includes('--headed');
 // Fixtures the server flagged as `excluded: true` (tuning mismatch
 // etc.) are skipped by default. --include-excluded opts in.
 const INCLUDE_EXCLUDED = args.includes('--include-excluded');
-const TIMEOUT_MS = 180_000;
+// Per-replay timeout. Fixtures are full-song recordings (2-4 minutes
+// at 1× playback) and testInjectWav waits playback + drain + miss
+// sweep, so the puppeteer protocol call routinely exceeds the
+// default 180s. 10 minutes covers the longest expected fixture
+// with headroom.
+const TIMEOUT_MS = 600_000;
 
 function globToRegex(pattern) {
     const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
@@ -102,6 +107,11 @@ function fmtCount(n) {
 
     const browser = await puppeteer.launch({
         headless: HEADED ? false : 'new',
+        // protocolTimeout is the upper bound on a single CDP call.
+        // page.evaluate(testInjectWav) is one CDP call that runs for
+        // the entire WAV's duration, so this MUST exceed the longest
+        // fixture's playback time + drain + sweep tail.
+        protocolTimeout: TIMEOUT_MS,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--autoplay-policy=no-user-gesture-required'],
     });
     const page = await browser.newPage();
