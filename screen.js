@@ -3800,6 +3800,13 @@ function createNoteDetector(options = {}) {
         panel.querySelector('.nd-gain-slider').oninput = (e) => {
             inputGain = e.target.value / 10;
             panel.querySelector('.nd-gain-val').textContent = inputGain.toFixed(1);
+            // Live-apply so the slider takes effect immediately without
+            // requiring a Detect off/on cycle. Without this the value
+            // is only picked up on the next gainNode = createGain() in
+            // startAudio, which makes "find the right gain" painful
+            // — common on attenuated input paths where you need to
+            // sweep the value while watching the input meter.
+            if (gainNode) gainNode.gain.value = inputGain;
             saveSettings();
         };
         panel.querySelector('.nd-chord-ratio-slider').oninput = (e) => {
