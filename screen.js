@@ -3588,66 +3588,61 @@ function createNoteDetector(options = {}) {
             byTime.get(tk).push(cn);
         }
 
-        // ── ML bridge: onset-driven single-note matching ──────────────────
-        // Each fresh onset claims the ONE nearest unmatched single-note chart
-        // note of its pitch. Previously every same-pitch candidate checked the
-        // onset set independently, so a single onset matched 2-4 same-pitch
-        // notes at once on dense passages — recording the extras as early
-        // misses. That one-onset-to-many bug was the dominant accuracy loss.
-        if (usingDesktopBridge && bridgeOnsetPrimed && bridgeNewOnsets.size > 0) {
-            const singles = [];
-            for (const [, group] of byTime) {
-                if (group.length !== 1) continue;
-                const cn = group[0];
-                const key = noteKey(cn, cn.t);
-                if (noteResults.has(key)) continue;
-                singles.push({
-                    cn, key, claimed: false,
-                    em: _ndMidiFromStringFret(cn.s, cn.f, currentArrangement,
-                        currentStringCount, tuningOffsets, capo),
-                });
-            }
-            for (const [midi, onset] of bridgeNewOnsets) {
-                let best = null, bestDist = Infinity;
-                for (const s of singles) {
-                    if (s.claimed) continue;
-                    let ok = (s.em === midi);
-                    if (!ok && (s.cn.b || s.cn.sl)) ok = Math.abs(s.em - midi) <= 2;
-                    if (!ok && s.cn.hm) ok = (midi === s.em + 12 || midi === s.em + 19);
-                    if (!ok) continue;
-                    const dist = Math.abs(s.cn.t - t);  // nearest to the playhead
-                    if (dist < bestDist) { bestDist = dist; best = s; }
-                }
-                if (best) {
-                    best.claimed = true;
-                    recordJudgment(best.key, makeMatchedJudgment(
-                        best.cn, best.cn.t, t, best.em, best.em, onset.conf,
-                        { pitchError: 0 }));
-                }
-            }
+        // ── Single-note pool: collect ALL pitch-passing candidates,
+        // then apply tier-2 selection (exact-pitch beats boundary-
+        // pitch; among ties pick nearest in time, drift-adjusted).
+        // Without this, when multiple chart notes share the matcher's
+        // candidate window, byTime iteration order picks an arbitrary
+        // one — frequently the boundary-pitch candidate over the
+        // exact one. That's the subtle quality regression the
+        // pre-port matcher fixed.
+        const pitchPassing = [];
+        for (const [, group] of byTime) {
+            if (group.length !== 1) continue;
+            if (detectedMidi < 0) continue;
+            const cn = group[0];
+            const key = noteKey(cn, cn.t);
+            if (noteResults.has(key)) continue;
+            const expectedMidi = _ndMidiFromStringFret(
+                cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
+            if (Math.abs(detectedCents) > centsTolerance) continue;
+            const timingErrorMs = (t - cn.t) * 1000;
+            pitchPassing.push({
+                cn, key, expectedMidi,
+                pitchError: detectedCents,
+                timingError: timingErrorMs,
+            });
         }
 
+        if (pitchPassing.length > 0) {
+            const EXACT_PITCH_CENTS = _ND_PRECISION_PITCH_CENTS;
+            // Prefer the precision-zone subset; fall back to all
+            // pitch-passing if none are in the precision zone.
+            const exactPitch = pitchPassing.filter(p => Math.abs(p.pitchError) < EXACT_PITCH_CENTS);
+            const pool = exactPitch.length > 0 ? exactPitch : pitchPassing;
+            // Sort by drift-adjusted timing distance: the chart note
+            // closest to where the player actually landed (not closest
+            // to the un-compensated chart-time clock) wins.
+            pool.sort((a, b) =>
+                Math.abs(a.timingError - driftEstimateMs)
+                - Math.abs(b.timingError - driftEstimateMs));
+            const winner = pool[0];
+            const judgment = makeMatchedJudgment(
+                winner.cn, winner.cn.t, t, winner.expectedMidi,
+                detectedMidi, detectedConfidence,
+                { pitchError: winner.pitchError }
+            );
+            recordJudgment(winner.key, judgment);
+        }
+
+        // Chord path: walks byTime independently. Tier-2 selection
+        // doesn't apply here — chord matching is per-time-group via
+        // _ndScoreChord, not detection-pool selection.
         for (const [, group] of byTime) {
             if (group.length === 1) {
-                // ML bridge single notes are matched by the onset-driven pass
-                // above; here, only the web / downlevel monophonic path.
-                if (usingDesktopBridge && bridgeOnsetPrimed) continue;
-                if (detectedMidi < 0) continue;
-                const cn = group[0];
-                const key = noteKey(cn, cn.t);
-                if (noteResults.has(key)) continue;
-
-                const expectedMidi = _ndMidiFromStringFret(
-                    cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                );
-                const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
-                if (Math.abs(detectedCents) <= centsTolerance) {
-                    const judgment = makeMatchedJudgment(
-                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
-                        { pitchError: detectedCents }
-                    );
-                    recordJudgment(key, judgment);
-                }
+                continue;  // single-note path handled above
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
                 // Chord-level resolved key. checkMisses() honours this so a
