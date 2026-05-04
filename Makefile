@@ -61,6 +61,13 @@ replay-baseline: ## Run all WAV fixtures through the detector via puppeteer (slo
 replay-gasoline: ## Replay just the gasoline fixtures
 	node test/replay-baseline.js --url http://localhost:$(SLOPSMITH_PORT) --fixture-glob 'gasoline*.wav'
 
+.PHONY: rebuild
+rebuild: check-slopsmith ## Rebuild slopsmith container image (after slopsmith requirements.txt changes)
+	$(COMPOSE) build --no-cache web
+	$(COMPOSE) up -d
+	@echo
+	@echo "Slopsmith rebuilt and running at http://localhost:$(SLOPSMITH_PORT)"
+
 .PHONY: dev
 dev: check-slopsmith ## Start slopsmith with this plugin mounted (http://localhost:$(SLOPSMITH_PORT))
 	$(COMPOSE) up -d

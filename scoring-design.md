@@ -1,4 +1,4 @@
-# Game/Guitar Hero Scoring: Collapse to a Single Number
+# Scoring: Collapse to a Single Number
 
 ## The proposal
 
@@ -12,8 +12,8 @@ Per-note score:
 ```
 per_note =
   0                              if outside detection
-  0.5                            if detected, outside precision
-  0.5 + 0.5 × tightness          if inside precision
+  0.3                            if detected, outside precision
+  0.3 + 0.7 × tightness          if inside precision
 
 tightness = min(1 - |cents|/25, 1 - |ms|/50)   clamped to [0, 1]
 ```
@@ -21,6 +21,8 @@ tightness = min(1 - |cents|/25, 1 - |ms|/50)   clamped to [0, 1]
 Song score = **mean of per_note across the chart.** A number in [0, 1] that reads as "what fraction of perfection you delivered."
 
 That's the whole thing. The rest of this doc is why each piece is the right call.
+
+> **Context.** Pedagogy lives in a separate post-play coach evaluator, not in the score. The score's only job is to be an honest measurement of what happened on this run. That assumption shapes several of the calls below — particularly the floor value.
 
 ---
 
@@ -49,17 +51,19 @@ Product is too harsh — two small errors (say 0.9 × 0.9 = 0.81) get punished m
 
 Average is the worst of the three for a tuning game. It tells the player they can coast on pitch if their timing is sharp, or vice versa. That's a lie, and they'll feel the lie when they try to play with a band and discover their "90% score" sounds bad.
 
-## Why 0.5 is the right floor for "detected but not precise"
+## Why 0.3 is the right floor for "detected but not precise"
 
 This is a design knob, and it encodes a value judgment. Three plausible settings:
 
-- **0.2** — "Showing up barely counts." Aggressive push toward precision. Good for advanced players, brutal for learners.
-- **0.5** — "Showing up is half the battle." Honors the fact that hitting the right note at roughly the right time is the actual hard part of learning guitar.
-- **0.7+** — "Precision is just polish." Too generous; the precision window stops mattering.
+- **0.2** — "Showing up barely counts." Aggressive push toward precision.
+- **0.3** — "Showing up gets you a third of the way." Precision is clearly the point, but detection still earns something.
+- **0.5+** — "Showing up is half the battle." Makes the precision window feel optional rather than the goal.
 
-**0.5 is right for a Rocksmith-style game** because the audience spans beginners through intermediate players, and the detection window is where 90% of the learning happens. Penalizing that zone too hard makes the game feel like it hates you in the first 20 hours, which is exactly when you need it not to.
+The floor was tempting to set high (0.5) when the score had to double as a learner-protection mechanism — punishing a struggling beginner with a 0.1 score for notes they technically hit feels cruel. **But pedagogy is not the score's job here.** A post-play coach catches struggling players, identifies what they need to work on, and adjusts guidance accordingly. The score is freed up to do its actual job: measure execution honestly.
 
-Rocksmith itself sits closer to 0.3, which is defensible if your audience is already past the beginner hump. Tune against real play data once you have it. **Start at 0.5.**
+With that constraint lifted, **0.3 is right.** Reasoning: detection alone is the minimum bar for "you played guitar at this moment." Precision is what the game is actually measuring. A 70/30 split between "the precision part of the score" and "the showing-up part" reflects that hierarchy. A player who lands every note in the detection window but never in precision deserves to see ~0.3, because that's an accurate description of their playing — they're hitting notes but not playing them tightly. The coach can soften that delivery; the score shouldn't lie about it.
+
+Rocksmith landed at roughly this number for the same reason — they had dynamic difficulty doing learner-protection in parallel. Functionally similar setup.
 
 ## Why the asymmetric ratios (8× pitch, 6× time) are fine
 
@@ -82,8 +86,27 @@ These are not equally compatible with mean-based scoring. **Decide this before s
 
 My lean: keep the base score clean (mean of per_note) as the "skill number," and if you want combo feel, layer it as a **separate visible multiplier** during play that doesn't touch the underlying score. Player sees both. Leaderboards rank by the clean number. Best of both worlds.
 
+## Emit per-note data, not just the aggregate
+
+The coach evaluator is going to need more than a single number to do its job. It needs to know *which* notes were missed, where timing drift accumulated, whether pitch errors cluster on bends vs. sustains, whether the player falls apart in fast sections, whether they always rush the last beat of a measure. None of that is recoverable from a 0–1 song score.
+
+**Design the scoring pipeline to emit two outputs from the same pass:**
+
+1. **Song score** (single 0–1 float) — for the player UI, leaderboards, progress tracking.
+2. **Per-note record** (structured array) — for the coach. Each entry minimally contains:
+   - note index / timestamp in the chart
+   - target pitch and target time
+   - detected pitch and detected time (or null if missed)
+   - cents error and ms error (signed — direction matters; "always flat" is a different problem from "always sharp")
+   - per_note score
+   - bucket: `missed` | `detected_only` | `precise`
+
+This is cheap to emit during the same pass that computes the score, and it's the substrate the coach needs. Retrofitting it later means re-running scoring against stored audio, which is expensive and lossy. Build it in from day one.
+
+Signed errors are the one detail worth flagging — unsigned cents/ms is enough for scoring (you're folding both directions into the same penalty) but useless for diagnosis. The coach wants to tell the player "you're consistently 30ms late" or "your bends overshoot," and that requires direction.
+
 ---
 
 ## TL;DR
 
-Piecewise per-note, min across axes, 0.5 floor, mean across the song. Keep streaks out of the base score; if you want combo feel, layer it on top.
+Piecewise per-note, min across axes, **0.3 floor**, mean across the song. Keep streaks out of the base score; if you want combo feel, layer it on top. Emit per-note records alongside the aggregate so the coach has something to chew on.
