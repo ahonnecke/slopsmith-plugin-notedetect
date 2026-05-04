@@ -1072,50 +1072,305 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 
 // ── Two-axis scoring ───────────────────────────────────────────────────────
 //
-// Pure function. Takes a list of per-chart-note results (each with a
-// `judgment` field — HIT / MISS — and optional `labels` array of
-// LATE/EARLY/SHARP/FLAT/DIRTY) and returns a bundle of derived scores:
+// Single source of truth for play-level scoring math. Takes an iterable
+// of judgment objects (Map values OR Array — same shape) produced by
+// recordJudgment / makeMissJudgment, and returns the bundle the UI
+// cares about plus raw counts. The review modal calls this against
+// play.noteResults from the persisted plays endpoint; the live HUD
+// calls it against the in-flight noteResults Map; the snapshot summary
+// that gets persisted calls it too. All three paths use the same
+// function so displayed score, persisted score, and heatmap-derived
+// per-section scores can never drift.
 //
-//   detection — HIT/total at the wide thresholds (200¢ / 300ms). The
-//               headline number on the HUD and report. Wide on purpose
-//               — captures "approximately right" without punishing
-//               real-world pitch wobble.
-//   precision — fraction of HITs with no LATE/EARLY/SHARP/FLAT/DIRTY
-//               label, where labels fire when timing/pitch exceeds
-//               the tight thresholds (25¢ / 50ms). Independent number
-//               — answers "how tight."
-//   combined  — alias for detection (back-compat for callers not yet
-//               migrated to read .detection explicitly).
-//
-// A clean bass play on mic typically reads ~90% detection / ~35%
-// precision; that's not a bug, that's the actual play quality at
-// the two grain sizes.
+// Returned fields:
+//   detection      — HIT/total at the wide thresholds (200¢ / 300ms).
+//                    Headline number on the HUD and report.
+//   precision      — fraction of HITs that landed inside the precision
+//                    zone (timingState='OK' AND pitchState in {OK,null}).
+//                    Independent number — answers "how tight."
+//   combined       — alias for detection (back-compat for callers not
+//                    yet migrated to read .detection).
+//   pitchPct       — of attempts where pitch was measurable, fraction
+//                    correct. Null when no pitch attempts.
+//   coverage       — fraction of notes that produced any detection
+//                    (HIT + wrong-pitch). Null when no notes.
+//   timingMedianMs — median timing error across HITs (signed: + = late).
+//   timingStdMs    — standard deviation of HIT timings.
+//   total / hits / misses / perfect — raw counts.
 function _ndScoresFromNotes(notes) {
     let total = 0;
     let hitCount = 0;
+    let wrongPitchCount = 0;
+    let detectedCount = 0;
     let perfectCount = 0;
-    if (Array.isArray(notes)) {
-        for (const n of notes) {
-            total++;
-            const j = n && (n.judgment || n.primary || n.verdict);
-            const isHit = j === 'HIT' || j === 'DIRTY_HIT';
-            if (isHit) {
-                hitCount++;
-                const labels = (n && n.labels) || [];
-                if (labels.length === 0) perfectCount++;
-            }
+    const hitTimings = [];
+
+    const iter = notes && typeof notes[Symbol.iterator] === 'function' ? notes : (notes ? Object.values(notes) : []);
+    for (const r of iter) {
+        if (!r) continue;
+        total++;
+        if (r.hit) {
+            hitCount++;
+            detectedCount++;
+            if (typeof r.timingError === 'number') hitTimings.push(r.timingError);
+            // Precision = HITs that landed inside the perfect zone:
+            // timing inside _ND_PRECISION_TIMING_MS AND pitch inside
+            // _ND_PRECISION_PITCH_CENTS (or pitch unmeasured for chord
+            // events). _ndClassifyTiming/_ndClassifyPitch encode this
+            // as the 'OK' state when the makeJudgment thresholds were
+            // the precision values.
+            const timingOk = r.timingState === 'OK' || r.timingState == null;
+            const pitchOk = r.pitchState === 'OK' || r.pitchState == null;
+            if (timingOk && pitchOk) perfectCount++;
+        } else if (typeof r.detectedMidi === 'number' && r.detectedMidi >= 0
+                   && r.pitchState && r.pitchState !== 'OK') {
+            // A miss where YIN had something but pitch was wrong —
+            // counts as detected for coverage, drives the
+            // pitch-correctness denominator separately from "no input".
+            wrongPitchCount++;
+            detectedCount++;
         }
     }
+
     const detection = total === 0 ? 0 : hitCount / total;
     const precision = hitCount === 0 ? null : perfectCount / hitCount;
+    const combined = detection;
+    const pitchDenom = hitCount + wrongPitchCount;
+    const pitchPct = pitchDenom === 0 ? null : hitCount / pitchDenom;
+    const coverage = total === 0 ? null : detectedCount / total;
+
+    let timingMedianMs = null;
+    let timingStdMs = null;
+    if (hitTimings.length > 0) {
+        const sorted = [...hitTimings].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        timingMedianMs = sorted.length % 2 === 0
+            ? (sorted[mid - 1] + sorted[mid]) / 2
+            : sorted[mid];
+        const mean = hitTimings.reduce((s, v) => s + v, 0) / hitTimings.length;
+        const variance = hitTimings.reduce((s, v) => s + (v - mean) ** 2, 0) / hitTimings.length;
+        timingStdMs = Math.sqrt(variance);
+    }
+
     return {
-        detection,
-        precision,
-        combined: detection,
-        hits: hitCount,
-        perfect: perfectCount,
-        total,
+        detection, precision, combined,
+        pitchPct, coverage, timingMedianMs, timingStdMs,
+        total, hits: hitCount, misses: total - hitCount, perfect: perfectCount,
     };
+}
+
+// Compute deltas between current play's scores and a prior play's.
+// Pure, testable. Returns per-axis signed numbers — null per-field
+// when either side is missing data.
+//   detection / precision / pitchPct / coverage: signed fractional delta
+//                                                 (+0.08 = "8 percentage
+//                                                 points better")
+//   timingMedianMs:                              signed ms delta (raw
+//                                                 difference; renderer
+//                                                 interprets tighter=better)
+function _ndComputeScoreDeltas(current, prior) {
+    if (!current || !prior) return null;
+    const sub = (a, b) => (typeof a === 'number' && typeof b === 'number') ? a - b : null;
+    return {
+        detection:      sub(current.detection,      prior.detection),
+        precision:      sub(current.precision,      prior.precision),
+        combined:       sub(current.combined,       prior.combined),
+        pitchPct:       sub(current.pitchPct,       prior.pitchPct),
+        coverage:       sub(current.coverage,       prior.coverage),
+        timingMedianMs: sub(current.timingMedianMs, prior.timingMedianMs),
+    };
+}
+
+// Sliding-window cluster finder for a single play's noteResults. Picks
+// dense pockets of OFF-TARGET notes — anything that isn't a clean HIT
+// (so timing-sloppy plays cluster too even though they're hits). A
+// user with 100% pitch but consistently late timing should see
+// clusters; a miss-only algorithm reports "no trouble clusters" on
+// those plays, which is wrong because there's clearly something to
+// drill.
+//
+// `cluster.misses` keeps the legacy field name — semantically it now
+// means "off-target note count" (HIT-with-non-OK label + true MISS).
+//
+// Each note must carry `noteTime` (chart time) and a hit/timingState/
+// pitchState shape — the same shape recordJudgment/makeMissJudgment
+// produce.
+function _ndFindMissClusters(noteResults, opts = {}) {
+    const {
+        windowSec = 6,
+        slideSec = 0.5,
+        minOffTarget = 2,
+        maxClusters = 8,
+        padHeadSec = 0.5,
+        padTailSec = 1.0,
+        minGapSec = 1.0,
+    } = opts;
+    const notes = (noteResults || []).filter(r => r);
+    if (!notes.length) return [];
+
+    const isOffTarget = (r) => {
+        if (r.hit) {
+            // HIT with timing or pitch outside the precision zone is
+            // "off-target" for cluster purposes — answers the question
+            // "is there something here to drill?"
+            const timingOff = r.timingState && r.timingState !== 'OK';
+            const pitchOff  = r.pitchState  && r.pitchState  !== 'OK';
+            return timingOff || pitchOff;
+        }
+        return true;  // any kind of MISS
+    };
+
+    let minT = Infinity, maxT = -Infinity;
+    for (const r of notes) {
+        const t = typeof r.noteTime === 'number' ? r.noteTime : r.chartT;
+        if (t < minT) minT = t;
+        if (t > maxT) maxT = t;
+    }
+    if (!Number.isFinite(minT) || !Number.isFinite(maxT)) return [];
+
+    const tOf = (r) => typeof r.noteTime === 'number' ? r.noteTime : r.chartT;
+    const candidates = [];
+    for (let start = minT; start <= maxT; start += slideSec) {
+        const end = start + windowSec;
+        const inWin = notes.filter(r => tOf(r) >= start && tOf(r) < end);
+        const offTarget = inWin.filter(isOffTarget).length;
+        if (offTarget >= minOffTarget) {
+            candidates.push({ start, end, offTarget, total: inWin.length, notes: inWin });
+        }
+    }
+    if (!candidates.length) return [];
+    candidates.sort((a, b) => b.offTarget - a.offTarget || a.start - b.start);
+
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxClusters) break;
+        const padA = c.start - padHeadSec;
+        const padB = c.end + padTailSec;
+        // Reject overlapping windows (with a minGapSec margin) so the
+        // top-N clusters are spatially distinct rather than near-
+        // duplicates of the same densest 6-second region.
+        if (selected.some(s =>
+            (padA - minGapSec) < s.endSecRaw && (padB + minGapSec) > s.startSecRaw)) continue;
+        selected.push({
+            startSecRaw: c.start, endSecRaw: c.end,
+            startSec: Math.max(0, padA),
+            endSec: padB,
+            misses: c.offTarget,
+            total: c.total,
+            notes: c.notes,
+        });
+    }
+    selected.sort((a, b) => a.startSec - b.startSec);
+    return selected;
+}
+
+// Find the prior cluster whose time range overlaps a given current
+// cluster the most. Used by per-cluster delta badges: when the user
+// drills the same trouble spot they had last attempt, surface whether
+// they got better at it. Returns null when no prior cluster overlaps.
+function _ndFindOverlappingPriorCluster(current, priorClusters) {
+    if (!current || !priorClusters || !priorClusters.length) return null;
+    let best = null, bestOverlap = 0;
+    for (const prior of priorClusters) {
+        const start = Math.max(current.startSec, prior.startSec);
+        const end = Math.min(current.endSec, prior.endSec);
+        const overlap = end - start;
+        if (overlap > bestOverlap) { bestOverlap = overlap; best = prior; }
+    }
+    return bestOverlap > 0 ? best : null;
+}
+
+// Time-binned heatmap. Independent of chart section structure (CDLCs
+// often have sparse sections; fixed-width bins give consistent
+// granularity regardless of how the chart was annotated).
+//
+// Each bin gets the combined score over notes whose time falls in
+// [startSec, endSec). Uses _ndScoresFromNotes so heatmap colors agree
+// with everything else by construction. Empty bins (no notes) carry a
+// null score and render as neutral background.
+function _ndComputeTimeHeatmap(noteResults, totalDuration, binSec = 5) {
+    if (totalDuration <= 0 || binSec <= 0) return [];
+    const notes = (noteResults || []).filter(r => r);
+    const tOf = (r) => typeof r.noteTime === 'number' ? r.noteTime : r.chartT;
+    const numBins = Math.ceil(totalDuration / binSec);
+    const bins = [];
+    for (let i = 0; i < numBins; i++) {
+        const startSec = i * binSec;
+        const endSec = Math.min(startSec + binSec, totalDuration);
+        const inBin = notes.filter(r => {
+            const t = tOf(r);
+            return typeof t === 'number' && t >= startSec && t < endSec;
+        });
+        if (inBin.length === 0) {
+            bins.push({ startSec, endSec, totalNotes: 0, score: null, hits: 0, misses: 0 });
+            continue;
+        }
+        const scores = _ndScoresFromNotes(inBin);
+        bins.push({
+            startSec, endSec,
+            totalNotes: inBin.length,
+            score: scores.combined,
+            hits: scores.hits,
+            misses: scores.misses,
+        });
+    }
+    return bins;
+}
+
+// Per-section aggregation. Returns Map<sectionName, {hits, misses,
+// total, accuracy, timingErrors[]}>. Pre-creates rows for every chart
+// section (even sections with no notes) so the heatmap renderer shows
+// consistent cells rather than collapsing empties. Section assignment
+// uses the chart's section boundaries — a note's `sectionName` field
+// when present, else looked up by chart-time falling inside the
+// section's range.
+function _ndAggregateBySection(noteResults, sections) {
+    const byName = new Map();
+    const ensure = (name) => {
+        let row = byName.get(name);
+        if (!row) {
+            row = { hits: 0, misses: 0, total: 0, timingErrors: [] };
+            byName.set(name, row);
+        }
+        return row;
+    };
+    for (const sec of sections || []) ensure(sec.name);
+
+    const sectionForTime = (t) => {
+        if (!sections || !sections.length) return null;
+        // Sections are sorted by startTime ascending; binary search if
+        // this becomes hot. For typical N≤30 sections per song, linear
+        // scan is fine.
+        for (let i = 0; i < sections.length; i++) {
+            const sec = sections[i];
+            const next = sections[i + 1];
+            const start = sec.startTime ?? sec.start ?? 0;
+            const end = next ? (next.startTime ?? next.start) : Infinity;
+            if (t >= start && t < end) return sec.name;
+        }
+        return null;
+    };
+
+    for (const r of noteResults || []) {
+        if (!r) continue;
+        const t = typeof r.noteTime === 'number' ? r.noteTime : r.chartT;
+        const name = r.sectionName
+            || (typeof t === 'number' ? sectionForTime(t) : null)
+            || '(unsectioned)';
+        const row = ensure(name);
+        row.total++;
+        if (r.hit) {
+            row.hits++;
+            if (typeof r.timingError === 'number') row.timingErrors.push(r.timingError);
+        } else {
+            row.misses++;
+        }
+    }
+    // Attach derived accuracy for renderer convenience.
+    for (const row of byName.values()) {
+        row.accuracy = row.total > 0 ? row.hits / row.total : null;
+    }
+    return byName;
 }
 
 async function _ndCrepeDetect(buffer) {

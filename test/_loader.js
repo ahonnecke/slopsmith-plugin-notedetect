@@ -292,14 +292,19 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
             };
         },
         createNoteDetector: sandbox.createNoteDetector,
-        // Drill-mode tests: expose the slopsmith stub so tests can
-        // drive synthetic `loop:restart` etc. and toggle the loop
-        // state that getLoop() returns.
-        slopsmith: sandbox.slopsmith,
-        // For the rare test that needs to manipulate the highway
-        // stub directly (e.g., make hw.getTime return non-zero so
-        // drillIterStartT comes out non-null).
-        highway: sandbox.highway,
+        // ── Pure analysis functions (Unit 3a) ─────────────────────────
+        // Score → color, time-formatter, dedup helper, and the post-play
+        // analysis pipeline (scores, deltas, clusters, time heatmap,
+        // section aggregation). All pure, no DOM, no factory state.
+        scoreColor: sandbox._ndScoreColor,
+        fmtMmSs: sandbox._ndFmtMmSs,
+        isDuplicateLoop: sandbox._ndIsDuplicateLoop,
+        scoresFromNotes: sandbox._ndScoresFromNotes,
+        computeScoreDeltas: sandbox._ndComputeScoreDeltas,
+        findMissClusters: sandbox._ndFindMissClusters,
+        findOverlappingPriorCluster: sandbox._ndFindOverlappingPriorCluster,
+        computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
+        aggregateBySection: sandbox._ndAggregateBySection,
     };
 }
 
