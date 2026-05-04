@@ -15,8 +15,9 @@ shape during porting.
 ✓ Unit 2x — Drill HUD + iteration + auto-save  aae1593
 ✓ Unit 3a — Coaching analysis pure functions   253110e
 ✓ Unit 3b — exportCoachingAnalysis entry point e2e6a9a
+✓ Unit 3c — Coaching review modal base layout  7f532d1
 
-☐ Unit 3c  Coaching review modal — base layout
+☐ Unit 3d  Modal — heatmap SVGs
 ☐ Unit 3a  Coaching analysis pure functions
 ☐ Unit 3b  _ndExportCoachingAnalysis entry point
 ☐ Unit 3c  Coaching review modal — base layout
