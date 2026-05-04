@@ -1070,6 +1070,16 @@ const _ND_DRILL_SLOW_SPEED = 0.95;
 const _ND_LOOP_RESTART_MIN_BACKWARD_SEC = 1.0;
 const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 
+// Drift compensation. Track the rolling median of recent HIT timing
+// errors and shift the matcher's search center backward by that
+// amount. Self-corrects for residual A/V offset drift the user's
+// calibration didn't catch — e.g., output-latency drift across
+// pause/resume, or per-song processing latency. Median is robust:
+// a single outlier doesn't move the estimate. Window of 8 picks up
+// tempo wobble within ~10 s without locking onto a single bad hit.
+const _ND_DRIFT_WINDOW = 8;
+const _ND_DRIFT_MIN_SAMPLES = 4;
+
 // ── Two-axis scoring ───────────────────────────────────────────────────────
 //
 // Single source of truth for play-level scoring math. Takes an iterable
@@ -2153,6 +2163,11 @@ function createNoteDetector(options = {}) {
     // restart.
     let lastSeenChartTime = 0;
     let lastLoopRestartPerf = 0;
+    // Drift compensation: rolling median of recent HIT timing errors,
+    // applied as a shift in the matcher search center. Self-corrects
+    // residual A/V drift the user's static calibration didn't catch.
+    let driftBuffer = [];
+    let driftEstimateMs = 0;
 
     // Scoring
     let hits = 0;
@@ -3403,173 +3418,22 @@ function createNoteDetector(options = {}) {
         });
     }
 
-    // Update per-string diagnostic counters for a chord constituent
-    // judgment WITHOUT updating any other diagnostic counter. Chord
-    // constituent judgments are stashed straight into noteResults
-    // (bypassing recordJudgment) because totals/event-log are
-    // already accounted for at the chord-level entry — but the
-    // per-string panel still needs to see each string's outcome,
-    // otherwise it overrepresents whatever string happens to be
-    // `liveNotes[0]` and is blind to the rest.
-    function _recordPerStringForChord(judgment) {
-        const n = judgment.chartNote || judgment.note;
-        if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
-            const slot = _diagPerString[n.s];
-            if (judgment.hit) slot.hits++; else slot.misses++;
+    // Update the rolling-median timing-error estimator from a new HIT.
+    // Median over a sliding window of the most recent N hits — robust
+    // to outliers (a single late note doesn't move the estimate).
+    // Below MIN_SAMPLES the estimate stays at 0 so the first few hits
+    // aren't influenced by a tiny sample.
+    function updateDriftEstimate(timingErrorMs) {
+        if (typeof timingErrorMs !== 'number' || !Number.isFinite(timingErrorMs)) return;
+        driftBuffer.push(timingErrorMs);
+        if (driftBuffer.length > _ND_DRIFT_WINDOW) driftBuffer.shift();
+        if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES) {
+            const sorted = driftBuffer.slice().sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            driftEstimateMs = sorted.length % 2 === 0
+                ? (sorted[mid - 1] + sorted[mid]) / 2
+                : sorted[mid];
         }
-    }
-
-    // Bin one judgment into the diagnostic counters. Called from inside
-    // recordJudgment under the same `count` gate so this never double-
-    // counts (chord events fire one chord-level judgment plus per-string
-    // ones; only the chord-level passes count=true). One miss → exactly
-    // one primary-cause bin (chord events into chordPartial regardless
-    // of axis; non-chord misses chosen as pure → timing → pitch in that
-    // priority, so a single bar height adds up to total misses).
-    //
-    // NOTE: per-string counters here only see the chord-level chartNote
-    // (lead constituent). Chord constituents go through
-    // _recordPerStringForChord at their stash sites so per-string
-    // stats reflect each string's actual outcome.
-    function _recordDiagnostic(judgment) {
-        const isChord = !!judgment.chord;
-        if (judgment.hit) {
-            (isChord ? _diagChords : _diagSingles).hits++;
-        } else {
-            (isChord ? _diagChords : _diagSingles).misses++;
-            if (isChord) {
-                _diagBreakdown.chordPartial++;
-            } else if (judgment.detectedMidi == null) {
-                _diagBreakdown.pure++;
-            } else if (judgment.timingState === 'EARLY') {
-                _diagBreakdown.early++;
-            } else if (judgment.timingState === 'LATE') {
-                _diagBreakdown.late++;
-            } else if (judgment.pitchState === 'SHARP') {
-                _diagBreakdown.sharp++;
-            } else if (judgment.pitchState === 'FLAT') {
-                _diagBreakdown.flat++;
-            } else {
-                // Defensive fallback — keep totals balanced if a future
-                // judgment shape doesn't trip any axis (shouldn't happen
-                // today). Land it in pure so the bin sums still match.
-                _diagBreakdown.pure++;
-            }
-        }
-        // Per-string counters: only update for non-chord judgments here.
-        // For chord-level judgments, judgment.chartNote is the chord's
-        // lead constituent (`liveNotes[0]`), which doesn't represent any
-        // single string's outcome — counting it here would overrepresent
-        // whichever string happened to be the lead and miss the other
-        // constituents. Per-string credit for chord constituents flows
-        // through _recordPerStringForChord at the constituent stash sites.
-        if (!isChord) {
-            const n = judgment.chartNote || judgment.note;
-            if (n && Number.isInteger(n.s) && n.s >= 0 && n.s < _diagPerString.length) {
-                const slot = _diagPerString[n.s];
-                if (judgment.hit) slot.hits++; else slot.misses++;
-            }
-        }
-        if (Number.isFinite(judgment.timingError) && _diagTimingErrors.length < _DIAG_ERROR_CAP) {
-            _diagTimingErrors.push(judgment.timingError);
-            if (judgment.hit && _diagTimingErrorsHits.length < _DIAG_ERROR_CAP) {
-                _diagTimingErrorsHits.push(judgment.timingError);
-            }
-        }
-        if (Number.isFinite(judgment.pitchError) && _diagPitchErrors.length < _DIAG_ERROR_CAP) {
-            _diagPitchErrors.push(judgment.pitchError);
-        }
-        // Build the event object once; push to in-memory log (capped)
-        // AND stream to the backend live-judgment endpoint when tuning
-        // mode is on. The streaming path is fire-and-forget — failures
-        // are swallowed since they shouldn't disrupt detection or
-        // bookkeeping.
-        const nn = judgment.chartNote || judgment.note || {};
-        const eventObj = {
-            t:   Number.isFinite(judgment.noteTime) ? +judgment.noteTime.toFixed(3) : null,
-            at:  Number.isFinite(judgment.time)     ? +judgment.time.toFixed(3)     : null,
-            s:   Number.isInteger(nn.s) ? nn.s : null,
-            f:   Number.isInteger(nn.f) ? nn.f : null,
-            sus: Number.isFinite(nn.sus) ? +(+nn.sus).toFixed(3) : 0,
-            hit:   !!judgment.hit,
-            chord: !!judgment.chord,
-            ts:  judgment.timingState || null,
-            ps:  judgment.pitchState  || null,
-            te:  Number.isFinite(judgment.timingError) ? judgment.timingError : null,
-            pe:  Number.isFinite(judgment.pitchError)  ? judgment.pitchError  : null,
-            ex:  Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
-            dx:  Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
-            cnf: Number.isFinite(judgment.confidence) ? +judgment.confidence.toFixed(3) : 0,
-            hs:  Number.isFinite(judgment.hitStrings)   ? judgment.hitStrings   : undefined,
-            tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
-            sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
-            tf:  _diagTechFlags(nn),
-        };
-        if (_diagEvents.length < _DIAG_EVENT_CAP) {
-            _diagEvents.push(eventObj);
-        }
-        if ((tuningMode || _recArmedForTraining) && _liveSessionId) {
-            _streamLiveJudgment(eventObj);
-        }
-    }
-
-    function _diagTechFlags(n) {
-        if (!n) return null;
-        const flags = [];
-        if (n.bn)               flags.push('B');    // bend
-        if (n.sl != null && n.sl >= 0) flags.push('S');    // slide
-        if (n.hm || n.hp)       flags.push('H');    // harmonic / pinch
-        if (n.ho)               flags.push('h');    // hammer-on
-        if (n.po)               flags.push('p');    // pull-off
-        if (n.tp)               flags.push('t');    // tap
-        if (n.pm)               flags.push('PM');   // palm mute
-        if (n.mt)               flags.push('M');    // muted
-        if (n.tr)               flags.push('TR');   // tremolo
-        if (n.ac)               flags.push('A');    // accent
-        if ((+n.sus || 0) > 0)  flags.push('SUS');
-        return flags.length ? flags.join(',') : null;
-    }
-
-    function _diagPercentile(arr, p) {
-        if (!arr || !arr.length) return null;
-        const sorted = arr.slice().sort((a, b) => a - b);
-        return _diagPercentileFromSorted(sorted, p);
-    }
-    // Same nearest-rank math as _diagPercentile but takes an already-
-    // sorted array. Used by the bulk helper below to avoid sorting the
-    // same array three times when computing p10/median/p90 for one
-    // distribution.
-    function _diagPercentileFromSorted(sorted, p) {
-        if (!sorted || !sorted.length) return null;
-        const rank = (p / 100) * (sorted.length - 1);
-        const idx = Math.max(0, Math.min(sorted.length - 1, Math.round(rank)));
-        return sorted[idx];
-    }
-    // Sort once, compute count + p10/median/p90 once. _buildDiagnosticPayload
-    // calls this three times per export (timing, timing-hits, pitch); the
-    // previous code did three .slice().sort() per call there → 9 sorts per
-    // payload. The Settings-page A/V auto-calibrate panel polls every 1.5 s
-    // while open, so this hit was real.
-    function _diagDistribution(arr) {
-        if (!arr || !arr.length) return { count: 0, p10: null, median: null, p90: null };
-        const sorted = arr.slice().sort((a, b) => a - b);
-        return {
-            count: sorted.length,
-            p10:    _diagPercentileFromSorted(sorted, 10),
-            median: _diagPercentileFromSorted(sorted, 50),
-            p90:    _diagPercentileFromSorted(sorted, 90),
-        };
-    }
-
-    function _diagResetCounters() {
-        for (const k of Object.keys(_diagBreakdown)) _diagBreakdown[k] = 0;
-        _diagSingles.hits = 0; _diagSingles.misses = 0;
-        _diagChords.hits  = 0; _diagChords.misses  = 0;
-        for (const slot of _diagPerString) { slot.hits = 0; slot.misses = 0; }
-        _diagTimingErrors.length = 0;
-        _diagTimingErrorsHits.length = 0;
-        _diagPitchErrors.length  = 0;
-        _diagEvents.length       = 0;
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
@@ -3586,6 +3450,14 @@ function createNoteDetector(options = {}) {
                 streak++;
                 if (streak > bestStreak) bestStreak = streak;
                 updateSectionStat('hit');
+                // Feed the drift estimator with the raw observed
+                // timing so future matches benefit from the rolling
+                // median. Done here rather than at the matchNotes
+                // call site so chord HITs (which path through a
+                // different branch) feed the estimator too.
+                if (typeof judgment.timingError === 'number') {
+                    updateDriftEstimate(judgment.timingError);
+                }
             } else {
                 misses++;
                 streak = 0;
@@ -3610,7 +3482,15 @@ function createNoteDetector(options = {}) {
 
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const t = hw.getTime() + avOffsetSec - latencyOffset;
+        // Shift the search center backward by the rolling drift estimate.
+        // Equivalent to shifting each chart note's effective time forward
+        // by the same amount — i.e., "the chart says C, but the audio
+        // is consistently arriving D ms later, so search as if the chart
+        // said C+D". Self-corrects residual A/V drift across the play
+        // even when the user's static avOffset calibration is off by
+        // ~50-200ms.
+        const driftSec = driftEstimateMs / 1000;
+        const t = hw.getTime() + avOffsetSec - latencyOffset - driftSec;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -4093,7 +3973,12 @@ function createNoteDetector(options = {}) {
         // scores during drill mode.
         detectLoopRestart();
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const t = hw.getTime() + avOffsetSec - latencyOffset;
+        // Apply the same drift compensation as matchNotes — without
+        // this, a chart note whose actual hit lands inside the
+        // drift-shifted matcher window would be marked missed by
+        // checkMisses before the matcher saw it.
+        const driftSec = driftEstimateMs / 1000;
+        const t = hw.getTime() + avOffsetSec - latencyOffset - driftSec;
         const tolerance = timingTolerance;
         const missDeadline = t - tolerance * 2;
         // Mirror matchNotes' sus-late-grace policy. Without this, a sus
@@ -5038,6 +4923,10 @@ function createNoteDetector(options = {}) {
         lastChordHit = 0;
         lastChordTotal = 0;
         lastChordTime = -Infinity;
+        // Drift estimator restarts per session so a song's per-track
+        // latency doesn't leak into the next track's calibration.
+        driftBuffer = [];
+        driftEstimateMs = 0;
     }
 
     // Narrower reset used by the A/V auto-calibrate Apply button.
@@ -7267,6 +7156,8 @@ function createNoteDetector(options = {}) {
             hits, misses, streak, bestStreak,
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
             sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
+            driftEstimateMs,
+            driftSamples: driftBuffer.length,
         }),
         // The user's most-recently-expressed preference: did they last
         // click Detect to turn it ON? Distinct from isEnabled(), which
