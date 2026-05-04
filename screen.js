@@ -194,12 +194,25 @@ const _ndInstances = _ndShared.instances;
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
-// Plugin semver — keep in sync with package.json / plugin.json. Stamped
-// into every diagnostic export so a JSON blob can be tied back to the
-// exact build that produced it. The script tag has no `import`/`fetch`
-// hook to read package.json at load time, so this is the single
-// hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.10.0';
+// ── Two-axis scoring thresholds ────────────────────────────────────────────
+//
+// Score is two independent numbers — Detection ("did you play it") and
+// Precision ("how tight"). Detection uses wide thresholds; Precision uses
+// tight thresholds. The strictness-preset abstraction the pre-port code
+// used (rocksmith / easy / default / strict) is retired: it conflated
+// "did the player play the right note" (binary) with "how tightly did
+// they play it" (continuous). On bass-via-mic, strict-mode 25¢ pitch
+// tolerance produced ~50% scores on clean plays because mic-captured
+// bass has natural pitch wobble — a HIT and a 30¢-off HIT became
+// identical (both MISS), even though the failure modes are different.
+const _ND_DETECTION_PITCH_CENTS = 200;
+const _ND_DETECTION_TIMING_SEC  = 0.300;
+const _ND_PRECISION_PITCH_CENTS = 25;
+const _ND_PRECISION_TIMING_MS   = 50;
+// Dirty-hit threshold (fraction of off-target YIN frames in the hit
+// window). HITs above this downgrade to DIRTY_HIT — represents
+// "the right note sometimes, but with audible contamination."
+const _ND_DIRTY_HIT_MAX_OFF_RATIO = 0.5;
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -998,6 +1011,54 @@ function _ndLoadScript(src) {
     });
 }
 
+// ── Two-axis scoring ───────────────────────────────────────────────────────
+//
+// Pure function. Takes a list of per-chart-note results (each with a
+// `judgment` field — HIT / MISS — and optional `labels` array of
+// LATE/EARLY/SHARP/FLAT/DIRTY) and returns a bundle of derived scores:
+//
+//   detection — HIT/total at the wide thresholds (200¢ / 300ms). The
+//               headline number on the HUD and report. Wide on purpose
+//               — captures "approximately right" without punishing
+//               real-world pitch wobble.
+//   precision — fraction of HITs with no LATE/EARLY/SHARP/FLAT/DIRTY
+//               label, where labels fire when timing/pitch exceeds
+//               the tight thresholds (25¢ / 50ms). Independent number
+//               — answers "how tight."
+//   combined  — alias for detection (back-compat for callers not yet
+//               migrated to read .detection explicitly).
+//
+// A clean bass play on mic typically reads ~90% detection / ~35%
+// precision; that's not a bug, that's the actual play quality at
+// the two grain sizes.
+function _ndScoresFromNotes(notes) {
+    let total = 0;
+    let hitCount = 0;
+    let perfectCount = 0;
+    if (Array.isArray(notes)) {
+        for (const n of notes) {
+            total++;
+            const j = n && (n.judgment || n.primary || n.verdict);
+            const isHit = j === 'HIT' || j === 'DIRTY_HIT';
+            if (isHit) {
+                hitCount++;
+                const labels = (n && n.labels) || [];
+                if (labels.length === 0) perfectCount++;
+            }
+        }
+    }
+    const detection = total === 0 ? 0 : hitCount / total;
+    const precision = hitCount === 0 ? null : perfectCount / hitCount;
+    return {
+        detection,
+        precision,
+        combined: detection,
+        hits: hitCount,
+        perfect: perfectCount,
+        total,
+    };
+}
+
 async function _ndCrepeDetect(buffer) {
     if (!_ndShared.model) return { freq: -1, confidence: 0 };
     try {
@@ -1175,22 +1236,16 @@ function createNoteDetector(options = {}) {
     // singleton writes back to localStorage; non-default instances keep
     // mutations local.
     let detectionMethod = 'yin';
-    let timingTolerance = 0.150;
-    let pitchTolerance = 50;
-    let timingHitThreshold = 0.100;
-    // Chord-specific timing-OK window. Wider than the single-note
-    // threshold because a chord strum spans 5–10 ms across strings and
-    // the per-string FFT analysis window itself smears chord-strike
-    // timing by another 50–100 ms — so the inherent jitter on a chord
-    // event is closer to ±150 ms than the single-note ±100 ms. Fast
-    // punk / pop-rock rhythm players also anticipate the beat by 80–
-    // 120 ms (issue #38 — "Bad Habit", "American Jesus"), and the strict
-    // 100 ms window cuts off most of that bias even when the chord was
-    // scored as a strict-ratio hit. Default 150 ms; clamped >=
-    // timingHitThreshold at load so chord scoring is never stricter
-    // than single notes.
-    let chordTimingHitThreshold = 0.150;
-    let pitchHitThreshold = 20;
+    // Detection (wide) and Precision (tight) thresholds are now fixed
+    // module constants — see _ND_DETECTION_* / _ND_PRECISION_*. Kept as
+    // const aliases here so the matcher / labeler code below reads
+    // naturally without per-call constant references. Anything that
+    // tries to mutate these in localStorage-load is a leftover from
+    // the strictness UI and is now a silent no-op.
+    const timingTolerance = _ND_DETECTION_TIMING_SEC;
+    const pitchTolerance = _ND_DETECTION_PITCH_CENTS;
+    const timingHitThreshold = _ND_PRECISION_TIMING_MS / 1000;
+    const pitchHitThreshold = _ND_PRECISION_PITCH_CENTS;
     let showTimingErrors = true;
     let showPitchErrors = true;
     // slopsmith#254 — the full-screen green/red edge flash on hit/miss.
@@ -1256,19 +1311,11 @@ function createNoteDetector(options = {}) {
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
             if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
-            // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
-            // before deriving hit thresholds so a stale or manually-edited
-            // stored value can't produce an invalid range input or a hit
-            // threshold that exceeds the tolerance ceiling.
-            if (s.timingTolerance !== undefined) timingTolerance = Math.max(0.03, Math.min(0.3, s.timingTolerance));
-            if (s.pitchTolerance !== undefined) pitchTolerance = Math.max(10, Math.min(100, s.pitchTolerance));
-            if (s.timingHitThreshold !== undefined) timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, s.timingHitThreshold));
-            // Chord threshold clamp: at least the single-note strict threshold
-            // (chords shouldn't be stricter than single notes), at most the
-            // outer timing tolerance (we're widening within the existing
-            // candidate window, not pushing past it).
-            if (s.chordTimingHitThreshold !== undefined) chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, s.chordTimingHitThreshold));
-            if (s.pitchHitThreshold !== undefined) pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, s.pitchHitThreshold));
+            // Tolerance/hit-threshold settings used to be persisted from
+            // the strictness UI. Now they're fixed two-axis constants
+            // (see _ND_DETECTION_* / _ND_PRECISION_* at module scope).
+            // Older saves that include these keys are silently ignored
+            // — the constants take precedence.
             if (s.showTimingErrors !== undefined) showTimingErrors = !!s.showTimingErrors;
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
@@ -1679,6 +1726,9 @@ function createNoteDetector(options = {}) {
     }
 
     // ── Settings persistence (only the default singleton writes) ──────
+    // Tolerance/hit-threshold are no longer written: those are now fixed
+    // two-axis constants (see _ND_DETECTION_* / _ND_PRECISION_*). Older
+    // saves that contain those keys are silently ignored on load.
     function saveSettings() {
         if (!isDefault) return;
         try {
@@ -1686,11 +1736,6 @@ function createNoteDetector(options = {}) {
                 deviceId: selectedDeviceId,
                 channel: selectedChannel,
                 method: detectionMethod,
-                timingTolerance,
-                pitchTolerance,
-                timingHitThreshold,
-                chordTimingHitThreshold,
-                pitchHitThreshold,
                 showTimingErrors,
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
@@ -3539,40 +3584,11 @@ function createNoteDetector(options = {}) {
                 Compensates for USB/audio interface delay. Increase if notes register late.
             </div>
 
-            <label class="block text-gray-400 text-xs mb-1">Timing Tolerance: <span class="nd-timing-val">${Math.round(timingTolerance * 1000)}</span>ms</label>
-            <input type="range" min="30" max="300" value="${Math.round(timingTolerance * 1000)}"
-                   class="nd-timing-slider w-full accent-green-400 mb-2">
-            <div class="text-[10px] text-gray-600 mb-2 leading-tight">
-                Outer match window. Detections outside this range are ignored.
-            </div>
-
-            <label class="block text-gray-400 text-xs mb-1">Pitch Tolerance: <span class="nd-pitch-val">${pitchTolerance}</span> cents</label>
-            <input type="range" min="10" max="100" value="${pitchTolerance}"
-                   class="nd-pitch-slider w-full accent-green-400 mb-2">
-            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-                Outer pitch match window. Wider values correlate more attempts.
-            </div>
-
-            <label class="block text-gray-400 text-xs mb-1">Clean Timing: <span class="nd-timing-hit-val">${Math.round(timingHitThreshold * 1000)}</span>ms</label>
-            <input type="range" min="30" max="${Math.round(timingTolerance * 1000)}" value="${Math.round(timingHitThreshold * 1000)}"
-                   class="nd-timing-hit-slider w-full accent-blue-400 mb-2">
-
-            <label class="block text-gray-400 text-xs mb-1">Chord Timing Window: <span class="nd-chord-timing-val">${Math.round(chordTimingHitThreshold * 1000)}</span>ms</label>
-            <input type="range" min="${Math.round(timingHitThreshold * 1000)}" max="${Math.round(timingTolerance * 1000)}" value="${Math.round(chordTimingHitThreshold * 1000)}"
-                   class="nd-chord-timing-slider w-full accent-blue-400 mb-1">
-            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-                Chord strums have more inherent timing jitter than single notes (multi-string strike spread + analysis-window smearing). Fast power-chord punk also anticipates the beat. Wider than Clean Timing; pinned >= it.
-            </div>
-
-            <label class="block text-gray-400 text-xs mb-1">Clean Pitch: <span class="nd-pitch-hit-val">${pitchHitThreshold}</span> cents</label>
-            <input type="range" min="5" max="${pitchTolerance}" value="${pitchHitThreshold}"
-                   class="nd-pitch-hit-slider w-full accent-blue-400 mb-3">
-
-            <label class="block text-gray-400 text-xs mb-1">Detection Confidence: <span class="nd-conf-val">${Math.round(detectionConfidenceMin * 100)}</span>%</label>
-            <input type="range" min="5" max="50" value="${Math.round(detectionConfidenceMin * 100)}"
-                   class="nd-conf-slider w-full accent-purple-400 mb-2">
-            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-                Minimum confidence to accept a YIN/HPS/CREPE frame. Lower this if too many notes register as "pure miss" with no detection — at the cost of more false positives on quiet/noisy signals.
+            <div class="bg-dark-700 border border-gray-700 rounded p-2 mb-3 text-[11px] text-gray-300 leading-snug">
+                <div class="font-semibold text-gray-200 mb-1">Scoring thresholds</div>
+                <div>Detection: <span class="text-gray-100 font-mono">${_ND_DETECTION_PITCH_CENTS}¢ / ${Math.round(_ND_DETECTION_TIMING_SEC * 1000)}ms</span> — did you play it?</div>
+                <div>Precision: <span class="text-gray-100 font-mono">${_ND_PRECISION_PITCH_CENTS}¢ / ${_ND_PRECISION_TIMING_MS}ms</span> — how tight?</div>
+                <div class="text-[10px] text-gray-500 mt-1">Fixed thresholds; the strictness preset abstraction was retired in favor of two independent score axes.</div>
             </div>
 
             <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
@@ -3739,80 +3755,10 @@ function createNoteDetector(options = {}) {
             panel.querySelector('.nd-latency-val').textContent = e.target.value;
             saveSettings();
         };
-        panel.querySelector('.nd-timing-slider').oninput = (e) => {
-            timingTolerance = e.target.value / 1000;
-            timingHitThreshold = Math.min(timingHitThreshold, timingTolerance);
-            chordTimingHitThreshold = Math.min(chordTimingHitThreshold, timingTolerance);
-            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
-            panel.querySelector('.nd-timing-val').textContent = e.target.value;
-            const hitSlider = panel.querySelector('.nd-timing-hit-slider');
-            if (hitSlider) {
-                hitSlider.max = e.target.value;
-                hitSlider.value = Math.round(timingHitThreshold * 1000);
-                panel.querySelector('.nd-timing-hit-val').textContent = hitSlider.value;
-            }
-            const chordSlider = panel.querySelector('.nd-chord-timing-slider');
-            if (chordSlider) {
-                chordSlider.max = e.target.value;
-                chordSlider.min = Math.round(timingHitThreshold * 1000);
-                chordSlider.value = Math.round(chordTimingHitThreshold * 1000);
-                panel.querySelector('.nd-chord-timing-val').textContent = chordSlider.value;
-            }
-            saveSettings();
-        };
-        panel.querySelector('.nd-pitch-slider').oninput = (e) => {
-            pitchTolerance = +e.target.value;
-            pitchHitThreshold = Math.min(pitchHitThreshold, pitchTolerance);
-            panel.querySelector('.nd-pitch-val').textContent = e.target.value;
-            const hitSlider = panel.querySelector('.nd-pitch-hit-slider');
-            if (hitSlider) {
-                hitSlider.max = e.target.value;
-                hitSlider.value = pitchHitThreshold;
-                panel.querySelector('.nd-pitch-hit-val').textContent = hitSlider.value;
-            }
-            saveSettings();
-        };
-        panel.querySelector('.nd-timing-hit-slider').oninput = (e) => {
-            timingHitThreshold = e.target.value / 1000;
-            panel.querySelector('.nd-timing-hit-val').textContent = e.target.value;
-            // Keep the chord-timing slider's lower bound + value in sync —
-            // chord threshold can never be stricter than single-note.
-            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
-            const chordSlider = panel.querySelector('.nd-chord-timing-slider');
-            if (chordSlider) {
-                chordSlider.min = e.target.value;
-                chordSlider.value = Math.round(chordTimingHitThreshold * 1000);
-                panel.querySelector('.nd-chord-timing-val').textContent = chordSlider.value;
-            }
-            saveSettings();
-        };
-        panel.querySelector('.nd-chord-timing-slider').oninput = (e) => {
-            chordTimingHitThreshold = e.target.value / 1000;
-            // Enforce the invariant on direct edits too — slider min should
-            // already prevent inversion, but a stale DOM state during fast
-            // drag can momentarily produce values below the current
-            // single-note threshold. Clamp here to be safe.
-            const clamped = chordTimingHitThreshold < timingHitThreshold;
-            if (clamped) chordTimingHitThreshold = timingHitThreshold;
-            // When we clamped up, the variable + persisted setting have
-            // moved past the slider's current `value` — sync the slider's
-            // value back to the clamped position so the thumb doesn't
-            // sit below the actual setting.
-            if (clamped) e.target.value = Math.round(chordTimingHitThreshold * 1000);
-            panel.querySelector('.nd-chord-timing-val').textContent = Math.round(chordTimingHitThreshold * 1000);
-            saveSettings();
-        };
-        panel.querySelector('.nd-pitch-hit-slider').oninput = (e) => {
-            pitchHitThreshold = +e.target.value;
-            panel.querySelector('.nd-pitch-hit-val').textContent = e.target.value;
-            saveSettings();
-        };
-        panel.querySelector('.nd-conf-slider').oninput = (e) => {
-            // Slider is in percent (5-50); state is the 0.05-0.50 fraction.
-            detectionConfidenceMin = (+e.target.value) / 100;
-            panel.querySelector('.nd-conf-val').textContent = e.target.value;
-            saveSettings();
-        };
+        // Tolerance/hit-threshold sliders are gone — those four values
+        // are now the fixed _ND_DETECTION_* / _ND_PRECISION_* constants
+        // displayed read-only above. The strictness preset abstraction
+        // they fed into has been retired in favor of two-axis scoring.
         panel.querySelector('.nd-show-timing').onchange = (e) => {
             showTimingErrors = !!e.target.checked;
             saveSettings();
