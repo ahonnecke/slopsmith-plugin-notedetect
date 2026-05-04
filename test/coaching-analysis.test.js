@@ -59,6 +59,74 @@ test('scoresFromNotes — half hits → detection=0.5, precision still 1 across 
     assert.strictEqual(s.misses, 2);
 });
 
+// ── Two-axis judgment semantics (Unit 6 follow-on fix) ────────────────────
+
+test('makeJudgment — wide threshold gates hit, tight threshold drives label', () => {
+    // 80ms late: should be HIT (within 300ms wide) with LATE label
+    // (outside 50ms tight). Pre-fix this returned hit=false.
+    const j = core.makeJudgment({
+        matched: true,
+        judgedAt: 1.080,
+        noteTime: 1.000,
+        timingHitThresholdMs: 300,
+        pitchHitThresholdCents: 200,
+        timingPrecisionMs: 50,
+        pitchPrecisionCents: 25,
+        pitchError: 0,
+    });
+    assert.strictEqual(j.hit, true);
+    assert.strictEqual(j.timingState, 'LATE');
+    assert.strictEqual(j.timingError, 80);
+});
+
+test('makeJudgment — outside wide threshold fails hit', () => {
+    // 400ms late is outside the 300ms wide window: hit=false.
+    const j = core.makeJudgment({
+        matched: true,
+        judgedAt: 1.400,
+        noteTime: 1.000,
+        timingHitThresholdMs: 300,
+        pitchHitThresholdCents: 200,
+        timingPrecisionMs: 50,
+        pitchPrecisionCents: 25,
+        pitchError: 0,
+    });
+    assert.strictEqual(j.hit, false);
+    assert.strictEqual(j.timingState, 'LATE');
+});
+
+test('makeJudgment — clean hit inside precision zone reports OK label', () => {
+    const j = core.makeJudgment({
+        matched: true,
+        judgedAt: 1.020,
+        noteTime: 1.000,
+        timingHitThresholdMs: 300,
+        pitchHitThresholdCents: 200,
+        timingPrecisionMs: 50,
+        pitchPrecisionCents: 25,
+        pitchError: 10,
+    });
+    assert.strictEqual(j.hit, true);
+    assert.strictEqual(j.timingState, 'OK');
+    assert.strictEqual(j.pitchState, 'OK');
+});
+
+test('makeJudgment — backwards-compat single-threshold behavior', () => {
+    // Callers passing only timingThresholdMs (legacy shape) should
+    // get the old behavior where the same threshold is used for both
+    // hit and label.
+    const j = core.makeJudgment({
+        matched: true,
+        judgedAt: 1.080,
+        noteTime: 1.000,
+        timingThresholdMs: 50,         // legacy: tight = hit
+        pitchThresholdCents: 25,
+        pitchError: 0,
+    });
+    assert.strictEqual(j.hit, false);  // 80ms > 50ms threshold
+    assert.strictEqual(j.timingState, 'LATE');
+});
+
 test('scoresFromNotes — ignoredAsDetectorFailure misses excluded from total', () => {
     const notes = [
         mkNote({ noteTime: 1, hit: true }),

@@ -313,47 +313,43 @@ function _ndMakeJudgment(opts) {
     const pitchError = matched && Number.isFinite(o.pitchError)
         ? Math.round(o.pitchError)
         : null;
-    const timingThresholdMs = Number.isFinite(o.timingThresholdMs) ? o.timingThresholdMs : 100;
-    const pitchThresholdCents = Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20;
-    // Derive late-side grace from the chart note's sustain. Capped at
-    // 1 s so a 4-second held note doesn't accept detections nearly 4
-    // seconds late as "on time" — at some point the player has clearly
-    // missed the strike and is just holding the previous note's ring.
+    // Two-axis judgment thresholds (Unit 1's promise, finally honored
+    // here): the WIDE threshold drives hit-vs-miss (Detection score),
+    // the TIGHT threshold drives the LATE/EARLY/SHARP/FLAT labels
+    // (Precision score). A loose-but-on-target hit (e.g. 80ms late
+    // with 200ms wide threshold) becomes "HIT with LATE label", not
+    // MISS. Earlier port of _ndMakeJudgment used a single
+    // timingThresholdMs collapsed to the precision value, which marked
+    // anything outside ±50ms as missed and produced the detection
+    // regression the user reported.
     //
-    // For chord judgments, the caller passes an explicit `lateGraceMs`
-    // computed from the MAX sus across chord constituents (matching
-    // matchNotes' candidate-inclusion + checkMisses' retire-extension
-    // grace). Without that override, this falls back to the chart
-    // note's own sus, which for chords is just the first constituent
-    // (`liveNotes[0]`) — and a chord whose lead has a shorter sus than
-    // its longest constituent would get classified LATE here even
-    // though it was still inside the chord's matching window.
-    const chartNote = o.chartNote || o.note || null;
-    const susSec = chartNote && Number.isFinite(chartNote.sus) ? chartNote.sus : 0;
-    const lateGraceMs = Number.isFinite(o.lateGraceMs)
-        ? Math.max(0, o.lateGraceMs)
-        : (susSec > 0 ? Math.min(susSec * 1000, 1000) : 0);
-    const timingState = matched ? _ndClassifyTiming(timingError, timingThresholdMs, lateGraceMs) : null;
-    const pitchState = matched ? _ndClassifyPitch(pitchError, pitchThresholdCents) : null;
+    // Backwards-compat: callers passing only timingThresholdMs /
+    // pitchThresholdCents fall back to the old single-threshold
+    // behavior (treats both hit and label thresholds as that value).
+    const timingHitThresholdMs = Number.isFinite(o.timingHitThresholdMs)
+        ? o.timingHitThresholdMs
+        : (Number.isFinite(o.timingThresholdMs) ? o.timingThresholdMs : 100);
+    const pitchHitThresholdCents = Number.isFinite(o.pitchHitThresholdCents)
+        ? o.pitchHitThresholdCents
+        : (Number.isFinite(o.pitchThresholdCents) ? o.pitchThresholdCents : 20);
+    const timingPrecisionMs = Number.isFinite(o.timingPrecisionMs)
+        ? o.timingPrecisionMs
+        : timingHitThresholdMs;
+    const pitchPrecisionCents = Number.isFinite(o.pitchPrecisionCents)
+        ? o.pitchPrecisionCents
+        : pitchHitThresholdCents;
+    // Hit decision uses the WIDE thresholds (Detection score path).
+    const timingHit = matched ? _ndClassifyTiming(timingError, timingHitThresholdMs) : null;
+    const pitchHit = matched ? _ndClassifyPitch(pitchError, pitchHitThresholdCents) : null;
+    // Label classification uses the TIGHT thresholds (Precision score
+    // path) — fires LATE/EARLY/SHARP/FLAT for a hit that passed the
+    // wide gate but fell outside the precision zone.
+    const timingState = matched ? _ndClassifyTiming(timingError, timingPrecisionMs) : null;
+    const pitchState = matched ? _ndClassifyPitch(pitchError, pitchPrecisionCents) : null;
     // pitchState === null means pitch was not measured (e.g. energy-only chord
     // check or harmonic flag).  Treat unmeasured pitch as non-blocking so a
     // chord that passes the scorer is not incorrectly counted as a miss.
-    //
-    // For CHORDS specifically: the chord scorer (_ndScoreChord) already
-    // ran per-string pitch + energy checks before this judgment was
-    // constructed. matchNotes only takes the chord-hit path when the
-    // scorer returned isHit (score ≥ chordHitRatio). If we *also* gate
-    // the overall hit on the monophonic pitchState computed from a
-    // SINGLE string's pitchError (the first one with a finite cents
-    // measurement), we throw away clean chord hits whenever the lead
-    // string happens to be a bit sharp/flat — even when every string
-    // rang and the chord scorer said yes. Trust the chord scorer's
-    // verdict here. For single notes the original timing+pitch rule
-    // still applies.
-    const isChord = !!o.chord;
-    const hit = isChord
-        ? (matched && timingState === 'OK')
-        : (timingState === 'OK' && (pitchState === 'OK' || pitchState === null));
+    const hit = timingHit === 'OK' && (pitchHit === 'OK' || pitchHit === null);
     return {
         chartNote: o.chartNote || o.note || null,
         note: o.note || null,
@@ -3411,8 +3407,15 @@ function createNoteDetector(options = {}) {
             pitchError,
             expectedFreq,
             detectedFreq,
-            timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
-            pitchThresholdCents: pitchHitThreshold,
+            // Wide thresholds drive hit/miss; tight drives the
+            // LATE/EARLY/SHARP/FLAT precision labels. timingTolerance
+            // and pitchTolerance are the wide values (Detection
+            // 200¢/300ms); timingHitThreshold and pitchHitThreshold
+            // are the tight ones (Precision 25¢/50ms).
+            timingHitThresholdMs: timingTolerance * 1000,
+            pitchHitThresholdCents: pitchTolerance,
+            timingPrecisionMs: timingHitThreshold * 1000,
+            pitchPrecisionCents: pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
@@ -3431,8 +3434,10 @@ function createNoteDetector(options = {}) {
             noteTime,
             judgedAt: t,
             expectedMidi,
-            timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
-            pitchThresholdCents: pitchHitThreshold,
+            timingHitThresholdMs: timingTolerance * 1000,
+            pitchHitThresholdCents: pitchTolerance,
+            timingPrecisionMs: timingHitThreshold * 1000,
+            pitchPrecisionCents: pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
@@ -3504,15 +3509,24 @@ function createNoteDetector(options = {}) {
 
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        // Shift the search center backward by the rolling drift estimate.
-        // Equivalent to shifting each chart note's effective time forward
-        // by the same amount — i.e., "the chart says C, but the audio
-        // is consistently arriving D ms later, so search as if the chart
-        // said C+D". Self-corrects residual A/V drift across the play
-        // even when the user's static avOffset calibration is off by
-        // ~50-200ms.
+        // Two clocks:
+        //   tRaw    — the player's actual "now" relative to chart time.
+        //             Used as judgedAt so timingError on the judgment
+        //             reflects RAW player timing. Coaching reads
+        //             judgment.timingError to surface "consistently
+        //             late" feedback; if we passed the drift-shifted
+        //             clock here, drift comp would mask the player's
+        //             skew and coaching would lie about it.
+        //   t       — drift-shifted "now". Used for the candidate
+        //             search window and selection sort. Self-corrects
+        //             residual A/V offset so the matcher finds the
+        //             right chart note even when the player's static
+        //             calibration is off by ~50-200ms.
+        // The split keeps drift comp from leaking into player-facing
+        // feedback while still doing its job at the matcher level.
         const driftSec = driftEstimateMs / 1000;
-        const t = hw.getTime() + avOffsetSec - latencyOffset - driftSec;
+        const tRaw = hw.getTime() + avOffsetSec - latencyOffset;
+        const t = tRaw - driftSec;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -3630,11 +3644,13 @@ function createNoteDetector(options = {}) {
             );
             const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
             if (Math.abs(detectedCents) > centsTolerance) continue;
-            const timingErrorMs = (t - cn.t) * 1000;
+            // Raw timing distance — used both for selection sort
+            // (drift-adjusted) and for the recorded judgment (raw).
+            const rawTimingErrorMs = (tRaw - cn.t) * 1000;
             pitchPassing.push({
                 cn, key, expectedMidi,
                 pitchError: detectedCents,
-                timingError: timingErrorMs,
+                timingError: rawTimingErrorMs,
             });
         }
 
@@ -3646,13 +3662,20 @@ function createNoteDetector(options = {}) {
             const pool = exactPitch.length > 0 ? exactPitch : pitchPassing;
             // Sort by drift-adjusted timing distance: the chart note
             // closest to where the player actually landed (not closest
-            // to the un-compensated chart-time clock) wins.
+            // to the un-compensated chart-time clock) wins. We compare
+            // raw timing minus the rolling median, which equals
+            // drift-adjusted distance algebraically.
             pool.sort((a, b) =>
                 Math.abs(a.timingError - driftEstimateMs)
                 - Math.abs(b.timingError - driftEstimateMs));
             const winner = pool[0];
+            // Pass tRaw (NOT t) as judgedAt so the recorded
+            // timingError reflects raw player timing, not the drift-
+            // shifted matcher clock. Coaching reads this to surface
+            // "consistently late" — it must see the player's actual
+            // skew, not the drift-comp-cancelled value.
             const judgment = makeMatchedJudgment(
-                winner.cn, winner.cn.t, t, winner.expectedMidi,
+                winner.cn, winner.cn.t, tRaw, winner.expectedMidi,
                 detectedMidi, detectedConfidence,
                 { pitchError: winner.pitchError }
             );
