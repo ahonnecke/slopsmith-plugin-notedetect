@@ -265,6 +265,75 @@ test('renderSubScoreTile — no delta slot when id omitted', () => {
     assert.ok(!html.includes('nd-delta-'));
 });
 
+// ── Unit 3d — heatmap SVG renderers ───────────────────────────────────────
+
+test('renderTimeHeatmapSvg — empty input returns valid empty SVG', () => {
+    const html = core.renderTimeHeatmapSvg([], 0, []);
+    assert.ok(html.startsWith('<svg'));
+    assert.ok(html.includes('</svg>'));
+    assert.ok(!html.includes('<rect'));
+});
+
+test('renderTimeHeatmapSvg — bins render as rects with score-derived colors', () => {
+    const heatmap = [
+        { startSec: 0,  endSec: 5,  score: 1.0,  hits: 5, totalNotes: 5, misses: 0 },
+        { startSec: 5,  endSec: 10, score: null, hits: 0, totalNotes: 0, misses: 0 },
+        { startSec: 10, endSec: 15, score: 0.2,  hits: 1, totalNotes: 5, misses: 4 },
+    ];
+    const html = core.renderTimeHeatmapSvg(heatmap, 15);
+    // 3 bins → 3 rects
+    const rectCount = (html.match(/<rect/g) || []).length;
+    assert.strictEqual(rectCount, 3);
+    // Score=1.0 → green, score=null → neutral, score=0.2 → red
+    assert.ok(html.includes('#10b981'));   // green
+    assert.ok(html.includes('#1f2937'));   // empty bin neutral
+    assert.ok(html.includes('#dc2626'));   // red
+    // Hover titles include time range
+    assert.ok(html.includes('0:00'));
+    assert.ok(html.includes('no notes'));
+});
+
+test('renderTimeHeatmapSvg — section markers overlay when sections provided', () => {
+    const heatmap = [
+        { startSec: 0, endSec: 30, score: 1, hits: 1, totalNotes: 1, misses: 0 },
+    ];
+    const sections = [{ name: 'intro', time: 0 }, { name: 'verse', time: 15 }];
+    const html = core.renderTimeHeatmapSvg(heatmap, 30, sections);
+    assert.ok(html.includes('<line'));
+    assert.ok(html.includes('intro'));
+    assert.ok(html.includes('verse'));
+});
+
+test('renderSectionHeatmapSvg — accepts perSection as plain object (Unit 3b shape)', () => {
+    const sections = [
+        { name: 'intro', time: 0 },
+        { name: 'verse', time: 30 },
+    ];
+    const perSectionObj = {
+        intro: { hits: 4, misses: 1, total: 5, accuracy: 0.8 },
+        verse: { hits: 0, misses: 0, total: 0, accuracy: null },
+    };
+    const html = core.renderSectionHeatmapSvg(perSectionObj, sections, 60);
+    const rectCount = (html.match(/<rect/g) || []).length;
+    assert.strictEqual(rectCount, 2);
+    assert.ok(html.includes('intro: 80%'));
+    assert.ok(html.includes('verse: no notes'));
+});
+
+test('renderSectionHeatmapSvg — accepts perSection as Map (Unit 3a shape)', () => {
+    const sections = [{ name: 'intro', time: 0 }];
+    const perSectionMap = new Map();
+    perSectionMap.set('intro', { hits: 5, misses: 0, total: 5, accuracy: 1.0 });
+    const html = core.renderSectionHeatmapSvg(perSectionMap, sections, 30);
+    assert.ok(html.includes('intro: 100%'));
+});
+
+test('renderSectionHeatmapSvg — empty sections → empty SVG', () => {
+    const html = core.renderSectionHeatmapSvg({}, [], 60);
+    assert.ok(html.startsWith('<svg'));
+    assert.ok(!html.includes('<rect'));
+});
+
 test('renderClusterRow — uses _ndScoresFromNotes for accuracy', () => {
     const cluster = {
         startSec: 30,

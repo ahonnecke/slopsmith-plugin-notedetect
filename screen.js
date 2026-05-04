@@ -1527,6 +1527,81 @@ function _ndRenderSubScoreTile(label, valueText, color, deltaSlotId) {
     `;
 }
 
+// Render the time-binned heatmap as a single SVG row. Each bin is one
+// colored rect; empty bins (no notes) get a neutral dark color so the
+// player can see "no chart notes here" vs "missed every note here."
+// Section boundaries overlay as faint vertical ticks with labels.
+//
+// Section field name compatibility: upstream's getSections() emits
+// `sec.time`; the older annotation shape used `sec.startTime`. Read
+// both so the renderer works against either.
+function _ndRenderTimeHeatmapSvg(timeHeatmap, totalDuration, sections) {
+    const width = 800, barH = 32, labelBand = 14;
+    if (!timeHeatmap || timeHeatmap.length === 0 || totalDuration <= 0) {
+        return `<svg width="100%" height="${labelBand + barH}" viewBox="0 0 ${width} ${labelBand + barH}"></svg>`;
+    }
+    let cells = '';
+    for (const bin of timeHeatmap) {
+        const x = (bin.startSec / totalDuration) * width;
+        const w = Math.max(1, ((bin.endSec - bin.startSec) / totalDuration) * width);
+        const color = bin.score == null ? '#1f2937' : _ndScoreColor(bin.score);
+        const title = bin.score == null
+            ? `${_ndFmtMmSs(bin.startSec)}–${_ndFmtMmSs(bin.endSec)}: no notes`
+            : `${_ndFmtMmSs(bin.startSec)}–${_ndFmtMmSs(bin.endSec)}: ${Math.round(bin.score * 100)}% (${bin.hits}/${bin.totalNotes})`;
+        cells += `<rect x="${x.toFixed(1)}" y="${labelBand}" width="${w.toFixed(1)}" height="${barH}" fill="${color}" stroke="#0a0a0a" stroke-width="0.3"><title>${title}</title></rect>`;
+    }
+    let secLayer = '';
+    if (sections && sections.length) {
+        for (const sec of sections) {
+            const t = sec.time ?? sec.startTime ?? sec.start ?? 0;
+            if (t > totalDuration) continue;
+            const x = (t / totalDuration) * width;
+            secLayer += `<line x1="${x.toFixed(1)}" y1="${labelBand}" x2="${x.toFixed(1)}" y2="${labelBand + barH}" stroke="#9ca3af" stroke-width="0.6" opacity="0.6"/>`;
+            secLayer += `<text x="${(x + 2).toFixed(1)}" y="${labelBand - 3}" fill="#9ca3af" font-size="9" opacity="0.85">${sec.name || ''}</text>`;
+        }
+    }
+    return `<svg width="100%" viewBox="0 0 ${width} ${labelBand + barH}" preserveAspectRatio="none">${secLayer}${cells}</svg>`;
+}
+
+// Render per-section accuracy as a single SVG row. Each section is one
+// colored rect, width-proportional to its duration. Sparse charts (CDLCs
+// with 2 sections covering 4 minutes) make this strip less informative
+// than the time-binned heatmap above, but it's still useful when section
+// boundaries are meaningful musical structure.
+//
+// Accepts perSection as either a Map (Unit 3a output) or a plain object
+// (Unit 3b's serialized form). Both paths produce the same SVG.
+function _ndRenderSectionHeatmapSvg(perSection, sections, totalDuration) {
+    const width = 800, height = 32;
+    if (!sections || !sections.length || totalDuration <= 0) {
+        return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
+    }
+    const lookup = (name) => {
+        if (!perSection) return null;
+        if (typeof perSection.get === 'function') return perSection.get(name);
+        return perSection[name];
+    };
+    let cells = '';
+    for (let i = 0; i < sections.length; i++) {
+        const sec = sections[i];
+        const next = sections[i + 1];
+        const start = sec.time ?? sec.startTime ?? sec.start ?? 0;
+        const end = next
+            ? (next.time ?? next.startTime ?? next.start ?? totalDuration)
+            : totalDuration;
+        const x = (start / totalDuration) * width;
+        const w = Math.max(1, ((end - start) / totalDuration) * width);
+        const row = lookup(sec.name);
+        const accuracy = row && typeof row.accuracy === 'number' ? row.accuracy : null;
+        const color = _ndScoreColor(accuracy);
+        const title = row && row.total > 0
+            ? `${sec.name}: ${Math.round((accuracy || 0) * 100)}% (${row.hits}/${row.total})`
+            : `${sec.name || ''}: no notes`;
+        cells += `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${height}" fill="${color}" stroke="#1f2937" stroke-width="0.5"><title>${title}</title></rect>`;
+    }
+    return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${cells}</svg>`;
+}
+
 function _ndRenderClusterRow(cluster, idx) {
     // Cluster accuracy uses the SAME _ndScoresFromNotes the headline
     // does, so a 79% headline can't coexist with cluster rows showing
@@ -1587,7 +1662,7 @@ async function _ndShowCoachingReview({ playId, source }) {
     // so a coaching change can never produce different results in
     // production vs tests.
     const analysis = _ndExportCoachingAnalysis(play, { sections, totalDuration });
-    const { derived, clusters, topFix } = analysis;
+    const { derived, clusters, topFix, timeHeatmap, perSection } = analysis;
 
     const pitchPctText = derived.pitchPct != null
         ? `${Math.round(derived.pitchPct * 100)}%` : '—';
@@ -1658,6 +1733,25 @@ async function _ndShowCoachingReview({ playId, source }) {
                 ), 'nd-delta-timing')}
                 ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage), 'nd-delta-coverage')}
             </div>
+
+            ${timeHeatmap && timeHeatmap.length ? `
+            <div class="px-5 py-4 border-b border-gray-700">
+                <div class="text-gray-400 text-xs mb-2 flex justify-between">
+                    <span>Heatmap — ${Math.round(timeHeatmap[0].endSec - timeHeatmap[0].startSec)}s bins</span>
+                    <span class="text-gray-600">hover for breakdown</span>
+                </div>
+                <div class="rounded overflow-hidden border border-gray-700">
+                    ${_ndRenderTimeHeatmapSvg(timeHeatmap, totalDuration, sections)}
+                </div>
+            </div>` : ''}
+
+            ${sections && sections.length ? `
+            <div class="px-5 py-4 border-b border-gray-700">
+                <div class="text-gray-400 text-xs mb-2">Per-section accuracy</div>
+                <div class="rounded overflow-hidden border border-gray-700">
+                    ${_ndRenderSectionHeatmapSvg(perSection, sections, totalDuration)}
+                </div>
+            </div>` : ''}
 
             <div class="px-5 py-4 border-b border-gray-700">
                 <div class="text-gray-400 text-xs mb-2">Trouble spots — densest miss clusters</div>

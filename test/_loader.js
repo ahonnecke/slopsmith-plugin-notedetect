@@ -311,6 +311,10 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         // testable against the bundle shape from 3b.
         renderSubScoreTile: sandbox._ndRenderSubScoreTile,
         renderClusterRow: sandbox._ndRenderClusterRow,
+        // Unit 3d — heatmap SVG renderers (pure: take data, return
+        // SVG markup). DOM-free; testable via string-content asserts.
+        renderTimeHeatmapSvg: sandbox._ndRenderTimeHeatmapSvg,
+        renderSectionHeatmapSvg: sandbox._ndRenderSectionHeatmapSvg,
     };
 }
 
