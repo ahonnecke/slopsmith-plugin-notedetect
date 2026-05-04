@@ -1080,6 +1080,24 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 const _ND_DRIFT_WINDOW = 8;
 const _ND_DRIFT_MIN_SAMPLES = 4;
 
+// Detector-failure demotion. The score should reflect playing
+// quality, not detector limitations. Misses caused by sustain bleed
+// or onset-detector refractory (rather than the player's error) get
+// flagged ignoredAsDetectorFailure and excluded from the score by
+// _ndScoresFromNotes. The flag is preserved on the judgment so
+// downstream analytics still see the underlying miss reason.
+//
+// Tight gap: rapid re-attack regime where the onset detector
+// physically can't fire again — refractory window + previous sustain
+// dominates the RMS measurement. The "sustain bleed wall."
+const _ND_DETECTOR_FAST_REPEAT_GAP_SEC = 0.4;
+// Wider gap: chain-failure regime. Even with a longer gap, if the
+// PREVIOUS chart note also missed, the detector is in a bad state
+// (accumulated sustain bleed across multiple unhit notes) and the
+// next note's NO_DETECTION is also a detector limitation. Validated
+// on user data: 29 of 56 wide-gap misses followed another miss.
+const _ND_DETECTOR_CHAIN_FAILURE_GAP_SEC = 1.0;
+
 // ── Two-axis scoring ───────────────────────────────────────────────────────
 //
 // Single source of truth for play-level scoring math. Takes an iterable
@@ -1118,6 +1136,10 @@ function _ndScoresFromNotes(notes) {
     const iter = notes && typeof notes[Symbol.iterator] === 'function' ? notes : (notes ? Object.values(notes) : []);
     for (const r of iter) {
         if (!r) continue;
+        // Detector-failure misses don't count against the score —
+        // they're sustain-bleed / refractory artifacts, not playing
+        // errors. Same flag the live counter (recordJudgment) honors.
+        if (r.ignoredAsDetectorFailure) continue;
         total++;
         if (r.hit) {
             hitCount++;
@@ -3439,13 +3461,13 @@ function createNoteDetector(options = {}) {
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
-            _recordDiagnostic(judgment);
-            // No per-judgment sync — the host getLoop() poll would land
-            // on the scoring hot path. Instead we sync at enable()
-            // (closes the post-enable gap) and rely on updateHUD's
-            // 33 ms tick for ongoing tracking. Mid-drill bounds changes
-            // lag by at most one frame, which the user can't perceive.
-            if (judgment.hit) {
+            if (judgment.ignoredAsDetectorFailure) {
+                // Demoted miss — score should reflect playing quality,
+                // not detector limitations. Don't bump misses/streak;
+                // the judgment is preserved on noteResults so analytics
+                // and the modal can still surface "this happened" via
+                // the ignoredAsDetectorFailure flag.
+            } else if (judgment.hit) {
                 hits++;
                 streak++;
                 if (streak > bestStreak) bestStreak = streak;
@@ -3986,6 +4008,34 @@ function createNoteDetector(options = {}) {
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
+        // Decide whether a fresh NO_DETECTION miss is a player error
+        // or a detector limitation. Patterns that demote:
+        //   1. Tight gap (<0.4s) since the previous chart note —
+        //      onset detector can't physically fire again while sustain
+        //      is dominant.
+        //   2. Wider gap (<1.0s) AND previous chart note also missed —
+        //      sustain bleed accumulating across multiple unhit notes.
+        // Same heuristics as the offline _ndLikelyDetectorFailures
+        // filter so live and post-hoc analysis agree on what's "really"
+        // a miss vs a detector limitation.
+        const isDetectorFailure = (noteTime) => {
+            let prevChartT = -Infinity;
+            let prevWasMiss = false;
+            for (const v of noteResults.values()) {
+                const vt = typeof v.noteTime === 'number' ? v.noteTime : v.chartT;
+                if (typeof vt !== 'number') continue;
+                if (vt < noteTime && vt > prevChartT) {
+                    prevChartT = vt;
+                    prevWasMiss = !v.hit;
+                }
+            }
+            if (prevChartT === -Infinity) return false;
+            const gap = noteTime - prevChartT;
+            if (gap < _ND_DETECTOR_FAST_REPEAT_GAP_SEC) return true;
+            if (gap < _ND_DETECTOR_CHAIN_FAILURE_GAP_SEC && prevWasMiss) return true;
+            return false;
+        };
+
         const checkNote = (s, f, noteTime) => {
             if (noteTime > missDeadline) return;
             // Drill gate: notes outside the judge window get neither
@@ -3996,10 +4046,11 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                recordJudgment(
-                    key,
-                    makeMissJudgment(chartNote, noteTime, t, expectedMidi)
-                );
+                const judgment = makeMissJudgment({ s, f }, noteTime, t, expectedMidi);
+                if (isDetectorFailure(noteTime)) {
+                    judgment.ignoredAsDetectorFailure = true;
+                }
+                recordJudgment(key, judgment);
             }
         };
 

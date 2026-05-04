@@ -59,6 +59,22 @@ test('scoresFromNotes — half hits → detection=0.5, precision still 1 across 
     assert.strictEqual(s.misses, 2);
 });
 
+test('scoresFromNotes — ignoredAsDetectorFailure misses excluded from total', () => {
+    const notes = [
+        mkNote({ noteTime: 1, hit: true }),
+        mkNote({ noteTime: 2, hit: false }),
+        // Two demoted misses — must NOT count toward total or misses.
+        Object.assign(mkNote({ noteTime: 3, hit: false }), { ignoredAsDetectorFailure: true }),
+        Object.assign(mkNote({ noteTime: 4, hit: false }), { ignoredAsDetectorFailure: true }),
+        mkNote({ noteTime: 5, hit: true }),
+    ];
+    const s = core.scoresFromNotes(notes);
+    assert.strictEqual(s.total, 3);                 // 5 entries, 2 demoted
+    assert.strictEqual(s.hits, 2);
+    assert.strictEqual(s.misses, 1);
+    assert.ok(Math.abs(s.detection - 2 / 3) < 1e-9);
+});
+
 test('scoresFromNotes — late hits drop precision, leave detection alone', () => {
     const notes = [
         mkNote({ noteTime: 1, hit: true, timingState: 'OK' }),
