@@ -1086,11 +1086,21 @@ const _ND_DRIFT_MIN_SAMPLES = 4;
 // entirely from post-onset chunks. Re-attack detection fires on
 // in-note RMS spikes so rapid same-pitch passes (where sustain
 // keeps inNote=true) still get fresh detections.
-const _ND_ONSET_LEVEL = 0.04;            // RMS above → entering a note
-const _ND_ONSET_EXIT_LEVEL = 0.02;       // RMS below → note ended
+// Thresholds tuned for the post-routing-fix audio path: bass guitar via
+// the pw-loopback systemd service (Audio/Source guitar_capture). That
+// path delivers peak ~0.32 to Firefox vs ~1.0 from a direct mic grab,
+// so RMS during plucks lands around 0.015-0.10. Pre-port defaults
+// (0.04 onset, 0.02 exit) were calibrated for the direct path and
+// produced onsetCount=0 on this user's system — the threshold sat
+// above their actual playing RMS, so no onset ever fired and the
+// buffer-flush logic never engaged. Lower defaults make the trigger
+// sensitive enough for the routed path while staying above typical
+// 0.005 noise floor.
+const _ND_ONSET_LEVEL = 0.015;           // RMS above → entering a note
+const _ND_ONSET_EXIT_LEVEL = 0.008;      // RMS below → note ended
 const _ND_REATTACK_REFRACTORY_SEC = 0.20; // refractory after onset
-const _ND_REATTACK_MIN_LEVEL = 0.04;     // re-attack must reach this RMS
-const _ND_REATTACK_REARM_LEVEL = 0.02;   // dip below this re-arms re-attack gate
+const _ND_REATTACK_MIN_LEVEL = 0.015;    // re-attack must reach this RMS
+const _ND_REATTACK_REARM_LEVEL = 0.008;  // dip below this re-arms re-attack gate
 const _ND_REATTACK_RATIO = 1.5;          // RMS spike must be N× recent min
 const _ND_REATTACK_WINDOW = 8;           // recent-min window (chunks)
 
@@ -2212,6 +2222,10 @@ function createNoteDetector(options = {}) {
     let reattackArmed = false;
     let reattackRmsBuf = [];
     let onsetCount = 0;
+    // Track recent-peak RMS so getStats can surface "what level is
+    // your input ACTUALLY hitting" — useful for verifying the onset
+    // threshold matches the audio path's gain.
+    let recentRmsPeak = 0;
 
     // Scoring
     let hits = 0;
@@ -2881,6 +2895,11 @@ function createNoteDetector(options = {}) {
                 let sumSq = 0;
                 for (let j = 0; j < input.length; j++) sumSq += input[j] * input[j];
                 const rms = Math.sqrt(sumSq / input.length);
+                // Track the running peak RMS with slow decay so
+                // getStats reports a sensible "what was your loudest
+                // recent pluck" number for threshold tuning.
+                if (rms > recentRmsPeak) recentRmsPeak = rms;
+                else recentRmsPeak *= 0.998;
 
                 // Maintain rolling RMS history for the re-attack trigger.
                 reattackRmsBuf.push(rms);
@@ -7325,6 +7344,8 @@ function createNoteDetector(options = {}) {
             driftSamples: driftBuffer.length,
             onsetCount,
             inNote,
+            recentRmsPeak: Number(recentRmsPeak.toFixed(4)),
+            onsetThreshold: _ND_ONSET_LEVEL,
         }),
         // The user's most-recently-expressed preference: did they last
         // click Detect to turn it ON? Distinct from isEnabled(), which
