@@ -1076,6 +1076,17 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 const _ND_DRIFT_WINDOW = 8;
 const _ND_DRIFT_MIN_SAMPLES = 4;
 
+// Stability voting. YIN's first ~100ms after a fresh pluck is
+// transient-jittery — a bass D2 might bounce D1 → D2 → A1 → D2
+// across consecutive 50ms frames before settling. Without voting,
+// the matcher's first-pass detection on each chart note can lock
+// onto a transient octave-down read. Voting requires N-of-M recent
+// rounded-MIDI frames to agree before a "stable" detection is
+// surfaced for matching. Raw detectedMidi still goes to the HUD
+// readout so the diagnostic layer sees what YIN is actually doing.
+const _ND_STABILITY_WINDOW = 3;       // frames considered
+const _ND_STABILITY_REQUIRED = 2;     // N-of-M for "stable"
+
 // Onset detection + buffer flush. Without this, YIN's 4096-sample
 // window (~85ms at 48kHz) is always contaminated by the previous
 // note's sustain — on bass this means YIN locks on the previous
@@ -2226,6 +2237,12 @@ function createNoteDetector(options = {}) {
     // your input ACTUALLY hitting" — useful for verifying the onset
     // threshold matches the audio path's gain.
     let recentRmsPeak = 0;
+    // Stability voting state: rolling history of rounded-MIDI values
+    // from the last N YIN/HPS frames. The matcher reads stableMidi
+    // (the N-of-M voted winner) instead of the raw detectedMidi to
+    // suppress single-frame octave-down anomalies on bass.
+    let rawMidiHistory = [];
+    let stableMidi = -1;
 
     // Scoring
     let hits = 0;
@@ -3302,6 +3319,13 @@ function createNoteDetector(options = {}) {
             detectedString = -1;
             detectedFret = -1;
             detectedDisplayMidi = -1;
+            // Flush stability history on silence so stale votes from a
+            // previous note don't produce false stable detections when
+            // signal briefly returns.
+            if (rawMidiHistory.length > 0) {
+                rawMidiHistory = [];
+                stableMidi = -1;
+            }
             // Fall through to matchNotes — the chord path doesn't need a
             // single confident pitch (it scores per-string energy bands),
             // and chord audio is the case where YIN/HPS most often
@@ -3311,6 +3335,25 @@ function createNoteDetector(options = {}) {
         } else {
             detectedMidi = _ndFreqToMidi(result.freq);
             detectedConfidence = result.confidence;
+            // Stability voting: roll the latest rounded-MIDI into a
+            // short history and derive stableMidi only when N of M
+            // recent raw detections agree. Suppresses YIN's
+            // attack-transient jitter (e.g. D1 → D2 → A1 → D2 in the
+            // first 100ms of a bass pluck). Raw detectedMidi stays
+            // unchanged for the HUD/diagnostic layer; only the
+            // matcher reads stableMidi.
+            const roundedMidi = Math.round(detectedMidi);
+            rawMidiHistory.push(roundedMidi);
+            if (rawMidiHistory.length > _ND_STABILITY_WINDOW) rawMidiHistory.shift();
+            const voteCounts = new Map();
+            for (const m of rawMidiHistory) {
+                voteCounts.set(m, (voteCounts.get(m) || 0) + 1);
+            }
+            let winnerMidi = -1, winnerCount = 0;
+            for (const [m, c] of voteCounts) {
+                if (c > winnerCount) { winnerMidi = m; winnerCount = c; }
+            }
+            stableMidi = (winnerCount >= _ND_STABILITY_REQUIRED) ? winnerMidi : -1;
         }
 
         // Stamp the detector identity for the diagnostic — web JS-DSP path.
@@ -3740,17 +3783,22 @@ function createNoteDetector(options = {}) {
         // one — frequently the boundary-pitch candidate over the
         // exact one. That's the subtle quality regression the
         // pre-port matcher fixed.
+        // Route through stableMidi (Unit 6g): the matcher uses the
+        // N-of-M voted MIDI rather than each frame's raw YIN result.
+        // Suppresses single-frame octave-down anomalies that
+        // otherwise sneak through as 199¢ "hits" on bass.
+        const matcherMidi = stableMidi >= 0 ? stableMidi : -1;
         const pitchPassing = [];
         for (const [, group] of byTime) {
             if (group.length !== 1) continue;
-            if (detectedMidi < 0) continue;
+            if (matcherMidi < 0) continue;
             const cn = group[0];
             const key = noteKey(cn, cn.t);
             if (noteResults.has(key)) continue;
             const expectedMidi = _ndMidiFromStringFret(
                 cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
             );
-            const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
+            const detectedCents = _ndNearestOctaveCents(matcherMidi, expectedMidi);
             if (Math.abs(detectedCents) > centsTolerance) continue;
             // Raw timing distance — used both for selection sort
             // (drift-adjusted) and for the recorded judgment (raw).
@@ -3782,9 +3830,12 @@ function createNoteDetector(options = {}) {
             // shifted matcher clock. Coaching reads this to surface
             // "consistently late" — it must see the player's actual
             // skew, not the drift-comp-cancelled value.
+            // Record the stable midi (what the matcher used) on the
+            // judgment, not the raw frame midi — keeps downstream
+            // analytics consistent with what produced the hit.
             const judgment = makeMatchedJudgment(
                 winner.cn, winner.cn.t, tRaw, winner.expectedMidi,
-                detectedMidi, detectedConfidence,
+                matcherMidi, detectedConfidence,
                 { pitchError: winner.pitchError }
             );
             recordJudgment(winner.key, judgment);
@@ -5112,6 +5163,9 @@ function createNoteDetector(options = {}) {
         reattackArmed = false;
         reattackRmsBuf = [];
         onsetCount = 0;
+        // Stability voting state.
+        rawMidiHistory = [];
+        stableMidi = -1;
     }
 
     // Narrower reset used by the A/V auto-calibrate Apply button.
