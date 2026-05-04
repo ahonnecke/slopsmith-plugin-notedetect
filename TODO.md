@@ -122,3 +122,32 @@ Highway ready: 305 notes, 0 chords highway.js:1124:33
 [note_detect] AudioContext state → running screen.js:2732:21
 [note_detect] Chart keys sample (first frame): ["1|5|9.95","1|5|10.305","1|5|11.01","1|5|12.775","1|5|13.125"] screen.js:6255:21
 [note_detect] Chart keys matching trouble map: 11 of 11 trouble entries screen.js:6272:21
+
+
+# Gamified "Rocksmith-mode" plugin variant (future)
+
+Strip the diagnostic UI down to a single-score experience that reads like
+Rocksmith: one big number, no labels, no clusters, no histograms,
+optionally streak / multiplier / combo mechanics. The current plugin is
+a *practice instrument* — it surfaces the failure modes a player needs to
+see to improve. A gamified variant would be a *game instrument* — it
+hides the analysis and rewards the hit count.
+
+Should ship as a separate plugin id (different folder, different
+manifest), not a toggle inside the existing one. Keeping the modes
+physically separate avoids the temptation to gate every feature on
+"is gamified mode on" — the practice plugin stays focused on the
+practice job, the game plugin stays focused on the game job.
+
+Reuse points:
+- detection pipeline (YIN, onset, matcher) — keep identical
+- `_ndScoresFromNotes` — `detection` field IS the headline number a
+  Rocksmith-mode HUD would display
+- play storage — gamified plays should write the same JSON format so
+  history aggregation across both plugins still works
+
+Game-side additions:
+- streak / combo / multiplier scoring layered on top of HIT/MISS
+- one-screen end-of-song result (score, accuracy, best streak), no
+  drill suggestions or coaching modal
+- maybe per-section grades (S/A/B/C) instead of cluster analysis
