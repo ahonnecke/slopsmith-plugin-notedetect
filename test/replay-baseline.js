@@ -36,6 +36,9 @@ function getArg(name, defaultVal) {
 const SLOPSMITH_URL = getArg('url', process.env.SLOPSMITH_URL || 'http://localhost:8088');
 const FIXTURE_GLOB = getArg('fixture-glob', '*');
 const HEADED = args.includes('--headed');
+// Fixtures the server flagged as `excluded: true` (tuning mismatch
+// etc.) are skipped by default. --include-excluded opts in.
+const INCLUDE_EXCLUDED = args.includes('--include-excluded');
 const TIMEOUT_MS = 180_000;
 
 function globToRegex(pattern) {
@@ -50,7 +53,16 @@ async function discoverFixtures() {
     }
     const data = await res.json();
     const re = globToRegex(FIXTURE_GLOB);
-    return (data.fixtures || []).filter(f => re.test(f.name));
+    let all = (data.fixtures || []).filter(f => re.test(f.name));
+    if (!INCLUDE_EXCLUDED) {
+        const before = all.length;
+        all = all.filter(f => !f.excluded);
+        const skipped = before - all.length;
+        if (skipped > 0) {
+            console.log(`(skipped ${skipped} tuning-mismatched fixture${skipped === 1 ? '' : 's'} — pass --include-excluded to run them anyway)`);
+        }
+    }
+    return all;
 }
 
 async function runOne(page, fixture) {

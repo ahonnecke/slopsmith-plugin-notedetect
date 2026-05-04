@@ -105,11 +105,21 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
         _prune_old_dumps()
         return {"ok": True, "path": str(target), "retained": _DIAG_RETENTION}
 
+    # Fixtures known to be tuning-mismatched against their charts and
+    # therefore meaningless for cross-fixture detector validation. Stand
+    # By Me recordings are in standard E tuning but the chart authoring
+    # expects Eb — every chart pitch is one semitone off. Tagged here
+    # rather than deleted because the WAVs themselves are still useful
+    # for non-pitch tests (onset density, sustain bleed, hygiene).
+    _EXCLUDED_PREFIXES = ("stand_by_me", "stand-by-me")
+
     @app.get("/api/plugins/note_detect/fixtures")
     def list_fixtures() -> dict[str, Any]:
         """List the WAV fixtures + JSON sidecars available for replay.
         Used by test/replay-baseline.js to discover what's available
-        without a host-side filesystem walk."""
+        without a host-side filesystem walk. Tuning-mismatched
+        fixtures get an `excluded` flag so consumers default to
+        skipping them."""
         if not _FIXTURES_DIR.is_dir():
             return {"fixtures": []}
         wavs = sorted(_FIXTURES_DIR.glob("*.wav"))
@@ -125,12 +135,18 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
                     song_id = sc.get("songId") or sc.get("filename")
                 except Exception:
                     pass
-            out.append({
+            lname = w.name.lower()
+            excluded = any(lname.startswith(p) for p in _EXCLUDED_PREFIXES)
+            entry: dict[str, Any] = {
                 "name": w.name,
                 "size": w.stat().st_size,
                 "chartStartTime": chart_start,
                 "songId": song_id,
-            })
+            }
+            if excluded:
+                entry["excluded"] = True
+                entry["excludedReason"] = "tuning mismatch (chart in Eb, recording in E)"
+            out.append(entry)
         return {"fixtures": out}
 
     @app.get("/api/plugins/note_detect/fixtures/{name}")
