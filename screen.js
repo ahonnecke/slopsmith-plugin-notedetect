@@ -7612,6 +7612,11 @@ function createNoteDetector(options = {}) {
         // master clock — incrementing relative to wavStartCtxT.
         // Also optionally mock hw.getNotes / hw.getChords if the
         // caller passed a chartNotesOverride (replay harness path).
+        // Also override hw.getAvOffset to 0 — the live slopsmith may
+        // have a per-user calibration offset stored, but for fixture
+        // replay we want raw chart-time alignment so the harness's
+        // reported timingError reflects only what's in the recording,
+        // not the host's calibration.
         let _hw = resolveHw();
         // If no highway is available at all (headless harness with
         // slopsmith stubbed), build a minimal stub object the
@@ -7635,6 +7640,7 @@ function createNoteDetector(options = {}) {
         const realGetTime = _hw && _hw.getTime ? _hw.getTime.bind(_hw) : null;
         const realGetNotes = _hw && _hw.getNotes ? _hw.getNotes.bind(_hw) : null;
         const realGetChords = _hw && _hw.getChords ? _hw.getChords.bind(_hw) : null;
+        const realGetAvOffset = _hw && _hw.getAvOffset ? _hw.getAvOffset.bind(_hw) : null;
         const wavStartCtxT = audioCtx.currentTime + 0.05;  // small lookahead
 
         if (_hw && realGetTime) {
@@ -7647,6 +7653,12 @@ function createNoteDetector(options = {}) {
             _hw.getNotes = () => chartNotesOverride;
             _hw.getChords = () => [];
         }
+        // Force avOffset to 0 during replay. The live slopsmith
+        // may have the user's per-machine calibration set, which
+        // would shift recorded timingError by that amount and make
+        // harness numbers non-portable. Replay timing is "raw player
+        // vs raw chart"; calibration belongs to live play.
+        if (_hw) _hw.getAvOffset = () => 0;
 
         enabled = true;
         sessionGen++;
@@ -7691,11 +7703,12 @@ function createNoteDetector(options = {}) {
             }
         }
 
-        // Restore real getTime / getNotes / getChords so subsequent
-        // live use isn't broken.
+        // Restore real getTime / getNotes / getChords / getAvOffset
+        // so subsequent live use isn't broken.
         if (_hw && realGetTime) _hw.getTime = realGetTime;
         if (_hw && realGetNotes) _hw.getNotes = realGetNotes;
         if (_hw && realGetChords) _hw.getChords = realGetChords;
+        if (_hw && realGetAvOffset) _hw.getAvOffset = realGetAvOffset;
 
         // Build summary using the SAME _ndScoresFromNotes the live HUD
         // and modal use, so the harness number can never drift from
