@@ -24,7 +24,14 @@ from typing import Any
 from fastapi import FastAPI, Request
 
 
-_DIAG_DIR = Path("/tmp/nd_diagnostics")
+# Write to the plugin's own directory rather than /tmp because
+# slopsmith typically runs in a container where /tmp is tmpfs and
+# isn't bind-mounted to the host. The plugin dir IS bind-mounted
+# (that's how live screen.js edits work in dev), so dumps land
+# directly on the host filesystem and can be read without docker
+# exec. The dir is computed at module-import time relative to this
+# file's path — same trick as plugins/__init__.py uses.
+_DIAG_DIR = Path(__file__).parent / "diagnostics"
 # Cap retained dumps so a long-running session doesn't fill /tmp.
 # Newest 50 retained; older silently dropped on each write.
 _DIAG_RETENTION = 50
