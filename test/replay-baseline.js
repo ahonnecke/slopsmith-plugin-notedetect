@@ -70,9 +70,51 @@ async function discoverFixtures() {
     return all;
 }
 
+// Load chart notes from the fixture's dump.json sidecar. The dump
+// captured the original recording's matched chart notes, which is
+// the ground truth we want the matcher to score against. Returns
+// an array of { s, f, t } the harness passes to testInjectWav so
+// the matcher has something to match against — slopsmith doesn't
+// auto-load songs in headless replay.
+function loadFixtureContext(fixturePath) {
+    const dumpPath = fixturePath.replace(/\.wav$/, '.dump.json');
+    if (!fs.existsSync(dumpPath)) return null;
+    let dump;
+    try {
+        dump = JSON.parse(fs.readFileSync(dumpPath, 'utf8'));
+    } catch (e) {
+        return null;
+    }
+    const noteResults = Array.isArray(dump.noteResults) ? dump.noteResults : [];
+    if (noteResults.length === 0) return null;
+    const seen = new Set();
+    const notes = [];
+    for (const r of noteResults) {
+        if (!r || typeof r.chartT !== 'number') continue;
+        if (typeof r.s !== 'number' || typeof r.f !== 'number') continue;
+        const key = `${r.s}|${r.f}|${r.chartT.toFixed(3)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        notes.push({ s: r.s, f: r.f, t: r.chartT });
+    }
+    notes.sort((a, b) => a.t - b.t);
+    const settings = dump.settings || {};
+    return {
+        chartNotes: notes,
+        arrangement: settings.arrangement || null,
+        tuning: Array.isArray(settings.tuning) ? settings.tuning : null,
+        capo: Number.isFinite(settings.capo) ? settings.capo : 0,
+    };
+}
+
 async function runOne(page, fixture) {
     const wavUrl = `/api/plugins/note_detect/fixtures/${encodeURIComponent(fixture.name)}`;
-    return await page.evaluate(async (url, chartStart) => {
+    const fixturePath = path.join(__dirname, 'fixtures', fixture.name);
+    const ctx = loadFixtureContext(fixturePath);
+    if (!ctx || !ctx.chartNotes || ctx.chartNotes.length === 0) {
+        throw new Error(`no chart notes — dump.json sidecar missing or empty for ${fixture.name}`);
+    }
+    return await page.evaluate(async (url, chartStart, notes, arrangement, tuning, capo) => {
         if (!window.noteDetect || typeof window.noteDetect.testInjectWav !== 'function') {
             throw new Error('window.noteDetect.testInjectWav unavailable — plugin not loaded?');
         }
@@ -82,8 +124,12 @@ async function runOne(page, fixture) {
         }
         return await window.noteDetect.testInjectWav(url, {
             chartStartTimeSec: chartStart,
+            chartNotes: notes,
+            arrangement,
+            tuning,
+            capo,
         });
-    }, wavUrl, fixture.chartStartTime || 0);
+    }, wavUrl, fixture.chartStartTime || 0, ctx.chartNotes, ctx.arrangement, ctx.tuning, ctx.capo);
 }
 
 function fmtPct(n) {
@@ -141,9 +187,13 @@ function fmtCount(n) {
         process.stdout.write(`Replaying ${fixture.name} ... `);
         try {
             const t0 = Date.now();
-            const { summary } = await runOne(page, fixture);
+            const result = await runOne(page, fixture);
             const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-            rows.push({ name: fixture.name, ok: true, summary, elapsed });
+            const { summary, noteResults } = result;
+            rows.push({
+                name: fixture.name, ok: true,
+                summary, noteResults, elapsed,
+            });
             process.stdout.write(`${summary.hits}/${summary.total} (${(summary.detection * 100).toFixed(1)}%) in ${elapsed}s\n`);
         } catch (e) {
             rows.push({ name: fixture.name, ok: false, error: String(e) });

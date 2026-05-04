@@ -7421,6 +7421,38 @@ function createNoteDetector(options = {}) {
         const chartStartTimeSec = Number.isFinite(opts.chartStartTimeSec)
             ? opts.chartStartTimeSec
             : 0;
+        // Optional override: caller-supplied chart notes that the matcher
+        // should match against. Used by the replay-baseline harness when
+        // the host slopsmith hasn't loaded a real song — the dump.json
+        // sidecars carry the chart notes from the original recording.
+        // Each entry: { s, f, t } (string, fret, time).
+        const chartNotesOverride = Array.isArray(opts.chartNotes)
+            ? opts.chartNotes
+            : null;
+        // Arrangement override — necessary because _ndMidiFromStringFret
+        // uses currentArrangement/currentStringCount/tuningOffsets to
+        // compute expectedMidi from (s, f). Without this set correctly
+        // a bass-recording fixture replayed with the default 'guitar'
+        // arrangement produces ~1 semitone-per-string offset on
+        // expectedMidi, which then cascades into 200¢-pitch-error hits.
+        if (typeof opts.arrangement === 'string') {
+            currentArrangement = opts.arrangement;
+        }
+        if (Number.isFinite(opts.stringCount)) {
+            currentStringCount = opts.stringCount;
+            // Resize tuningOffsets to match — same invariant the
+            // live arrangement-set path maintains.
+            if (tuningOffsets.length !== opts.stringCount) {
+                tuningOffsets = new Array(opts.stringCount).fill(0);
+            }
+        }
+        if (Array.isArray(opts.tuning)) {
+            tuningOffsets = opts.tuning.slice();
+            currentStringCount = opts.tuning.length;
+        }
+        if (Number.isFinite(opts.capo)) {
+            capo = opts.capo;
+        }
 
         // Build audio graph manually — bypasses startAudio's
         // getUserMedia path. Reuses module-scoped audio constants.
@@ -7524,8 +7556,31 @@ function createNoteDetector(options = {}) {
         // Mock hw.getTime so the matcher sees chart time advance in
         // lockstep with WAV playback. AudioContext.currentTime is the
         // master clock — incrementing relative to wavStartCtxT.
-        const _hw = resolveHw();
+        // Also optionally mock hw.getNotes / hw.getChords if the
+        // caller passed a chartNotesOverride (replay harness path).
+        let _hw = resolveHw();
+        // If no highway is available at all (headless harness with
+        // slopsmith stubbed), build a minimal stub object the
+        // matcher can read. createNoteDetector resolves window.highway
+        // lazily; if it's null we install a stub on window.
+        if (!_hw && chartNotesOverride) {
+            window.highway = {
+                _stub: true,
+                getNotes: () => chartNotesOverride,
+                getChords: () => [],
+                getSections: () => [],
+                getSongInfo: () => ({}),
+                getTime: () => 0,
+                getAvOffset: () => 0,
+                setLefty: () => {},
+                getLefty: () => false,
+            };
+            _hw = window.highway;
+            hw = _hw;  // bind closure-local ref so subsequent calls use the stub
+        }
         const realGetTime = _hw && _hw.getTime ? _hw.getTime.bind(_hw) : null;
+        const realGetNotes = _hw && _hw.getNotes ? _hw.getNotes.bind(_hw) : null;
+        const realGetChords = _hw && _hw.getChords ? _hw.getChords.bind(_hw) : null;
         const wavStartCtxT = audioCtx.currentTime + 0.05;  // small lookahead
 
         if (_hw && realGetTime) {
@@ -7533,6 +7588,10 @@ function createNoteDetector(options = {}) {
                 const elapsed = audioCtx.currentTime - wavStartCtxT;
                 return chartStartTimeSec + Math.max(0, elapsed);
             };
+        }
+        if (_hw && chartNotesOverride) {
+            _hw.getNotes = () => chartNotesOverride;
+            _hw.getChords = () => [];
         }
 
         enabled = true;
@@ -7578,8 +7637,11 @@ function createNoteDetector(options = {}) {
             }
         }
 
-        // Restore real getTime so subsequent live use isn't broken.
+        // Restore real getTime / getNotes / getChords so subsequent
+        // live use isn't broken.
         if (_hw && realGetTime) _hw.getTime = realGetTime;
+        if (_hw && realGetNotes) _hw.getNotes = realGetNotes;
+        if (_hw && realGetChords) _hw.getChords = realGetChords;
 
         // Build summary using the SAME _ndScoresFromNotes the live HUD
         // and modal use, so the harness number can never drift from
