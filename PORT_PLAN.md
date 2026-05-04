@@ -17,7 +17,12 @@ shape during porting.
 ✓ Unit 3b — exportCoachingAnalysis entry point e2e6a9a
 ✓ Unit 3c — Coaching review modal base layout  7f532d1
 ✓ Unit 3d — Modal heatmap SVGs                 7775a40
+✓ Unit 6a — Drift compensation                  cafeb98
+✓ Unit 6b — Tier-2 nearest-time selection      dff9855
+✓ Unit 6d — IGNORED_DETECTOR_FAILURE demotion  4f22231
 
+☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
+☐ Unit 6e  Onset-gated stability flush
 ☐ Unit 3f  Improvement deltas (current vs prior play)
 ☐ Unit 3a  Coaching analysis pure functions
 ☐ Unit 3b  _ndExportCoachingAnalysis entry point
