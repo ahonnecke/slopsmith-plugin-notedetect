@@ -2496,6 +2496,7 @@ function createNoteDetector(options = {}) {
     let hudInterval = null;
     let missCheckInterval = null;
     let gcInterval = null;
+    let diagnosticsInterval = null;
     let flashTimeouts = [];
 
     // Set to true when startAudio() routed through the slopsmith-desktop
@@ -5679,6 +5680,18 @@ function createNoteDetector(options = {}) {
             }
         }, 5000);
 
+        // Auto-dump diagnostics every 30s to /tmp/nd_diagnostics so
+        // the user doesn't have to paste console output during port
+        // debugging — the dumps land on the slopsmith host's disk and
+        // can be read directly. Default singleton only; non-default
+        // instances would step on each other's filenames.
+        if (isDefault) {
+            diagnosticsInterval = setInterval(() => {
+                if (!enabled) return;
+                postDiagnosticsDump('periodic').catch(() => {});
+            }, 30000);
+        }
+
         if (detectionMethod === 'crepe') _ndLoadCrepe();
         return true;
     }
@@ -5689,9 +5702,51 @@ function createNoteDetector(options = {}) {
     // pre-factory behaviour was to silently reset here. Parameter is
     // named distinctly from the factory's outer `opts` to avoid the
     // lexical shadow.
+    // Snapshot stats + post to the server-side diagnostics endpoint.
+    // Auto-collect path so the user doesn't paste console output —
+    // dumps land in /tmp/nd_diagnostics/ on the slopsmith host. Only
+    // the default singleton fires these; non-default instances would
+    // step on each other's filenames.
+    async function postDiagnosticsDump(reason) {
+        if (!isDefault) return;
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const stats = api.getStats();
+        const payload = {
+            reason,
+            timestamp: new Date().toISOString(),
+            songId: songInfo.songId || songInfo.title || 'unknown',
+            songTitle: songInfo.title,
+            arrangement: songInfo.arrangement,
+            tuning: songInfo.tuning,
+            stats,
+            // Drift + onset thresholds + note-result count give the
+            // full picture of "what's the matcher doing right now."
+            noteResultsCount: noteResults.size,
+            avOffsetMs: _hw && _hw.getAvOffset ? _hw.getAvOffset() : null,
+            inputGain,
+            latencyOffset,
+        };
+        try {
+            await fetch('/api/plugins/note_detect/diagnostics', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+        } catch (e) {
+            // Network failures are non-fatal — diagnostics is a
+            // debug aid, not a critical path.
+        }
+    }
+
     function disable(disableOptions) {
         if (!enabled) return;
         enabled = false;
+        // One last diagnostics dump on the way out so the final
+        // session state lands on disk before we tear everything
+        // down. Fire-and-forget; we don't await it because disable
+        // needs to return quickly to keep the UI responsive.
+        postDiagnosticsDump('disable').catch(() => {});
         // Invalidate any CREPE inference currently awaited in
         // processFrame — it captured the previous sessionGen and will
         // bail on mismatch rather than apply post-disable detections.
@@ -5703,6 +5758,7 @@ function createNoteDetector(options = {}) {
         stopHUD();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
+        if (diagnosticsInterval) { clearInterval(diagnosticsInterval); diagnosticsInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
         flashTimeouts = [];
 
