@@ -1011,6 +1011,38 @@ function _ndLoadScript(src) {
     });
 }
 
+// Score → CSS color ramp. Used by HUDs and modal tiles to give the
+// player a glance-readable color for any 0..1 score. null/undefined
+// returns neutral gray (no data).
+function _ndScoreColor(pct) {
+    if (pct == null) return '#4b5563';
+    if (pct >= 0.90) return '#10b981';   // green
+    if (pct >= 0.70) return '#eab308';   // yellow
+    if (pct >= 0.40) return '#f97316';   // orange
+    return '#dc2626';                    // red
+}
+
+// "M:SS" formatter for chart-time labels. Used by drill HUD and
+// loop-naming so saved drills are scannable in the saved-loops dropdown.
+function _ndFmtMmSs(t) {
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+// Pure: does a (start, end) loop range duplicate any in `existingLoops`
+// within `tolSec` on both endpoints? Used by drill auto-save to avoid
+// piling identical loops into the user's saved-loops list each time
+// they re-drill the same trouble spot.
+function _ndIsDuplicateLoop(start, end, existingLoops, tolSec = 0.5) {
+    if (!existingLoops || !existingLoops.length) return false;
+    return existingLoops.some(l =>
+        typeof l.start === 'number' && typeof l.end === 'number'
+        && Math.abs(l.start - start) <= tolSec
+        && Math.abs(l.end - end) <= tolSec
+    );
+}
+
 // ── Drill mode ─────────────────────────────────────────────────────────────
 //
 // A drill loops a short cluster of trouble notes so the player can grind
@@ -1031,6 +1063,12 @@ function _ndLoadScript(src) {
 const _ND_DRILL_LEAD_IN_SEC = 5;
 const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.5;
 const _ND_DRILL_SLOW_SPEED = 0.95;
+// Loop-restart detection. When chartTime jumps backward by more than
+// MIN_BACKWARD_SEC, that's a loop wrap (slopsmith's audio engine
+// re-seeking to loopA). Refractory window suppresses duplicate fires
+// from audio-engine seek bouncing.
+const _ND_LOOP_RESTART_MIN_BACKWARD_SEC = 1.0;
+const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 
 // ── Two-axis scoring ───────────────────────────────────────────────────────
 //
@@ -1393,6 +1431,17 @@ function createNoteDetector(options = {}) {
     let drillLabel = null;
     let drillSavedSpeed = null;
     let drillSpeedMul = 1.0;
+    // Iteration tracking — per-loop scoring across the drill session.
+    let drillFocus = null;          // string shown in the HUD ("Late by 30ms" etc.)
+    let drillGoal = null;           // 0..1 target score
+    let drillIterScores = [];       // detection score (0..1) per loop iteration
+    let drillBestScore = 0;
+    let drillGoalReached = false;   // sticky once user crosses the goal
+    // Loop-restart detection (chartTime backward jump > 1s). Refractory
+    // suppresses audio-engine seek bouncing from firing 4-6× per real
+    // restart.
+    let lastSeenChartTime = 0;
+    let lastLoopRestartPerf = 0;
 
     // Scoring
     let hits = 0;
@@ -3326,6 +3375,12 @@ function createNoteDetector(options = {}) {
 
     function checkMisses() {
         if (!enabled) return;
+        // Loop-restart detection runs alongside miss-checking on the
+        // same 10Hz tick. Slopsmith's audio engine handles the wrap
+        // but doesn't emit a `loop:restart` event — we infer it from
+        // chartTime jumping backward and use it to capture per-iter
+        // scores during drill mode.
+        detectLoopRestart();
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
@@ -4954,7 +5009,7 @@ function createNoteDetector(options = {}) {
     }
 
     async function startDrillRange(startSec, endSec, label, drillOpts = {}) {
-        const { speedMul = 1.0 } = drillOpts;
+        const { speedMul = 1.0, focus = null, goal = null } = drillOpts;
         const audio = document.getElementById('audio');
         if (!audio) {
             console.warn('[note_detect] startDrillRange: no <audio id="audio"> element');
@@ -4990,6 +5045,15 @@ function createNoteDetector(options = {}) {
         drillJudgeStart = start;
         drillJudgeEnd = end;
         drillLabel = label || `${start.toFixed(1)}-${end.toFixed(1)}s`;
+        drillFocus = focus;
+        drillGoal = goal;
+        drillIterScores = [];
+        drillBestScore = 0;
+        drillGoalReached = false;
+        // Reset chart-time tracking so the first detected restart is a
+        // real one, not a residual jump from before the drill started.
+        lastSeenChartTime = 0;
+        lastLoopRestartPerf = 0;
 
         // Speed scaffolding: drilling slightly slower buys reaction time.
         drillSavedSpeed = audio.playbackRate;
@@ -5016,6 +5080,10 @@ function createNoteDetector(options = {}) {
 
         if (!enabled) await enable();
 
+        showDrillHud();
+        // Fire-and-forget — network failures shouldn't block drill startup.
+        autoSaveDrillLoop(loopStart, loopEnd).catch(() => {});
+
         console.log(`[note_detect] Drill "${drillLabel}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (lead-in ${(start - loopStart).toFixed(1)}s)`);
         return true;
     }
@@ -5028,12 +5096,160 @@ function createNoteDetector(options = {}) {
                 && audio.playbackRate !== drillSavedSpeed) {
             audio.playbackRate = drillSavedSpeed;
         }
+        hideDrillHud();
         drillActive = false;
         drillJudgeStart = null;
         drillJudgeEnd = null;
         drillLabel = null;
         drillSavedSpeed = null;
         drillSpeedMul = 1.0;
+        drillFocus = null;
+        drillGoal = null;
+        drillIterScores = [];
+        drillBestScore = 0;
+        drillGoalReached = false;
+    }
+
+    // Detect a loop wrap by watching chartTime for a backward jump >1s.
+    // Slopsmith's audio engine doesn't emit a `loop:restart` event;
+    // we infer it from the chart clock. Refractory window (1.5s)
+    // suppresses audio-engine seek bouncing from firing duplicate
+    // captures per real iteration. Called from the missCheck tick (10Hz).
+    function detectLoopRestart() {
+        const _hw = resolveHw();
+        if (!_hw || !_hw.getTime) return;
+        const chartT = _hw.getTime();
+        const nowSec = performance.now() / 1000;
+        const sinceLastRestart = nowSec - lastLoopRestartPerf;
+        const jumpedBack = lastSeenChartTime > 0
+            && chartT >= 0
+            && chartT < lastSeenChartTime - _ND_LOOP_RESTART_MIN_BACKWARD_SEC;
+        if (jumpedBack && sinceLastRestart > _ND_LOOP_RESTART_REFRACTORY_SEC) {
+            lastLoopRestartPerf = nowSec;
+            if (drillActive) drillCaptureIterationScore();
+        }
+        lastSeenChartTime = chartT;
+    }
+
+    // On each loop iteration end, push the just-finished iteration's
+    // detection score into drillIterScores, update best-so-far, and
+    // mark the goal reached if the player crossed the threshold.
+    function drillCaptureIterationScore() {
+        if (!drillActive) return;
+        // Build a noteResults array snapshot for the pure scorer.
+        const arr = [];
+        for (const v of noteResults.values()) arr.push(v);
+        const scores = _ndScoresFromNotes(arr);
+        const score = scores.detection || 0;
+        drillIterScores.push(score);
+        if (score > drillBestScore) drillBestScore = score;
+        if (drillGoal != null && score >= drillGoal && !drillGoalReached) {
+            drillGoalReached = true;
+        }
+        updateDrillHud();
+        // The iteration is over — clear noteResults so the next
+        // iteration re-judges from scratch instead of carrying stale
+        // hits forward.
+        noteResults.clear();
+    }
+
+    // ── Drill HUD ─────────────────────────────────────────────────────
+    // Floating overlay showing the drill's focus, goal, current
+    // iteration score, and best-so-far. Lives on document.body so it's
+    // visible regardless of which instance container the player has.
+    function showDrillHud() {
+        let hud = document.getElementById('nd-drill-hud');
+        if (!hud) {
+            hud = document.createElement('div');
+            hud.id = 'nd-drill-hud';
+            hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
+            document.body.appendChild(hud);
+        }
+        updateDrillHud();
+    }
+
+    function updateDrillHud() {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        const goalPct = Math.round((drillGoal || 0) * 100);
+        const lastScore = drillIterScores.length
+            ? drillIterScores[drillIterScores.length - 1] : null;
+        const lastPct = lastScore != null ? Math.round(lastScore * 100) : null;
+        const bestPct = Math.round(drillBestScore * 100);
+        const iter = drillIterScores.length;
+        const focusLine = drillFocus
+            ? `<div class="text-blue-200 text-xs mt-0.5">${drillFocus}</div>` : '';
+        const speedTag = drillSpeedMul !== 1.0
+            ? `<span class="text-yellow-300 text-[11px] ml-2">@ ${Math.round(drillSpeedMul * 100)}%</span>` : '';
+        const goalLine = drillGoalReached
+            ? `<div class="text-green-300 font-bold text-xs mt-1">🎯 Goal hit! ${bestPct}% (target ${goalPct}%)</div>`
+            : (lastPct != null
+                ? `<div class="text-gray-300 text-xs mt-1">
+                     Iter ${iter}: <span class="font-bold" style="color:${_ndScoreColor(lastScore)}">${lastPct}%</span>
+                     · best ${bestPct}%${drillGoal != null ? ` · goal <span class="text-blue-300">${goalPct}%</span>` : ''}
+                   </div>`
+                : `<div class="text-gray-500 text-xs mt-1">Play through the loop — score updates each iteration</div>`);
+        hud.innerHTML = `
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <div class="text-blue-300 text-[10px] uppercase tracking-wide font-semibold">
+                        🎯 Drilling${speedTag}
+                    </div>
+                    ${focusLine}
+                    ${goalLine}
+                </div>
+                <button id="nd-drill-end" class="text-gray-500 hover:text-gray-200 text-xl leading-none px-2"
+                        title="End drill">×</button>
+            </div>
+        `;
+        const endBtn = hud.querySelector('#nd-drill-end');
+        if (endBtn) endBtn.onclick = () => {
+            // End drill = clear loop. Slopsmith's clear-loop handler
+            // nulls loopA/loopB; we then call endDrill to tear down the
+            // HUD and restore playbackRate.
+            const clearBtn = document.getElementById('btn-loop-clear');
+            if (clearBtn) clearBtn.click();
+            endDrill();
+        };
+    }
+
+    function hideDrillHud() {
+        const hud = document.getElementById('nd-drill-hud');
+        if (hud) hud.remove();
+    }
+
+    // Save the drill's loop range to slopsmith's saved-loops list so
+    // the user can return to the same trouble spot via the dropdown.
+    // Dedupes within 0.5s on both endpoints — re-drilling the same
+    // cluster won't pile copies. Fire-and-forget; failures don't
+    // block drill startup.
+    async function autoSaveDrillLoop(loopStart, loopEnd) {
+        const filename = window.currentFilename;
+        if (!filename) return;
+        const decoded = decodeURIComponent(filename);
+        let existing = [];
+        try {
+            const r = await fetch(`/api/loops?filename=${encodeURIComponent(decoded)}`);
+            if (r.ok) existing = await r.json();
+        } catch {
+            // Continue without dedup — better to risk a duplicate than
+            // skip the save entirely on a transient network error.
+        }
+        if (_ndIsDuplicateLoop(loopStart, loopEnd, existing)) return;
+        const name = `Drill: ${_ndFmtMmSs(loopStart)}–${_ndFmtMmSs(loopEnd)}`;
+        try {
+            await fetch('/api/loops', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: decoded, name, start: loopStart, end: loopEnd }),
+            });
+            if (typeof window.loadSavedLoops === 'function') {
+                try { await window.loadSavedLoops(); } catch {}
+            }
+        } catch {
+            // Network failure is non-fatal — the user can still drill,
+            // just won't see the loop in the saved-list dropdown.
+        }
     }
 
     function showSummary() {
