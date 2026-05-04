@@ -1076,6 +1076,24 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 const _ND_DRIFT_WINDOW = 8;
 const _ND_DRIFT_MIN_SAMPLES = 4;
 
+// Onset detection + buffer flush. Without this, YIN's 4096-sample
+// window (~85ms at 48kHz) is always contaminated by the previous
+// note's sustain — on bass this means YIN locks on the previous
+// pitch when a new pluck arrives, the matcher records detectedMidi
+// for the wrong note, and the chart note becomes a miss. Onset
+// detection fires when RMS crosses a threshold from below; on
+// onset we flush the accumulator so the next YIN window is built
+// entirely from post-onset chunks. Re-attack detection fires on
+// in-note RMS spikes so rapid same-pitch passes (where sustain
+// keeps inNote=true) still get fresh detections.
+const _ND_ONSET_LEVEL = 0.04;            // RMS above → entering a note
+const _ND_ONSET_EXIT_LEVEL = 0.02;       // RMS below → note ended
+const _ND_REATTACK_REFRACTORY_SEC = 0.20; // refractory after onset
+const _ND_REATTACK_MIN_LEVEL = 0.04;     // re-attack must reach this RMS
+const _ND_REATTACK_REARM_LEVEL = 0.02;   // dip below this re-arms re-attack gate
+const _ND_REATTACK_RATIO = 1.5;          // RMS spike must be N× recent min
+const _ND_REATTACK_WINDOW = 8;           // recent-min window (chunks)
+
 // Detector-failure demotion. The score should reflect playing
 // quality, not detector limitations. Misses caused by sustain bleed
 // or onset-detector refractory (rather than the player's error) get
@@ -2186,6 +2204,14 @@ function createNoteDetector(options = {}) {
     // residual A/V drift the user's static calibration didn't catch.
     let driftBuffer = [];
     let driftEstimateMs = 0;
+    // Onset state. inNote tracks the RMS-envelope hysteresis;
+    // reattackRmsBuf is the rolling RMS history used by the re-attack
+    // trigger to detect a fresh pluck during sustain.
+    let inNote = false;
+    let lastOnsetPerfSec = 0;
+    let reattackArmed = false;
+    let reattackRmsBuf = [];
+    let onsetCount = 0;
 
     // Scoring
     let hits = 0;
@@ -2850,6 +2876,68 @@ function createNoteDetector(options = {}) {
             processor.onaudioprocess = (e) => {
                 if (!enabled) return;
                 const input = e.inputBuffer.getChannelData(0);
+
+                // RMS for onset detection.
+                let sumSq = 0;
+                for (let j = 0; j < input.length; j++) sumSq += input[j] * input[j];
+                const rms = Math.sqrt(sumSq / input.length);
+
+                // Maintain rolling RMS history for the re-attack trigger.
+                reattackRmsBuf.push(rms);
+                if (reattackRmsBuf.length > _ND_REATTACK_WINDOW) reattackRmsBuf.shift();
+
+                const nowSec = performance.now() / 1000;
+                const refractoryOk = (nowSec - lastOnsetPerfSec) > _ND_REATTACK_REFRACTORY_SEC;
+
+                // Re-arm the re-attack gate when the envelope dips
+                // below rearm level — confirms previous sustain has
+                // genuinely released so a subsequent spike is a fresh
+                // pluck rather than body-peak resonance from the
+                // ongoing note.
+                if (rms < _ND_REATTACK_REARM_LEVEL) reattackArmed = true;
+
+                let fireOnset = false;
+                // Trigger 1: silence → playing (fresh note after rest).
+                if (rms > _ND_ONSET_LEVEL && !inNote && refractoryOk) {
+                    inNote = true;
+                    fireOnset = true;
+                }
+                // Trigger 2: in-note re-attack — RMS spike above recent
+                // running min, gated by prior release. Catches rapid
+                // same-pitch plucks where sustain keeps inNote=true
+                // between attacks.
+                else if (inNote && refractoryOk && reattackArmed
+                         && rms > _ND_REATTACK_MIN_LEVEL
+                         && reattackRmsBuf.length >= 3) {
+                    const recentMin = Math.min(...reattackRmsBuf.slice(0, -1));
+                    if (rms > recentMin * _ND_REATTACK_RATIO) fireOnset = true;
+                }
+                // Exit hysteresis — wait for clearly-below to reset
+                // inNote so sustain noise doesn't toggle Trigger 1.
+                else if (rms < _ND_ONSET_EXIT_LEVEL) {
+                    inNote = false;
+                }
+
+                if (fireOnset) {
+                    // Flush the YIN buffer AND drop this trigger chunk.
+                    // The trigger chunk is half pre-attack (previous
+                    // sustain) and half post-attack — when previous
+                    // sustain is louder than the new attack (soft
+                    // pluck after a held note), keeping it lets YIN
+                    // lock onto the stale pitch. Returning here drops
+                    // the trigger chunk so the next 4096-sample YIN
+                    // buffer is built entirely from post-onset chunks.
+                    // Costs one extra ScriptProcessor chunk (~43ms) of
+                    // latency but is the dominant fix for bass-on-mic
+                    // sustain bleed.
+                    lastOnsetPerfSec = nowSec;
+                    reattackArmed = false;
+                    onsetCount++;
+                    accumBuffer = new Float32Array(0);
+                    pendingBuffer = null;
+                    return;
+                }
+
                 const prev = accumBuffer;
                 const combined = new Float32Array(prev.length + input.length);
                 combined.set(prev);
@@ -4996,6 +5084,14 @@ function createNoteDetector(options = {}) {
         // latency doesn't leak into the next track's calibration.
         driftBuffer = [];
         driftEstimateMs = 0;
+        // Onset state — same reasoning. Don't carry inNote=true into
+        // the next session or the first note will be missed by the
+        // refractory check.
+        inNote = false;
+        lastOnsetPerfSec = 0;
+        reattackArmed = false;
+        reattackRmsBuf = [];
+        onsetCount = 0;
     }
 
     // Narrower reset used by the A/V auto-calibrate Apply button.
@@ -7227,6 +7323,8 @@ function createNoteDetector(options = {}) {
             sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
             driftEstimateMs,
             driftSamples: driftBuffer.length,
+            onsetCount,
+            inNote,
         }),
         // The user's most-recently-expressed preference: did they last
         // click Detect to turn it ON? Distinct from isEnabled(), which
