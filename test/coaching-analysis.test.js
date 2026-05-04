@@ -248,3 +248,42 @@ test('exportCoachingAnalysis — totalDuration passed through for renderer', () 
     const bundle = core.exportCoachingAnalysis({ noteResults: [] }, { totalDuration: 240 });
     assert.strictEqual(bundle.totalDuration, 240);
 });
+
+// ── Unit 3c — modal HTML renderers ────────────────────────────────────────
+
+test('renderSubScoreTile — basic shape', () => {
+    const html = core.renderSubScoreTile('Pitch', '85%', '#10b981', 'nd-delta-pitch');
+    assert.ok(html.includes('Pitch'));
+    assert.ok(html.includes('85%'));
+    assert.ok(html.includes('#10b981'));
+    assert.ok(html.includes('id="nd-delta-pitch"'));
+});
+
+test('renderSubScoreTile — no delta slot when id omitted', () => {
+    const html = core.renderSubScoreTile('Pitch', '85%', '#10b981');
+    assert.ok(html.includes('Pitch'));
+    assert.ok(!html.includes('nd-delta-'));
+});
+
+test('renderClusterRow — uses _ndScoresFromNotes for accuracy', () => {
+    const cluster = {
+        startSec: 30,
+        endSec: 36,
+        misses: 2,
+        total: 5,
+        notes: [
+            mkNote({ noteTime: 30, hit: true }),
+            mkNote({ noteTime: 31, hit: false }),
+            mkNote({ noteTime: 32, hit: true }),
+            mkNote({ noteTime: 33, hit: false }),
+            mkNote({ noteTime: 34, hit: true }),
+        ],
+    };
+    const html = core.renderClusterRow(cluster, 0);
+    assert.ok(html.includes('0:30'));      // _ndFmtMmSs(30)
+    assert.ok(html.includes('0:36'));      // _ndFmtMmSs(36)
+    assert.ok(html.includes('2 off-target'));
+    assert.ok(html.includes('5 notes'));
+    assert.ok(html.includes('data-drill-cluster="0"'));
+    assert.ok(html.includes('data-drill-speed="1"') || html.includes('data-drill-speed="1.0"'));
+});

@@ -1476,6 +1476,265 @@ function _ndExportCoachingAnalysis(play, opts = {}) {
     };
 }
 
+// ── Coaching review modal ─────────────────────────────────────────────────
+//
+// Pops at session boundaries (song end, restart, loop-clear, detect-off)
+// to show the player how the just-finished play went. The modal is the
+// primary post-play surface — distinct from drilling (live, intra-loop)
+// or the cross-song history view (Unit 3e — separate fetch).
+//
+// Routing: drill buttons call `window.noteDetect.startDrillRange(...)`,
+// which means the default singleton owns the drill session. Splitscreen
+// per-panel review modals are deferred until a more complex routing
+// scheme is needed.
+//
+// Modal MVP (this unit, Unit 3c):
+//   - Header: song title + Detection/Precision score tiles + close X
+//   - Top-fix banner (axis-level only; cluster-kind needs Unit 3c
+//     follow-on with the failure-mode classifier)
+//   - Sub-score tiles (Pitch / Timing / Coverage)
+//   - Trouble-spot cluster list with Drill buttons (full speed only;
+//     slow-speed recommendation needs cluster.analysis from a
+//     follow-on unit)
+//   - Close on X / outside-click / Escape
+//
+// Deferred to follow-on units:
+//   3d  Time heatmap SVG
+//   3e  History toggle (line chart of past plays)
+//   3f  Improvement deltas (delta slot ids are already in the markup
+//       so 3f only needs to populate them)
+//   3c+ cluster.analysis enrichment (focus sentence, recommendedSpeed)
+const _ND_REVIEW_SOURCE_LABELS = {
+    song_end:   'Song complete',
+    restart:    'Restarted',
+    loop_clear: 'Loop ended',
+    detect_off: 'Detect off',
+};
+
+function _ndRenderSubScoreTile(label, valueText, color, deltaSlotId) {
+    // deltaSlotId is the id of an empty span Unit 3f will patch into.
+    // Render the slot empty initially so the modal opens immediately;
+    // the delta badge appears when the prior-play fetch resolves.
+    const deltaHtml = deltaSlotId
+        ? `<div id="${deltaSlotId}" class="text-[10px] mt-0.5 text-gray-500">&nbsp;</div>`
+        : '';
+    return `
+        <div class="bg-dark-700 border border-gray-700 rounded-lg px-4 py-3 text-center">
+            <div class="text-gray-500 text-[11px] uppercase tracking-wide">${label}</div>
+            <div class="text-2xl font-bold mt-1" style="color:${color}">${valueText}</div>
+            ${deltaHtml}
+        </div>
+    `;
+}
+
+function _ndRenderClusterRow(cluster, idx) {
+    // Cluster accuracy uses the SAME _ndScoresFromNotes the headline
+    // does, so a 79% headline can't coexist with cluster rows showing
+    // 92% and confuse the user about which number is real.
+    const clusterScores = _ndScoresFromNotes(cluster.notes);
+    const accuracy = clusterScores.combined;
+    const accColor = _ndScoreColor(accuracy);
+    const span = `${_ndFmtMmSs(cluster.startSec)}–${_ndFmtMmSs(cluster.endSec)}`;
+    const dur = (cluster.endSec - cluster.startSec).toFixed(1);
+    // Focus sentence is a placeholder until cluster.analysis lands —
+    // surface the raw counts so the row is informative regardless.
+    return `
+        <div class="bg-dark-700 border border-gray-700 rounded-lg px-3 py-2">
+            <div class="flex items-center gap-3">
+                <div class="font-mono text-xl font-bold w-20 text-center" style="color:${accColor}">${span}</div>
+                <div class="flex-1 min-w-0">
+                    <div class="text-gray-200 text-sm font-medium">
+                        ${cluster.misses} off-target in ${dur}s
+                        <span id="nd-cluster-delta-${idx}" class="ml-2 text-[11px]">&nbsp;</span>
+                    </div>
+                    <div class="text-[11px] text-gray-500">
+                        ${cluster.total} note${cluster.total === 1 ? '' : 's'} in window
+                    </div>
+                </div>
+                <div class="flex flex-col gap-1 shrink-0">
+                    <button data-drill-cluster="${idx}" data-drill-speed="1.0"
+                            class="px-3 py-1.5 bg-blue-900/70 hover:bg-blue-800 rounded text-xs text-blue-100 font-semibold whitespace-nowrap">
+                        Drill this
+                    </button>
+                    <button data-drill-cluster="${idx}" data-drill-speed="${_ND_DRILL_SLOW_SPEED}"
+                            class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300 whitespace-nowrap">
+                        @ ${Math.round(_ND_DRILL_SLOW_SPEED * 100)}%
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+async function _ndShowCoachingReview({ playId, source }) {
+    document.getElementById('nd-review-modal')?.remove();
+    let play;
+    try {
+        const r = await fetch(`/api/plugins/note_detect/play/${playId}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        play = await r.json();
+    } catch (e) {
+        console.warn('[note_detect] review fetch failed:', e);
+        return;
+    }
+    const hw = window.highway;
+    const sections = (hw && hw.getSections && hw.getSections()) || [];
+    const songInfo = hw && hw.getSongInfo && hw.getSongInfo();
+    const totalDuration = (songInfo && songInfo.duration) || 0;
+
+    // SINGLE SOURCE OF TRUTH for the modal's numbers. Unit 3b's
+    // exportCoachingAnalysis is the same function the test harness calls,
+    // so a coaching change can never produce different results in
+    // production vs tests.
+    const analysis = _ndExportCoachingAnalysis(play, { sections, totalDuration });
+    const { derived, clusters, topFix } = analysis;
+
+    const pitchPctText = derived.pitchPct != null
+        ? `${Math.round(derived.pitchPct * 100)}%` : '—';
+    const coverageText = derived.coverage != null
+        ? `${Math.round(derived.coverage * 100)}%` : '—';
+    const timingText = derived.timingMedianMs != null
+        ? `${Math.round(derived.timingMedianMs)} ±${Math.round(derived.timingStdMs || 0)}ms`
+        : '—';
+    const combinedColor = _ndScoreColor(derived.combined);
+    const precisionColor = derived.precision != null ? _ndScoreColor(derived.precision) : '#4b5563';
+    const precisionText = derived.precision != null
+        ? Math.round(derived.precision * 100) + '%' : '—';
+
+    const modal = document.createElement('div');
+    modal.id = 'nd-review-modal';
+    modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+
+    // Top-fix banner — axis-level (cluster-kind requires the failure-
+    // mode classifier and is therefore null until that lands).
+    const topFixHtml = topFix && topFix.kind === 'axis' ? `
+        <div class="px-5 py-3 bg-gradient-to-r from-blue-900/30 to-transparent border-b border-blue-800/40">
+            <div class="flex items-start gap-3">
+                <div class="text-2xl leading-none mt-0.5">🎯</div>
+                <div class="flex-1 min-w-0">
+                    <div class="text-blue-200 text-xs uppercase tracking-wide font-semibold">Top fix · ${topFix.axis}</div>
+                    <div class="text-gray-100 text-sm font-medium mt-0.5">${topFix.focus}</div>
+                    ${topFix.advice ? `
+                    <div class="text-gray-400 text-[12px] mt-1 leading-snug">${topFix.advice}</div>` : ''}
+                </div>
+            </div>
+        </div>
+    ` : '';
+
+    modal.innerHTML = `
+        <div class="bg-dark-800 border border-gray-700 rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-auto m-4">
+            <div class="sticky top-0 bg-dark-800 border-b border-gray-700 px-5 py-3 flex items-center justify-between z-10">
+                <div class="min-w-0 flex-1">
+                    <div class="text-gray-200 font-semibold truncate">${(songInfo && songInfo.title) || play.songId || 'Song'}</div>
+                    <div class="text-gray-500 text-xs">
+                        ${_ND_REVIEW_SOURCE_LABELS[source] || source || 'Review'}
+                        · ${play.playedAt ? new Date(play.playedAt).toLocaleString() : ''}
+                        · ${(play.noteResults || []).length} notes
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 ml-4">
+                    <div class="text-right">
+                        <div class="text-[10px] text-gray-500 uppercase tracking-wide">Detection</div>
+                        <div class="text-2xl font-bold leading-none" style="color:${combinedColor}">${
+                            derived.total > 0 ? Math.round(derived.combined * 100) + '%' : '—'
+                        }</div>
+                        <div id="nd-delta-combined" class="text-[10px] mt-0.5 text-gray-500">&nbsp;</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-[10px] text-gray-500 uppercase tracking-wide">Precision</div>
+                        <div class="text-2xl font-bold leading-none" style="color:${precisionColor}">${precisionText}</div>
+                        <div class="text-[10px] mt-0.5 text-gray-500">of ${derived.hits} hits</div>
+                    </div>
+                    <button id="nd-review-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
+                </div>
+            </div>
+
+            ${topFixHtml}
+
+            <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
+                ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct), 'nd-delta-pitch')}
+                ${_ndRenderSubScoreTile('Timing', timingText, _ndScoreColor(
+                    derived.timingMedianMs != null ? Math.max(0, 1 - Math.abs(derived.timingMedianMs) / 100) : null
+                ), 'nd-delta-timing')}
+                ${_ndRenderSubScoreTile('Coverage', coverageText, _ndScoreColor(derived.coverage), 'nd-delta-coverage')}
+            </div>
+
+            <div class="px-5 py-4 border-b border-gray-700">
+                <div class="text-gray-400 text-xs mb-2">Trouble spots — densest miss clusters</div>
+                <div class="space-y-1.5">
+                    ${clusters.length === 0
+                        ? '<div class="text-gray-500 text-xs italic">No trouble clusters — clean play.</div>'
+                        : clusters.map((c, i) => _ndRenderClusterRow(c, i)).join('')
+                    }
+                </div>
+            </div>
+
+            <div class="px-5 py-4">
+                <button id="nd-review-history-toggle"
+                        class="text-gray-400 hover:text-gray-200 text-xs flex items-center gap-1">
+                    <span class="nd-history-arrow">▸</span> History — improvement over time
+                </button>
+                <div id="nd-review-history" class="hidden mt-3"></div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    // Dismissal: X button, click outside, Escape.
+    const close = () => {
+        modal.remove();
+        document.removeEventListener('keydown', escHandler);
+    };
+    const escHandler = (e) => { if (e.key === 'Escape') close(); };
+    modal.querySelector('#nd-review-close').onclick = close;
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    document.addEventListener('keydown', escHandler);
+
+    // Cluster Drill buttons — route to the default singleton.
+    // Splitscreen per-panel routing is deferred; the default singleton
+    // is what the post-play modal speaks to in the standard
+    // single-panel use case.
+    modal.querySelectorAll('[data-drill-cluster]').forEach(btn => {
+        btn.onclick = () => {
+            const idx = parseInt(btn.getAttribute('data-drill-cluster'), 10);
+            const speedAttr = btn.getAttribute('data-drill-speed');
+            const speedMul = speedAttr ? parseFloat(speedAttr) : 1.0;
+            const cluster = clusters[idx];
+            if (!cluster) {
+                console.warn('[note_detect] cluster idx not found:', idx);
+                return;
+            }
+            const detector = window.noteDetect;
+            if (!detector || typeof detector.startDrillRange !== 'function') {
+                console.warn('[note_detect] no default detector to drill on');
+                return;
+            }
+            close();
+            detector.startDrillRange(
+                cluster.startSec, cluster.endSec,
+                `cluster ${idx + 1}`,
+                { speedMul }
+            );
+        };
+    });
+
+    // History toggle is wired here but the body remains a stub until
+    // Unit 3e implements the line chart + section trends.
+    const historyToggle = modal.querySelector('#nd-review-history-toggle');
+    const historyEl = modal.querySelector('#nd-review-history');
+    historyToggle.onclick = () => {
+        const arrow = historyToggle.querySelector('.nd-history-arrow');
+        if (historyEl.classList.contains('hidden')) {
+            historyEl.classList.remove('hidden');
+            arrow.textContent = '▾';
+            historyEl.innerHTML = '<div class="text-gray-500 text-xs italic">History view ships in a follow-on unit.</div>';
+        } else {
+            historyEl.classList.add('hidden');
+            arrow.textContent = '▸';
+        }
+    };
+}
+
 async function _ndCrepeDetect(buffer) {
     if (!_ndShared.model) return { freq: -1, confidence: 0 };
     try {

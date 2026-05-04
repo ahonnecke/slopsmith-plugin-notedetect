@@ -306,6 +306,11 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
         aggregateBySection: sandbox._ndAggregateBySection,
         exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
+        // Unit 3c — pure HTML renderers (_ndShowCoachingReview itself
+        // is async + DOM, not exposed). These return strings and are
+        // testable against the bundle shape from 3b.
+        renderSubScoreTile: sandbox._ndRenderSubScoreTile,
+        renderClusterRow: sandbox._ndRenderClusterRow,
     };
 }
 
