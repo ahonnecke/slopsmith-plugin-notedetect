@@ -9,11 +9,14 @@ shape during porting.
 ## Status (2026-05-04)
 
 ```
-✓ Unit 1 — Two-axis scoring                    e035e9e
-✓ Unit 2 — Drill mode core (start/end/gate)    9e0e2ec
-✓ Unit 5 — Gain slider live-update             6d56a78
+✓ Unit 1  — Two-axis scoring                    e035e9e
+✓ Unit 2  — Drill mode core (start/end/gate)    9e0e2ec
+✓ Unit 5  — Gain slider live-update             6d56a78
+✓ Unit 2x — Drill HUD + iteration + auto-save  aae1593
+✓ Unit 3a — Coaching analysis pure functions   253110e
+✓ Unit 3b — exportCoachingAnalysis entry point e2e6a9a
 
-☐ Unit 2x  Drill HUD + iteration scoring + auto-save
+☐ Unit 3c  Coaching review modal — base layout
 ☐ Unit 3a  Coaching analysis pure functions
 ☐ Unit 3b  _ndExportCoachingAnalysis entry point
 ☐ Unit 3c  Coaching review modal — base layout
