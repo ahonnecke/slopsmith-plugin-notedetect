@@ -21,7 +21,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 
 
 # Write to the plugin's own directory rather than /tmp because
@@ -32,6 +33,12 @@ from fastapi import FastAPI, Request
 # exec. The dir is computed at module-import time relative to this
 # file's path — same trick as plugins/__init__.py uses.
 _DIAG_DIR = Path(__file__).parent / "diagnostics"
+# Fixture WAVs live under test/fixtures/ on the host (bind-mounted
+# into the container at the same path). The replay-baseline harness
+# (test/replay-baseline.js) drives puppeteer to fetch fixtures via
+# the route below, so the browser context can replay them through
+# the detection pipeline without a separate file server.
+_FIXTURES_DIR = Path(__file__).parent / "test" / "fixtures"
 # Cap retained dumps so a long-running session doesn't fill /tmp.
 # Newest 50 retained; older silently dropped on each write.
 _DIAG_RETENTION = 50
@@ -97,6 +104,52 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
 
         _prune_old_dumps()
         return {"ok": True, "path": str(target), "retained": _DIAG_RETENTION}
+
+    @app.get("/api/plugins/note_detect/fixtures")
+    def list_fixtures() -> dict[str, Any]:
+        """List the WAV fixtures + JSON sidecars available for replay.
+        Used by test/replay-baseline.js to discover what's available
+        without a host-side filesystem walk."""
+        if not _FIXTURES_DIR.is_dir():
+            return {"fixtures": []}
+        wavs = sorted(_FIXTURES_DIR.glob("*.wav"))
+        out: list[dict[str, Any]] = []
+        for w in wavs:
+            sidecar = w.with_suffix(".json")
+            chart_start = 0.0
+            song_id = None
+            if sidecar.is_file():
+                try:
+                    sc = json.loads(sidecar.read_text())
+                    chart_start = float(sc.get("chartStartTime", 0.0))
+                    song_id = sc.get("songId") or sc.get("filename")
+                except Exception:
+                    pass
+            out.append({
+                "name": w.name,
+                "size": w.stat().st_size,
+                "chartStartTime": chart_start,
+                "songId": song_id,
+            })
+        return {"fixtures": out}
+
+    @app.get("/api/plugins/note_detect/fixtures/{name}")
+    def get_fixture(name: str) -> Any:
+        """Serve a WAV fixture file. Path-traversal-safe via name
+        sanitization: must be a single filename ending in .wav and
+        must resolve inside _FIXTURES_DIR."""
+        if "/" in name or "\\" in name or ".." in name.split("/"):
+            raise HTTPException(400, "invalid fixture name")
+        if not name.endswith(".wav"):
+            raise HTTPException(400, "fixture must be a .wav file")
+        target = (_FIXTURES_DIR / name).resolve()
+        try:
+            target.relative_to(_FIXTURES_DIR.resolve())
+        except ValueError:
+            raise HTTPException(400, "path escape detected")
+        if not target.is_file():
+            raise HTTPException(404, f"fixture not found: {name}")
+        return FileResponse(target, media_type="audio/wav", filename=name)
 
     @app.get("/api/plugins/note_detect/diagnostics")
     def list_diagnostics() -> dict[str, Any]:

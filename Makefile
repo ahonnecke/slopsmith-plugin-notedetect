@@ -53,6 +53,14 @@ check-slopsmith:
 test: ## Run the plugin's node:test suite (no deps)
 	npm test
 
+.PHONY: replay-baseline
+replay-baseline: ## Run all WAV fixtures through the detector via puppeteer (slopsmith must be running)
+	node test/replay-baseline.js --url http://localhost:$(SLOPSMITH_PORT) $(REPLAY_ARGS)
+
+.PHONY: replay-gasoline
+replay-gasoline: ## Replay just the gasoline fixtures
+	node test/replay-baseline.js --url http://localhost:$(SLOPSMITH_PORT) --fixture-glob 'gasoline*.wav'
+
 .PHONY: dev
 dev: check-slopsmith ## Start slopsmith with this plugin mounted (http://localhost:$(SLOPSMITH_PORT))
 	$(COMPOSE) up -d

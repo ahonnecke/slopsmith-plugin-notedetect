@@ -1,0 +1,180 @@
+#!/usr/bin/env node
+/**
+ * Replay baseline harness — runs recorded WAV fixtures through the
+ * detection pipeline via puppeteer (headless Chrome) and reports
+ * per-fixture hit rates.
+ *
+ * The host slopsmith server must be running (port 8088 by default)
+ * and serving the note_detect plugin from this checkout. Fixtures
+ * are discovered via `/api/plugins/note_detect/fixtures` (the route
+ * added in routes.py) and replayed via `window.noteDetect.testInjectWav`
+ * (added in screen.js Unit H1).
+ *
+ * Usage:
+ *   node test/replay-baseline.js
+ *   node test/replay-baseline.js --fixture-glob 'gasoline*'
+ *   node test/replay-baseline.js --headed
+ *   node test/replay-baseline.js --url http://localhost:8088
+ *
+ * Output:
+ *   Console table of per-fixture hit/miss/detection/precision.
+ *   Combined totals at the bottom.
+ *   JSON dump under test/replay-results/<timestamp>.json so a
+ *   subsequent run can diff against it.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const puppeteer = require('puppeteer');
+
+const args = process.argv.slice(2);
+function getArg(name, defaultVal) {
+    const idx = args.indexOf(`--${name}`);
+    if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
+    return defaultVal;
+}
+const SLOPSMITH_URL = getArg('url', process.env.SLOPSMITH_URL || 'http://localhost:8088');
+const FIXTURE_GLOB = getArg('fixture-glob', '*');
+const HEADED = args.includes('--headed');
+const TIMEOUT_MS = 180_000;
+
+function globToRegex(pattern) {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    return new RegExp(`^${escaped}$`);
+}
+
+async function discoverFixtures() {
+    const res = await fetch(`${SLOPSMITH_URL}/api/plugins/note_detect/fixtures`);
+    if (!res.ok) {
+        throw new Error(`fixture discovery failed: HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const re = globToRegex(FIXTURE_GLOB);
+    return (data.fixtures || []).filter(f => re.test(f.name));
+}
+
+async function runOne(page, fixture) {
+    const wavUrl = `/api/plugins/note_detect/fixtures/${encodeURIComponent(fixture.name)}`;
+    return await page.evaluate(async (url, chartStart) => {
+        if (!window.noteDetect || typeof window.noteDetect.testInjectWav !== 'function') {
+            throw new Error('window.noteDetect.testInjectWav unavailable — plugin not loaded?');
+        }
+        if (window.noteDetect.isEnabled()) {
+            window.noteDetect.disable({ silent: true });
+            await new Promise(r => setTimeout(r, 100));
+        }
+        return await window.noteDetect.testInjectWav(url, {
+            chartStartTimeSec: chartStart,
+        });
+    }, wavUrl, fixture.chartStartTime || 0);
+}
+
+function fmtPct(n) {
+    if (n == null || !Number.isFinite(n)) return '   —';
+    return `${(n * 100).toFixed(1)}%`.padStart(6);
+}
+
+function fmtCount(n) {
+    return String(n).padStart(4);
+}
+
+(async () => {
+    const fixtures = await discoverFixtures();
+    if (fixtures.length === 0) {
+        console.error(`No fixtures matched ${FIXTURE_GLOB} at ${SLOPSMITH_URL}/api/plugins/note_detect/fixtures`);
+        process.exit(1);
+    }
+    console.log(`Discovered ${fixtures.length} fixture(s) at ${SLOPSMITH_URL}`);
+    fixtures.forEach(f => console.log(`  ${f.name}  chartStart=${(f.chartStartTime || 0).toFixed(2)}s`));
+    console.log();
+
+    const browser = await puppeteer.launch({
+        headless: HEADED ? false : 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--autoplay-policy=no-user-gesture-required'],
+    });
+    const page = await browser.newPage();
+    page.setDefaultTimeout(TIMEOUT_MS);
+
+    // Surface in-browser errors to the host console so harness
+    // failures aren't silent.
+    page.on('console', (msg) => {
+        const t = msg.type();
+        if (t === 'error' || t === 'warning') {
+            console.warn(`[browser:${t}]`, msg.text());
+        }
+    });
+    page.on('pageerror', (err) => console.error('[browser:pageerror]', err.message));
+
+    await page.goto(SLOPSMITH_URL, { waitUntil: 'networkidle2', timeout: TIMEOUT_MS });
+    // Give plugins a moment to register on the page.
+    await page.waitForFunction(
+        () => !!(window.noteDetect && window.noteDetect.testInjectWav),
+        { timeout: 30_000 },
+    ).catch(() => {
+        throw new Error('window.noteDetect.testInjectWav never appeared — plugin failed to load');
+    });
+
+    const rows = [];
+    for (const fixture of fixtures) {
+        process.stdout.write(`Replaying ${fixture.name} ... `);
+        try {
+            const t0 = Date.now();
+            const { summary } = await runOne(page, fixture);
+            const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            rows.push({ name: fixture.name, ok: true, summary, elapsed });
+            process.stdout.write(`${summary.hits}/${summary.total} (${(summary.detection * 100).toFixed(1)}%) in ${elapsed}s\n`);
+        } catch (e) {
+            rows.push({ name: fixture.name, ok: false, error: String(e) });
+            process.stdout.write(`FAILED: ${e.message}\n`);
+        }
+    }
+
+    await browser.close();
+
+    // Summary table
+    console.log();
+    console.log('=== Replay results ===');
+    console.log('  hits  miss total   detect    prec   onsets   drift  fixture');
+    let totalHits = 0, totalMisses = 0, totalNotes = 0, totalOnsets = 0;
+    for (const r of rows) {
+        if (!r.ok) {
+            console.log(`     —    —    —      —      —       —       —  ${r.name}  (${r.error})`);
+            continue;
+        }
+        const s = r.summary;
+        totalHits += s.hits;
+        totalMisses += s.misses;
+        totalNotes += s.total;
+        totalOnsets += s.onsetCount || 0;
+        const drift = (s.driftEstimateMs ?? 0).toFixed(0).padStart(6);
+        console.log(`  ${fmtCount(s.hits)} ${fmtCount(s.misses)} ${fmtCount(s.total)}  ${fmtPct(s.detection)}  ${fmtPct(s.precision)}  ${fmtCount(s.onsetCount || 0)}  ${drift}  ${r.name}`);
+    }
+    console.log('  ----  ---- -----  ------  ------  ------  ------');
+    const overallDetection = totalNotes > 0 ? totalHits / totalNotes : null;
+    console.log(`  ${fmtCount(totalHits)} ${fmtCount(totalMisses)} ${fmtCount(totalNotes)}  ${fmtPct(overallDetection)}      —  ${fmtCount(totalOnsets)}      —  TOTAL`);
+
+    // Persist results so subsequent runs can diff.
+    const outDir = path.join(__dirname, 'replay-results');
+    fs.mkdirSync(outDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const outFile = path.join(outDir, `${stamp}.json`);
+    fs.writeFileSync(outFile, JSON.stringify({
+        url: SLOPSMITH_URL,
+        timestamp: stamp,
+        glob: FIXTURE_GLOB,
+        rows,
+        totals: {
+            hits: totalHits,
+            misses: totalMisses,
+            total: totalNotes,
+            detection: overallDetection,
+            onsetCount: totalOnsets,
+        },
+    }, null, 2));
+    console.log(`\nResults written to ${outFile}`);
+
+    process.exit(0);
+})().catch((err) => {
+    console.error('Harness error:', err);
+    process.exit(1);
+});
