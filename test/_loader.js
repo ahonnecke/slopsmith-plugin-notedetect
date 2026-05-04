@@ -305,6 +305,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         findOverlappingPriorCluster: sandbox._ndFindOverlappingPriorCluster,
         computeTimeHeatmap: sandbox._ndComputeTimeHeatmap,
         aggregateBySection: sandbox._ndAggregateBySection,
+        exportCoachingAnalysis: sandbox._ndExportCoachingAnalysis,
     };
 }
 

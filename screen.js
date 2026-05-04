@@ -1373,6 +1373,109 @@ function _ndAggregateBySection(noteResults, sections) {
     return byName;
 }
 
+// ── Coaching analysis bundle (single source of truth) ─────────────────────
+//
+// Pure function. The modal renderer (Unit 3c) and any test harness that
+// wants the full post-play picture call this once and read all the
+// derived numbers off the result. Internal-only consumers (the live
+// HUD, the iteration banner) use individual analysis functions
+// directly — this entry point exists for the modal which needs all
+// the pieces at once with a stable shape.
+//
+// Input:
+//   play         — { noteResults: [...] } from the persisted plays
+//                  endpoint, or built live from the in-flight Map.
+//   opts         — { sections, totalDuration, heatmapBinSec }.
+//
+// Output: { derived, clusters, perSection, timeHeatmap, topFix,
+//           sections, totalDuration }.
+//
+// `topFix` is the single most actionable suggestion the modal should
+// surface above the fold. Cluster-based topFix (pick the densest
+// cluster and read its dominant failure mode) is deferred to Unit 3c
+// — it needs the failure-mode classifier. Axis-level fallback is
+// implemented here: when no clusters are found, look at the weakest
+// sub-score (pitch / coverage / timing skew) and surface global
+// coaching advice.
+function _ndExportCoachingAnalysis(play, opts = {}) {
+    const { sections = [], totalDuration = 0, heatmapBinSec = 5 } = opts;
+    const noteResults = (play && play.noteResults) || [];
+
+    const derived = _ndScoresFromNotes(noteResults);
+    const perSection = _ndAggregateBySection(noteResults, sections);
+    const clusters = _ndFindMissClusters(noteResults);
+    const timeHeatmap = _ndComputeTimeHeatmap(noteResults, totalDuration, heatmapBinSec);
+
+    // Axis-level fallback for `topFix`. Cluster-based selection (which
+    // requires reading dominant failure mode per cluster) is deferred
+    // to Unit 3c. For now: when scoring identifies a clear weakest
+    // axis, surface global coaching for it; otherwise topFix stays null
+    // and the modal renders without a top-of-fold callout.
+    let topFix = null;
+    const pitch = derived.pitchPct;
+    const cov = derived.coverage;
+    const timing = derived.timingMedianMs;
+    const candidates = [];
+    if (pitch != null && pitch < 0.95) {
+        candidates.push({
+            axis: 'Pitch', severity: 1 - pitch,
+            focus: `Pitch was off on ${Math.round((1 - pitch) * 100)}% of detected notes`,
+            advice: 'Practice the fingering pattern silently first. Common causes: catching adjacent open strings, octave confusion on bass, or fret-buzz on heavily distorted signals.',
+        });
+    }
+    if (cov != null && cov < 0.95) {
+        candidates.push({
+            axis: 'Coverage', severity: 1 - cov,
+            focus: `${Math.round((1 - cov) * 100)}% of notes produced no detection`,
+            advice: 'Pluck harder, or check your input gain. If the chart is dense (chords, fast runs), the detector may need more attack energy to fire onsets between sustains.',
+        });
+    }
+    if (timing != null && Math.abs(timing) >= 30) {
+        const dir = timing > 0 ? 'late' : 'early';
+        candidates.push({
+            axis: 'Timing',
+            severity: Math.min(1, Math.abs(timing) / 100),
+            focus: `Consistently ${dir} by ~${Math.abs(Math.round(timing))}ms across the song`,
+            advice: timing > 0
+                ? `Late skew is usually one of two things: either the A/V offset is uncalibrated (use [/] keys to nudge), or you are reacting to notes instead of anticipating them. Drill at ${Math.round(_ND_DRILL_SLOW_SPEED * 100)}% speed to give yourself a beat more reaction time.`
+                : 'Early skew is usually A/V offset uncalibrated (use [/] keys to nudge). If it persists after calibration, you are anticipating ahead of the beat — drill with the click track on to lock the timing.',
+        });
+    }
+    if (candidates.length) {
+        candidates.sort((a, b) => b.severity - a.severity);
+        const c = candidates[0];
+        topFix = {
+            kind: 'axis',
+            axis: c.axis,
+            focus: c.focus,
+            advice: c.advice,
+            color: '#60a5fa',
+        };
+    }
+
+    // Serialize the perSection Map as a plain object so tests/JSON
+    // round-trips don't have to learn about the Map shape.
+    const perSectionObj = {};
+    for (const [name, row] of perSection) {
+        perSectionObj[name] = {
+            hits: row.hits,
+            misses: row.misses,
+            total: row.total,
+            accuracy: row.accuracy,
+        };
+    }
+
+    return {
+        derived,
+        clusters,
+        perSection: perSectionObj,
+        timeHeatmap,
+        topFix,
+        sections,        // pass-through for renderers that need section order
+        totalDuration,
+    };
+}
+
 async function _ndCrepeDetect(buffer) {
     if (!_ndShared.model) return { freq: -1, confidence: 0 };
     try {

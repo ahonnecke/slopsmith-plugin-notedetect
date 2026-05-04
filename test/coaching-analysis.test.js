@@ -188,3 +188,63 @@ test('fmtMmSs — basic', () => {
     assert.strictEqual(core.fmtMmSs(65), '1:05');
     assert.strictEqual(core.fmtMmSs(125.7), '2:05');
 });
+
+// ── Unit 3b — exportCoachingAnalysis bundle ───────────────────────────────
+
+test('exportCoachingAnalysis — empty play returns shaped bundle', () => {
+    const result = core.exportCoachingAnalysis({ noteResults: [] }, { totalDuration: 0 });
+    assert.strictEqual(typeof result, 'object');
+    assert.ok('derived' in result);
+    assert.ok('clusters' in result);
+    assert.ok('perSection' in result);
+    assert.ok('timeHeatmap' in result);
+    assert.ok('topFix' in result);
+    assert.strictEqual(result.derived.detection, 0);
+    assert.strictEqual(result.clusters.length, 0);
+    assert.strictEqual(result.topFix, null);
+});
+
+test('exportCoachingAnalysis — derived scores match scoresFromNotes for the same input', () => {
+    const notes = [
+        mkNote({ noteTime: 1, hit: true }),
+        mkNote({ noteTime: 2, hit: false }),
+        mkNote({ noteTime: 3, hit: true }),
+    ];
+    const bundle = core.exportCoachingAnalysis({ noteResults: notes }, { totalDuration: 10 });
+    const direct = core.scoresFromNotes(notes);
+    assert.strictEqual(bundle.derived.detection, direct.detection);
+    assert.strictEqual(bundle.derived.precision, direct.precision);
+    assert.strictEqual(bundle.derived.combined, direct.combined);
+});
+
+test('exportCoachingAnalysis — perSection serialized as plain object', () => {
+    const notes = [
+        mkNote({ noteTime: 1, hit: true,  sectionName: 'intro' }),
+        mkNote({ noteTime: 2, hit: false, sectionName: 'intro' }),
+    ];
+    const bundle = core.exportCoachingAnalysis({ noteResults: notes }, { totalDuration: 10 });
+    // Must be a plain object (NOT a Map) so it round-trips through JSON.
+    assert.strictEqual(typeof bundle.perSection, 'object');
+    assert.ok(bundle.perSection.intro);
+    assert.strictEqual(bundle.perSection.intro.hits, 1);
+    assert.strictEqual(bundle.perSection.intro.misses, 1);
+    assert.strictEqual(bundle.perSection.intro.accuracy, 0.5);
+});
+
+test('exportCoachingAnalysis — axis-level topFix when timing is consistently late', () => {
+    // 10 hits, all 100ms late → median 100ms triggers Timing axis
+    const notes = [];
+    for (let i = 0; i < 10; i++) {
+        notes.push(mkNote({ noteTime: i, hit: true, timingState: 'LATE', timingError: 100 }));
+    }
+    const bundle = core.exportCoachingAnalysis({ noteResults: notes }, { totalDuration: 10 });
+    assert.ok(bundle.topFix);
+    assert.strictEqual(bundle.topFix.kind, 'axis');
+    assert.strictEqual(bundle.topFix.axis, 'Timing');
+    assert.ok(bundle.topFix.focus.includes('late'));
+});
+
+test('exportCoachingAnalysis — totalDuration passed through for renderer', () => {
+    const bundle = core.exportCoachingAnalysis({ noteResults: [] }, { totalDuration: 240 });
+    assert.strictEqual(bundle.totalDuration, 240);
+});
