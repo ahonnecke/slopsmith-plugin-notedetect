@@ -7387,6 +7387,235 @@ function createNoteDetector(options = {}) {
     }
 
     // ── Public API ────────────────────────────────────────────────────
+    // ── Test-injection: replay a WAV through the detection pipeline ──
+    //
+    // Bypasses getUserMedia (which doesn't work cleanly in headless
+    // browsers / fixture replay). Builds the same audio graph as
+    // enable() — gain → analyser → processor — but drives it with an
+    // AudioBufferSource decoded from the WAV instead of a MediaStream.
+    // Mocks hw.getTime() so the matcher's chart clock advances in
+    // lockstep with WAV playback, then sweeps checkMisses post-playback
+    // to finalize miss markers for chart notes the player didn't
+    // produce. Returns a summary derived from _ndScoresFromNotes so
+    // the same scoring math the live HUD uses is what the harness
+    // reports.
+    //
+    // Designed for `test/replay-baseline.js` (Unit H2) but exposed
+    // on the public API so any consumer can drive a fixture through
+    // the matcher offline.
+    //
+    // Caveats:
+    // - The instance must NOT already be enabled (live mic + WAV
+    //   would race on the same audio graph). Caller should call this
+    //   on a fresh detector or after disable().
+    // - `chartStartTimeSec` is the chart time corresponding to WAV
+    //   t=0; required because the user's recorded WAVs aren't
+    //   necessarily anchored to chart-time 0.
+    // - The function is async and resolves only after playback +
+    //   pipeline drain + miss sweep complete, so callers can await
+    //   the summary directly.
+    async function testInjectWav(wavUrl, opts = {}) {
+        if (enabled) {
+            throw new Error('testInjectWav: instance already enabled; call disable() first');
+        }
+        const chartStartTimeSec = Number.isFinite(opts.chartStartTimeSec)
+            ? opts.chartStartTimeSec
+            : 0;
+
+        // Build audio graph manually — bypasses startAudio's
+        // getUserMedia path. Reuses module-scoped audio constants.
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        const processor = audioCtx.createScriptProcessor(_ND_FRAME_SIZE, 1, 1);
+        worklet = processor;
+        accumBuffer = new Float32Array(0);
+        pendingBuffer = null;
+        // Reset onset state so each fixture replay starts clean
+        // (same isolation that resetScoring provides on disable()).
+        inNote = false;
+        lastOnsetPerfSec = 0;
+        reattackArmed = false;
+        reattackRmsBuf = [];
+        onsetCount = 0;
+        recentRmsPeak = 0;
+        driftBuffer = [];
+        driftEstimateMs = 0;
+
+        gainNode = audioCtx.createGain();
+        gainNode.gain.value = 1.0;
+
+        levelAnalyser = audioCtx.createAnalyser();
+        levelAnalyser.fftSize = 512;
+        levelAnalyser.smoothingTimeConstant = 0.8;
+        gainNode.connect(levelAnalyser);
+
+        // Same onset-aware audio chunk path as the live processor.
+        // Inlined here so the live and test paths can't drift.
+        processor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            let sumSq = 0;
+            for (let j = 0; j < input.length; j++) sumSq += input[j] * input[j];
+            const rms = Math.sqrt(sumSq / input.length);
+            if (rms > recentRmsPeak) recentRmsPeak = rms;
+            else recentRmsPeak *= 0.998;
+
+            reattackRmsBuf.push(rms);
+            if (reattackRmsBuf.length > _ND_REATTACK_WINDOW) reattackRmsBuf.shift();
+
+            const nowSec = performance.now() / 1000;
+            const refractoryOk = (nowSec - lastOnsetPerfSec) > _ND_REATTACK_REFRACTORY_SEC;
+
+            if (rms < _ND_REATTACK_REARM_LEVEL) reattackArmed = true;
+
+            let fireOnset = false;
+            if (rms > _ND_ONSET_LEVEL && !inNote && refractoryOk) {
+                inNote = true;
+                fireOnset = true;
+            } else if (inNote && refractoryOk && reattackArmed
+                       && rms > _ND_REATTACK_MIN_LEVEL
+                       && reattackRmsBuf.length >= 3) {
+                const recentMin = Math.min(...reattackRmsBuf.slice(0, -1));
+                if (rms > recentMin * _ND_REATTACK_RATIO) fireOnset = true;
+            } else if (rms < _ND_ONSET_EXIT_LEVEL) {
+                inNote = false;
+            }
+
+            if (fireOnset) {
+                lastOnsetPerfSec = nowSec;
+                reattackArmed = false;
+                onsetCount++;
+                accumBuffer = new Float32Array(0);
+                pendingBuffer = null;
+                return;
+            }
+
+            const prev = accumBuffer;
+            const combined = new Float32Array(prev.length + input.length);
+            combined.set(prev);
+            combined.set(input, prev.length);
+            if (combined.length >= _ND_MIN_YIN_SAMPLES) {
+                const start = combined.length - _ND_MIN_YIN_SAMPLES;
+                pendingBuffer = combined.slice(start, start + _ND_MIN_YIN_SAMPLES);
+                accumBuffer = new Float32Array(0);
+            } else {
+                accumBuffer = combined;
+            }
+        };
+
+        gainNode.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        // Detection runs on a 50ms timer — same as live path. Match
+        // that interval here so post-flush latency behaves identically.
+        let processingFrame = false;
+        const detectTimer = setInterval(() => {
+            if (processingFrame || !pendingBuffer) return;
+            const buf = pendingBuffer;
+            pendingBuffer = null;
+            processingFrame = true;
+            processFrame(buf).finally(() => { processingFrame = false; });
+        }, 50);
+
+        missCheckInterval = setInterval(checkMisses, 100);
+
+        // Mock hw.getTime so the matcher sees chart time advance in
+        // lockstep with WAV playback. AudioContext.currentTime is the
+        // master clock — incrementing relative to wavStartCtxT.
+        const _hw = resolveHw();
+        const realGetTime = _hw && _hw.getTime ? _hw.getTime.bind(_hw) : null;
+        const wavStartCtxT = audioCtx.currentTime + 0.05;  // small lookahead
+
+        if (_hw && realGetTime) {
+            _hw.getTime = () => {
+                const elapsed = audioCtx.currentTime - wavStartCtxT;
+                return chartStartTimeSec + Math.max(0, elapsed);
+            };
+        }
+
+        enabled = true;
+        sessionGen++;
+
+        // Decode the WAV and start playback on the audio clock.
+        const response = await fetch(wavUrl);
+        if (!response.ok) {
+            throw new Error(`testInjectWav: HTTP ${response.status} fetching ${wavUrl}`);
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(gainNode);
+        source.start(wavStartCtxT);
+
+        const dur = audioBuffer.duration;
+
+        // Wait playback + drain + miss-sweep tail.
+        await new Promise(r => setTimeout(r, (0.05 + dur + 1.5) * 1000));
+
+        // Sweep checkMisses across every chart note in the WAV's
+        // window. checkMisses is designed for per-frame use and only
+        // scans ~1s behind the deadline per call; manual time
+        // advancement covers the whole playback span.
+        if (_hw) {
+            const notes = (_hw.getNotes && _hw.getNotes()) || [];
+            const inWavWindow = notes.filter(n =>
+                typeof n.t === 'number'
+                && n.t >= chartStartTimeSec
+                && n.t <= chartStartTimeSec + dur + 1
+            );
+            if (inWavWindow.length > 0) {
+                const lastNoteT = inWavWindow[inWavWindow.length - 1].t;
+                for (let sweepT = chartStartTimeSec;
+                     sweepT <= lastNoteT + 2;
+                     sweepT += 0.5) {
+                    _hw.getTime = () => sweepT;
+                    checkMisses();
+                }
+            }
+        }
+
+        // Restore real getTime so subsequent live use isn't broken.
+        if (_hw && realGetTime) _hw.getTime = realGetTime;
+
+        // Build summary using the SAME _ndScoresFromNotes the live HUD
+        // and modal use, so the harness number can never drift from
+        // production scoring.
+        const noteList = [];
+        for (const v of noteResults.values()) noteList.push(v);
+        const scores = _ndScoresFromNotes(noteList);
+
+        // Tear down the test-mode audio graph.
+        clearInterval(detectTimer);
+        if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
+        try { source.disconnect(); } catch (e) {}
+        try { processor.disconnect(); } catch (e) {}
+        try { gainNode.disconnect(); } catch (e) {}
+        try { levelAnalyser.disconnect(); } catch (e) {}
+        worklet = null;
+        gainNode = null;
+        levelAnalyser = null;
+        enabled = false;
+
+        return {
+            summary: {
+                hits: scores.hits,
+                misses: scores.misses,
+                total: scores.total,
+                detection: scores.detection,
+                precision: scores.precision,
+                onsetCount,
+                driftEstimateMs,
+                driftSamples: driftBuffer.length,
+                durationSec: dur,
+            },
+            noteResults: noteList.map(v => ({ ...v })),
+        };
+    }
+
     const api = {
         enable,
         disable,
@@ -7444,6 +7673,10 @@ function createNoteDetector(options = {}) {
         startDrillRange,
         endDrill,
         isDrilling: () => drillActive,
+        // Test-injection — replay a WAV through the detection
+        // pipeline. Used by test/replay-baseline.js (Unit H2) to run
+        // the user's recorded fixtures offline.
+        testInjectWav,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
