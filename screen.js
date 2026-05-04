@@ -1011,6 +1011,27 @@ function _ndLoadScript(src) {
     });
 }
 
+// ── Drill mode ─────────────────────────────────────────────────────────────
+//
+// A drill loops a short cluster of trouble notes so the player can grind
+// through it. Three knobs:
+//
+//   _ND_DRILL_LEAD_IN_SEC — how far before the cluster the audio loop
+//       starts. The pre-roll is for context (you hear the song lead you
+//       into the trouble spot); judgments don't fire until judgeStart.
+//   _ND_DRILL_FIRST_NOTE_RUNWAY_SEC — minimum gap between judgment
+//       activation and the first chart note inside the cluster. Without
+//       this, clusters whose first note sits at the cluster boundary
+//       give the player ~0ms to react every loop iteration.
+//       startDrillRange shifts judgeStart back when the cluster's first
+//       note is too close to the requested boundary.
+//   _ND_DRILL_SLOW_SPEED — suggested slowdown for the "drill this slowly"
+//       recommendation. 0.95× gives a beat more reaction time without the
+//       dramatic motor-pattern shift of 0.75×.
+const _ND_DRILL_LEAD_IN_SEC = 5;
+const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.5;
+const _ND_DRILL_SLOW_SPEED = 0.95;
+
 // ── Two-axis scoring ───────────────────────────────────────────────────────
 //
 // Pure function. Takes a list of per-chart-note results (each with a
@@ -1361,6 +1382,17 @@ function createNoteDetector(options = {}) {
     let inputLevel = 0;
     let inputPeak = 0;
     let peakDecay = 0;
+
+    // Drill mode — per-instance. Drill is a loop over a short cluster
+    // with judgment gated to the [judgeStart, judgeEnd) window so the
+    // pre-loop lead-in is audible warm-up without scoring. The lead-in
+    // window itself is implied by setActiveLoop's start vs judgeStart.
+    let drillActive = false;
+    let drillJudgeStart = null;
+    let drillJudgeEnd = null;
+    let drillLabel = null;
+    let drillSavedSpeed = null;
+    let drillSpeedMul = 1.0;
 
     // Scoring
     let hits = 0;
@@ -2851,12 +2883,10 @@ function createNoteDetector(options = {}) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
                 if (n.mt) continue;
-                // Non-sus notes use the strict past edge; sus notes get
-                // a grace bounded by both the chart's declared sustain
-                // and the global cap.
-                const susSec = Number.isFinite(n.sus) && n.sus > 0 ? n.sus : 0;
-                const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
-                if (n.t < t - tolerance - lateGrace) continue;
+                // Drill gate: notes outside the judge window are warm-up
+                // (lead-in audio); they show up on the highway and play
+                // through audio but don't score.
+                if (!isInDrillJudgment(n.t)) continue;
                 // Spread the chart note so technique flags (ho/po/b/sl/hm)
                 // travel with the candidate. _ndScoreChord reads these to
                 // adjust per-string thresholds, so dropping them here would
@@ -2883,13 +2913,7 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > t + tolerance) break;
-                let chordSus = 0;
-                for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
-                    if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
-                }
-                const lateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
-                if (c.t < t - tolerance - lateGrace) continue;
+                if (!isInDrillJudgment(c.t)) continue;
                 for (const cn of (c.notes || [])) {
                     if (cn.mt) continue;
                     // Chord constituent notes don't carry their own time —
@@ -3316,20 +3340,12 @@ function createNoteDetector(options = {}) {
         const notes = hw.getNotes();
         const chords = hw.getChords();
 
-        // Pass the full chart-note object (not just {s, f}) so the miss
-        // judgment carries `sus` and technique flags through to the
-        // diagnostic event log. Stripping to {s, f} here made every pure
-        // miss look like a staccato note (sus=0) regardless of whether
-        // the chart said it was sustained, which corrupts any
-        // sus-conditioned analysis downstream.
-        const checkNote = (chartNote, noteTime) => {
-            const susSec = Number.isFinite(chartNote.sus) && chartNote.sus > 0 ? chartNote.sus : 0;
-            const lateGrace = susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
-            // Effective retire threshold: a sus note isn't retired
-            // until its sustain envelope has clearly elapsed, giving
-            // matchNotes the same grace period to lock on.
-            if (noteTime > missDeadline - lateGrace) return;
-            const key = noteKey(chartNote, noteTime);
+        const checkNote = (s, f, noteTime) => {
+            if (noteTime > missDeadline) return;
+            // Drill gate: notes outside the judge window get neither
+            // HIT nor MISS — they're warm-up audio.
+            if (!isInDrillJudgment(noteTime)) return;
+            const key = noteKey({ s, f }, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
                     chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
@@ -4834,6 +4850,9 @@ function createNoteDetector(options = {}) {
         // processFrame — it captured the previous sessionGen and will
         // bail on mismatch rather than apply post-disable detections.
         sessionGen++;
+        // End any active drill before tearing down audio so the saved
+        // playback rate is restored on the still-live audio element.
+        endDrill();
         stopAudio();
         stopHUD();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
@@ -4907,16 +4926,110 @@ function createNoteDetector(options = {}) {
         }
     }
 
-    // Builds a self-contained snapshot of the current session — counters,
-    // miss-category breakdown, per-string hit rate, signed error
-    // percentiles, the song/arrangement/tuning, the detector settings,
-    // and a capped per-judgment event log. Schema is versioned so future
-    // tooling can dispatch. `benchmark_hint` carries the song's title/
-    // artist/arrangement triple verbatim so reports against the official
-    // benchmark sloppak can be filtered without needing a strict match.
-    function _buildDiagnosticPayload() {
-        const currentHw = resolveHw();
-        const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
+    // ── Drill mode ────────────────────────────────────────────────────
+    //
+    // Drill loops a short cluster of trouble notes. Judgment is gated to
+    // [judgeStart, judgeEnd) so the lead-in is audible warm-up without
+    // scoring. Loop boundaries extend earlier than the judge window via
+    // setActiveLoop so the user hears the song lead them in.
+    //
+    // Pre-existing bug fixed here: the pre-port code only called
+    // window.setActiveLoop, which seeks audio.currentTime but does NOT
+    // call audio.play(). When drilling started from the post-game review
+    // modal (audio paused at song-end), the lead-in was silent until the
+    // user manually pressed play. Now we explicitly resume playback so
+    // the lead-in is always audible — that's what makes the runway
+    // useful for hitting the first beat.
+    function isInDrillJudgment(chartT) {
+        if (!drillActive) return true;
+        if (drillJudgeStart == null || drillJudgeEnd == null) return true;
+        return chartT >= drillJudgeStart && chartT < drillJudgeEnd;
+    }
+
+    async function startDrillRange(startSec, endSec, label, drillOpts = {}) {
+        const { speedMul = 1.0 } = drillOpts;
+        const audio = document.getElementById('audio');
+        if (!audio) {
+            console.warn('[note_detect] startDrillRange: no <audio id="audio"> element');
+            return false;
+        }
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const totalDuration = songInfo.duration
+            || (Number.isFinite(audio.duration) ? audio.duration : null);
+        if (!totalDuration) {
+            console.warn('[note_detect] startDrillRange: no duration available');
+            return false;
+        }
+        const requestedStart = Math.max(0, startSec);
+        const end = Math.min(totalDuration - 0.05, endSec);
+        if (end - requestedStart < 0.5) {
+            console.warn(`[note_detect] startDrillRange: range too short (${(end - requestedStart).toFixed(2)}s)`);
+            return false;
+        }
+
+        // First-note runway: ensure judgeStart sits at least
+        // _ND_DRILL_FIRST_NOTE_RUNWAY_SEC before the cluster's first
+        // chart note, so the player has reaction time on every loop
+        // iteration even when the cluster boundary lands right on the
+        // first scoreable note.
+        const allNotes = (_hw && _hw.getNotes && _hw.getNotes()) || [];
+        const firstNoteInCluster = allNotes.find(n => n.t >= requestedStart && n.t <= end);
+        const start = firstNoteInCluster
+            ? Math.min(requestedStart, firstNoteInCluster.t - _ND_DRILL_FIRST_NOTE_RUNWAY_SEC)
+            : requestedStart;
+
+        drillActive = true;
+        drillJudgeStart = start;
+        drillJudgeEnd = end;
+        drillLabel = label || `${start.toFixed(1)}-${end.toFixed(1)}s`;
+
+        // Speed scaffolding: drilling slightly slower buys reaction time.
+        drillSavedSpeed = audio.playbackRate;
+        if (speedMul && speedMul !== drillSavedSpeed) {
+            audio.playbackRate = speedMul;
+        }
+        drillSpeedMul = speedMul;
+
+        // Audio loop = lead-in + judge window. setActiveLoop seeks audio
+        // to loopStart but doesn't auto-play; we follow with audio.play()
+        // so the lead-in is actually audible. Without the explicit play,
+        // a drill kicked off from the post-game review modal (audio
+        // paused) would land on a silent pre-roll.
+        const loopStart = Math.max(0, start - _ND_DRILL_LEAD_IN_SEC);
+        const loopEnd = end;
+        if (typeof window.setActiveLoop === 'function') {
+            window.setActiveLoop(loopStart, loopEnd);
+        } else {
+            console.warn('[note_detect] startDrillRange: window.setActiveLoop missing');
+        }
+        try { await audio.play(); } catch (e) {
+            console.warn('[note_detect] startDrillRange: audio.play() rejected:', e);
+        }
+
+        if (!enabled) await enable();
+
+        console.log(`[note_detect] Drill "${drillLabel}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${start.toFixed(1)}–${end.toFixed(1)}s @ ${speedMul}× (lead-in ${(start - loopStart).toFixed(1)}s)`);
+        return true;
+    }
+
+    function endDrill() {
+        if (!drillActive) return;
+        const audio = document.getElementById('audio');
+        if (audio && drillSavedSpeed != null
+                && Number.isFinite(drillSavedSpeed)
+                && audio.playbackRate !== drillSavedSpeed) {
+            audio.playbackRate = drillSavedSpeed;
+        }
+        drillActive = false;
+        drillJudgeStart = null;
+        drillJudgeEnd = null;
+        drillLabel = null;
+        drillSavedSpeed = null;
+        drillSpeedMul = 1.0;
+    }
+
+    function showSummary() {
         const total = hits + misses;
         const sumAcc = total > 0 ? +(hits / total).toFixed(3) : 0;
         const sAcc = (_diagSingles.hits + _diagSingles.misses) > 0
@@ -6256,161 +6369,12 @@ function createNoteDetector(options = {}) {
         setChannel,
         injectButton,
         showSummary,
-        // Diagnostic export (#254 follow-up). `downloadDiagnostic()`
-        // triggers a browser file save of the current session's
-        // breakdown + capped event log; `getDiagnostic()` returns the
-        // same payload for in-page display / programmatic use. Schema
-        // is `note_detect.diagnostic.v1`. `resetDiagnostic()` zeroes
-        // all the counters mid-session (without touching audio /
-        // enabled / button state) so you can navigate to a specific
-        // section, reset, and capture *only* that section's events.
-        downloadDiagnostic: _downloadDiagnostic,
-        getDiagnostic: _buildDiagnosticPayload,
-        resetDiagnostic: resetScoring,
-        // Public setter for the Auto-tune-from-session panel — applies
-        // a partial settings object with the same clamps the storage
-        // loader uses, then persists via saveSettings(). Each field is
-        // optional; unknown / non-finite values are ignored so callers
-        // can pass only the rows they want to apply. Returns the
-        // post-clamp object so the caller can update the UI without a
-        // separate get round-trip.
-        applySettings: (partial) => {
-            partial = partial || {};
-            if (typeof partial.method === 'string' && ['yin', 'hps', 'crepe'].includes(partial.method)) {
-                detectionMethod = partial.method;
-            }
-            if (Number.isFinite(partial.timingTolerance)) {
-                timingTolerance = Math.max(0.03, Math.min(0.3, partial.timingTolerance));
-            }
-            if (Number.isFinite(partial.pitchTolerance)) {
-                pitchTolerance = Math.max(10, Math.min(100, partial.pitchTolerance));
-            }
-            if (Number.isFinite(partial.timingHitThreshold)) {
-                timingHitThreshold = Math.max(0.03, Math.min(timingTolerance, partial.timingHitThreshold));
-            }
-            if (Number.isFinite(partial.chordTimingHitThreshold)) {
-                chordTimingHitThreshold = Math.max(timingHitThreshold, Math.min(timingTolerance, partial.chordTimingHitThreshold));
-            }
-            // Maintain the chord >= single-note invariant after either side moved.
-            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
-            if (Number.isFinite(partial.pitchHitThreshold)) {
-                pitchHitThreshold = Math.max(5, Math.min(pitchTolerance, partial.pitchHitThreshold));
-            }
-            if (Number.isFinite(partial.chordHitRatio)) {
-                chordHitRatio = Math.max(0.25, Math.min(1, partial.chordHitRatio));
-            }
-            if (Number.isFinite(partial.detectionConfidenceMin)) {
-                detectionConfidenceMin = Math.max(0.05, Math.min(0.50, partial.detectionConfidenceMin));
-            }
-            if (Number.isFinite(partial.latencyOffset)) {
-                // Clamp to the same range as the gear-popover slider
-                // (0–0.250 s). The storage loader doesn't clamp this
-                // field on read, but the writer should — letting a
-                // caller (auto-tune, DevTools experiment, stale code)
-                // park latency at 5 s would render the matching
-                // window unreachable until the user manually drags
-                // the slider back into range.
-                latencyOffset = Math.max(0, Math.min(0.25, partial.latencyOffset));
-            }
-            // Re-enforce timing-threshold invariants at the END of the
-            // setter. A partial that lowers `timingTolerance` alone (and
-            // doesn't supply new hit thresholds) would otherwise leave
-            // `timingHitThreshold` and/or `chordTimingHitThreshold`
-            // above the new tolerance ceiling — a state the UI sliders
-            // can't represent and that drifts judgment classification
-            // until the user touches another knob. Same pattern as the
-            // storage-load invariant at the top of createNoteDetector.
-            if (timingHitThreshold > timingTolerance) timingHitThreshold = timingTolerance;
-            if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
-            if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
-            saveSettings();
-            return {
-                method: detectionMethod,
-                timingTolerance,
-                pitchTolerance,
-                timingHitThreshold,
-                chordTimingHitThreshold,
-                pitchHitThreshold,
-                chordHitRatio,
-                detectionConfidenceMin,
-                latencyOffset,
-            };
-        },
-        // Narrower reset for A/V calibrate — clears only the timing
-        // samples that feed the next calibration suggestion, leaving
-        // hits/misses/streak/sectionStats/eventLog intact. Use this
-        // instead of `resetDiagnostic` when the goal is "stop using
-        // stale samples from before my offset change", not "start a
-        // brand-new session".
-        resetCalibrationSamples: _resetCalibrationSamples,
-        // Tuning-mode gate. Off by default; flipped on/off from the
-        // Settings page (the developer surfaces it gates live there too,
-        // so the toggle and the panels it reveals are in one place).
-        // Other UI — the summary modal's breakdown / Download button —
-        // polls this to decide whether to render the dev-only surfaces.
-        isTuningMode: () => tuningMode,
-        setTuningMode: (v) => {
-            const next = !!v;
-            if (next === tuningMode) return;
-            tuningMode = next;
-            // If the user disables tuning mid-recording, drop the
-            // in-flight buffer + disarm — the UI for it is about to
-            // disappear and we don't want a half-captured WAV trailing.
-            if (!tuningMode && (_recArmed || _recChunks.length > 0)) {
-                discardRecording();
-            }
-            // Live JSONL streaming binds/unbinds with tuning mode so
-            // non-tuning users don't pollute the slopsmith event bus.
-            // The drill-mode tests assert exactly one song:ended
-            // listener after their own bind — adding an always-on
-            // live-stream listener would break that contract.
-            if (tuningMode) _liveBindEvents(); else _liveUnbindEvents();
-            saveSettings();
-        },
-        // Reference-recording capture for the headless harness. Arms
-        // the next song-play to capture the detector's input audio,
-        // auto-saves on song:ended. POSTs the WAV to the plugin's
-        // routes.py endpoint, which writes it under
-        // static/note_detect_recordings/ — bind-mounted in the dev
-        // container, so the harness on the host can read it back
-        // without any copy step. See `getRecordingState()` for status
-        // / lastSavePath / lastError fields the UI polls.
-        armRecording,
-        armRecordingForTraining,
-        disarmRecording,
-        discardRecording,
-        saveRecordingNow,
-        getRecordingState,
-        // Diagnostic accessor — surfaces the AudioContext's own
-        // latency self-report. Both fields describe the *output/render*
-        // side of the graph, not the microphone-capture path:
-        //   - `baseLatency` is the processing latency the AudioContext
-        //     incurs while rendering audio (typically a render quantum
-        //     or two of buffering on the output side). It is NOT a
-        //     measured input-capture delay and does NOT include the
-        //     ScriptProcessor frame buffering on top of it.
-        //   - `outputLatency` is the total downstream latency from the
-        //     destination node to actually-audible — also output-side.
-        // For input-chain latency you have to combine these with the
-        // ScriptProcessor frame size and the OS capture buffer (which
-        // the browser does not expose). What this accessor IS good for:
-        // verifying that the `latencyHint: 'interactive'` opt-in
-        // produced a smaller `baseLatency` than the platform default
-        // (a useful proxy for "the browser took the hint"). Returns
-        // null when audio hasn't been started yet (enable() not yet
-        // called or running in the desktop-bridge path that doesn't
-        // own an AudioContext).
-        getAudioLatencyInfo: () => {
-            if (!audioCtx) return null;
-            return {
-                baseLatency:   Number.isFinite(audioCtx.baseLatency)   ? audioCtx.baseLatency   : null,
-                outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
-                sampleRate:    audioCtx.sampleRate,
-                frameSize:     _ND_FRAME_SIZE,
-                yinBufferSize: _ND_MIN_YIN_SAMPLES,
-                state:         audioCtx.state,
-            };
-        },
+        // Drill mode — start a tight loop on a cluster range, with the
+        // lead-in audible (audio.play() is called explicitly) and
+        // judgment gated to [start, end).
+        startDrillRange,
+        endDrill,
+        isDrilling: () => drillActive,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
