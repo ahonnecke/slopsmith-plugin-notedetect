@@ -45,12 +45,15 @@ test('clean playing: no coaching needed', () => {
 });
 
 test('consistently late: timing label', () => {
+    // Pin the threshold explicitly; the live default is now 100ms (easy
+    // preset) so 80-90ms hits are within the perfect window. The test
+    // exercises the function's logic, not the active strictness preset.
     const plays = [
         play(note({ primary: 'HIT', timingError: 80 })),
         play(note({ primary: 'HIT', timingError: 75 })),
         play(note({ primary: 'HIT', timingError: 90 })),
     ];
-    const items = core.perNoteCoaching(plays);
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 50 });
     assert.equal(items.length, 1);
     assert.match(items[0].label, /Late/);
     assert.match(items[0].label, /3\/3/);
@@ -61,7 +64,7 @@ test('consistently early: timing label', () => {
         play(note({ primary: 'HIT', timingError: -75 })),
         play(note({ primary: 'HIT', timingError: -90 })),
     ];
-    const items = core.perNoteCoaching(plays);
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 50 });
     assert.equal(items.length, 1);
     assert.match(items[0].label, /Early/);
 });
@@ -116,7 +119,7 @@ test('multiple problem notes: ranked by severity', () => {
             note({ s: 3, f: 0, chartT: 3.0, primary: 'HIT', timingError: -10 }),
         ),
     ];
-    const items = core.perNoteCoaching(plays);
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 50 });
     assert.equal(items.length, 2);   // clean note excluded
     // Highest severity first (the never-played note)
     assert.equal(items[0].chartT, 1.0);
@@ -172,7 +175,7 @@ test('mixed dirty hits + clean hits count toward total', () => {
         play(note({ primary: 'HIT', timingError: 70 })),
         play(note({ primary: 'DIRTY_HIT', timingError: 90 })),
     ];
-    const items = core.perNoteCoaching(plays);
+    const items = core.perNoteCoaching(plays, undefined, undefined, { timingThresholdMs: 50 });
     assert.equal(items.length, 1);
     assert.match(items[0].label, /Late/);
     assert.match(items[0].label, /2\/2/);

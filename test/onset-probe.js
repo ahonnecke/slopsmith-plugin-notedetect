@@ -96,6 +96,54 @@ const ATTACK_AFTER_MS = 200;
 const PREATTACK_BEFORE_MS = 300;
 const PREATTACK_AFTER_MS = 0;
 
+// Band-pass for the rearm-on-BP-envelope simulation. Same 30-250 Hz filter
+// the live YIN feed uses; the goal is to ask "if rearm watched the bass-band
+// envelope instead of raw rms, would the gate fire reliably?" Out-of-band
+// noise (room, finger contact, drum bleed, breath) inflates raw rms during
+// "release" moments without reflecting actual sustain decay.
+const BAND_LOW_HZ = 30;
+const BAND_HIGH_HZ = 250;
+
+function biquadCoefs(type, fc, sampleRate) {
+    const w0 = 2 * Math.PI * fc / sampleRate;
+    const cs = Math.cos(w0), sn = Math.sin(w0);
+    const Q = Math.SQRT1_2;
+    const alpha = sn / (2 * Q);
+    let b0, b1, b2, a0, a1, a2;
+    if (type === 'highpass') {
+        b0 = (1 + cs) / 2;  b1 = -(1 + cs);  b2 = (1 + cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    } else {
+        b0 = (1 - cs) / 2;  b1 = 1 - cs;     b2 = (1 - cs) / 2;
+        a0 = 1 + alpha;     a1 = -2 * cs;    a2 = 1 - alpha;
+    }
+    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+}
+
+function applyBiquad(input, [b0, b1, b2, a1, a2]) {
+    const out = new Float32Array(input.length);
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < input.length; i++) {
+        const x = input[i];
+        const y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        out[i] = y;
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+    }
+    return out;
+}
+
+function bandpass(samples, sampleRate) {
+    const hp = biquadCoefs('highpass', BAND_LOW_HZ, sampleRate);
+    const lp = biquadCoefs('lowpass', BAND_HIGH_HZ, sampleRate);
+    let s = samples;
+    s = applyBiquad(s, hp);
+    s = applyBiquad(s, hp);
+    s = applyBiquad(s, lp);
+    s = applyBiquad(s, lp);
+    return s;
+}
+
 function readWav(p) {
     const buf = fs.readFileSync(p);
     if (buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('not RIFF');
@@ -164,6 +212,9 @@ function median(a) {
     const { samples, sampleRate } = readWav(wavPath);
     console.log(`  ${samples.length} samples @ ${sampleRate}Hz (${(samples.length / sampleRate).toFixed(1)}s)`);
 
+    console.log(`Band-passing ${BAND_LOW_HZ}-${BAND_HIGH_HZ} Hz for envelope-based rearm simulation…`);
+    const samplesBP = bandpass(samples, sampleRate);
+
     const chartStartTime = cls.chartStartTime || 0;
     const allNotes = (cls.notes || []).slice().sort((a, b) => a.chartT - b.chartT);
     const missed = allNotes.filter(n => n.category === 'PIPELINE_MISSED_REAL_PLAY');
@@ -181,10 +232,13 @@ function median(a) {
 
         const attack = frameRmsWindow(samples, sampleRate, wavT, ATTACK_BEFORE_MS, ATTACK_AFTER_MS);
         const preAttack = frameRmsWindow(samples, sampleRate, wavT, PREATTACK_BEFORE_MS, PREATTACK_AFTER_MS);
+        const preAttackBP = frameRmsWindow(samplesBP, sampleRate, wavT, PREATTACK_BEFORE_MS, PREATTACK_AFTER_MS);
 
         const peakRms = Math.max(0, ...attack.map(f => f.rms));
         const preAttackMin = preAttack.length
             ? Math.min(...preAttack.map(f => f.rms)) : 0;
+        const preAttackMinBP = preAttackBP.length
+            ? Math.min(...preAttackBP.map(f => f.rms)) : 0;
         const sawReleaseInPrior = preAttack.some(f => f.rms < ONSET_EXIT_LEVEL);
 
         // Refractory: was there ANY chart note within REATTACK_REFRACTORY before this one?
@@ -192,7 +246,7 @@ function median(a) {
         const prevChartT = idxInChart > 0 ? chartTimes[idxInChart - 1] : -Infinity;
         const refractoryBlocked = (n.chartT - prevChartT) < REATTACK_REFRACTORY_SEC;
 
-        const diag = { peakRms, preAttackMin, sawReleaseInPrior, refractoryBlocked,
+        const diag = { peakRms, preAttackMin, preAttackMinBP, sawReleaseInPrior, refractoryBlocked,
                        chartT: n.chartT, expectedMidi: n.expectedMidi };
         const cause = classifyMiss(diag);
         causes[cause].push(diag);
@@ -212,31 +266,79 @@ function median(a) {
         if (!bucket.length) continue;
         const peaks = bucket.map(b => b.peakRms);
         const mins = bucket.map(b => b.preAttackMin);
+        const minsBP = bucket.map(b => b.preAttackMinBP).filter(x => isFinite(x));
         const ratios = bucket.map(b => b.preAttackMin > 0 ? b.peakRms / b.preAttackMin : NaN).filter(x => isFinite(x));
         console.log(`\n  ${k} (${bucket.length} notes):`);
-        console.log(`    peak rms       median=${median(peaks).toFixed(3)}  (gate=${ONSET_LEVEL})`);
-        console.log(`    pre-attack min median=${median(mins).toFixed(3)}  (rearm=${ONSET_EXIT_LEVEL})`);
-        if (ratios.length) console.log(`    peak/min ratio median=${median(ratios).toFixed(2)}  (gate=${REATTACK_RATIO})`);
+        console.log(`    peak rms          median=${median(peaks).toFixed(3)}  (gate=${ONSET_LEVEL})`);
+        console.log(`    pre-attack min    median=${median(mins).toFixed(3)}  (rearm=${ONSET_EXIT_LEVEL})  RAW`);
+        if (minsBP.length) console.log(`    pre-attack min BP median=${median(minsBP).toFixed(3)}  BAND-PASSED (30-250 Hz)`);
+        if (ratios.length) console.log(`    peak/min ratio    median=${median(ratios).toFixed(2)}  (gate=${REATTACK_RATIO})`);
     }
 
-    // What-if sweep: how many of the no-rearm misses would recover if we
-    // raised the rearm threshold from 0.02 toward the actual sustain floor?
-    // A note recovers when its pre-attack-min < new-rearm AND its existing
-    // gates (peak >= 0.04, ratio >= 2.0) already pass. Notes that originally
-    // failed due to peak/ratio aren't helped by raising rearm.
+    // What-if sweeps: how many missed notes would recover if we raised the
+    // rearm threshold? We consider TWO rearm sources:
+    //
+    //   raw rms  — current live behavior. Inflated by out-of-band noise
+    //              (drum bleed, room, finger contact); a fixed threshold
+    //              has to chase moving sustain levels.
+    //   bp rms   — rearm watches only the 30-250 Hz bass band. Out-of-band
+    //              noise during release moments is suppressed, so the
+    //              "released" baseline is lower and a fixed threshold
+    //              should generalize across sessions / playing dynamics.
+    //
+    // A note recovers when its pre-attack-min < new-rearm AND existing
+    // gates (peak >= 0.04, raw ratio >= 2.0) already pass.
     const allDiagsForSweep = [...causes['no-rearm'], ...causes['should-have-fired']];
-    const sweepLevels = [0.02, 0.025, 0.03, 0.035, 0.04, 0.05];
-    console.log('\n═══ Rearm threshold sweep ═══');
+    const sweepLevels = [0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.050];
+
+    function gateRecovers(d, source, lvl) {
+        const minVal = source === 'bp' ? d.preAttackMinBP : d.preAttackMin;
+        return minVal < lvl
+            && d.peakRms >= ONSET_LEVEL
+            && d.preAttackMin > 0
+            && d.peakRms / d.preAttackMin >= REATTACK_RATIO;
+    }
+
+    console.log('\n═══ Rearm threshold sweep — RAW rms (current) ═══');
     console.log('  rearm   recovers (of all missed)');
     for (const lvl of sweepLevels) {
-        const recovered = allDiagsForSweep.filter(d =>
-            d.preAttackMin < lvl                                // would now rearm
-            && d.peakRms >= ONSET_LEVEL                         // still passes peak gate
-            && d.preAttackMin > 0
-            && d.peakRms / d.preAttackMin >= REATTACK_RATIO     // still passes ratio gate
-        ).length;
+        const recovered = allDiagsForSweep.filter(d => gateRecovers(d, 'raw', lvl)).length;
         const pct = (recovered / missed.length * 100).toFixed(1).padStart(5);
         console.log(`  ${lvl.toFixed(3)}   ${String(recovered).padStart(3)}/${missed.length}  +${pct}pp`);
+    }
+
+    console.log('\n═══ Rearm threshold sweep — BAND-PASS rms (proposed) ═══');
+    console.log('  rearm   recovers (of all missed)');
+    for (const lvl of sweepLevels) {
+        const recovered = allDiagsForSweep.filter(d => gateRecovers(d, 'bp', lvl)).length;
+        const pct = (recovered / missed.length * 100).toFixed(1).padStart(5);
+        console.log(`  ${lvl.toFixed(3)}   ${String(recovered).padStart(3)}/${missed.length}  +${pct}pp`);
+    }
+
+    // Control group: BP rms during the pre-attack window of HIT notes that
+    // had short note-to-note gaps (i.e., notes where rearm SHOULD have just
+    // fired). If those values are well-separated from the missed-note BP
+    // sustain values, a fixed BP threshold will be reliable. If they
+    // overlap, no fixed threshold works and adaptive logic is needed.
+    const hits = allNotes.filter(n => n.category === 'PIPELINE_HIT');
+    const denseHitSamples = [];
+    for (const n of hits) {
+        const idx = chartTimes.indexOf(n.chartT);
+        const prevT = idx > 0 ? chartTimes[idx - 1] : -Infinity;
+        if (n.chartT - prevT > 0.5) continue;  // only "dense" gaps where rearm matters
+        const wavT = n.chartT - chartStartTime;
+        const preBP = frameRmsWindow(samplesBP, sampleRate, wavT, PREATTACK_BEFORE_MS, PREATTACK_AFTER_MS);
+        if (preBP.length) denseHitSamples.push(Math.min(...preBP.map(f => f.rms)));
+    }
+    if (denseHitSamples.length) {
+        const sorted = [...denseHitSamples].sort((a, b) => a - b);
+        const p10 = sorted[Math.floor(sorted.length * 0.10)];
+        const p50 = sorted[Math.floor(sorted.length * 0.50)];
+        const p90 = sorted[Math.floor(sorted.length * 0.90)];
+        console.log(`\n═══ BP pre-attack rms on HIT notes (control, dense gaps only) ═══`);
+        console.log(`  n=${denseHitSamples.length}  p10=${p10.toFixed(3)}  p50=${p50.toFixed(3)}  p90=${p90.toFixed(3)}`);
+        console.log(`  → on HITs the BP envelope reaches ${p10.toFixed(3)} or below 10% of the time. A`);
+        console.log(`    rearm at p50 (${p50.toFixed(3)}) catches half the dense-gap HITs as "released".`);
     }
 
     console.log('\n═══ Interpretation ═══');

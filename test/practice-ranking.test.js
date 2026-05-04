@@ -11,6 +11,14 @@ const { loadDetectionCore } = require('./_loader');
 
 const core = loadDetectionCore();
 
+// Pin strictness to 'default' (50ms perfect-timing window) so tests are
+// insensitive to which preset happens to be active at module load. The
+// live initial default is now 'easy' (100ms perfect-timing); without
+// this pin, tests that expect timing-bias prescriptions to fire on
+// 80ms hits would break because 80 < 100. We test the function's
+// behavior at a fixed threshold, not which preset is in effect.
+core.applyStrictness('default');
+
 // ── Severity ──────────────────────────────────────────────────────────────
 
 test('severity: clean hit is 0', () => {
@@ -362,7 +370,7 @@ test('top3: empty plays returns empty list', () => {
 test('top3: produces at most 3 prescriptions', () => {
     // Build a play with multiple distinct failure signals — should clamp to 3.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 1, f: 3, chartT: i, primary: 'MISSED_NO_DETECTION', severity: 1.0,
                      expectedMidi: 40 });
     }
@@ -378,7 +386,7 @@ test('top3: produces at most 3 prescriptions', () => {
 
 test('top3: timing-bias prescription fires for chronic late hits', () => {
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 80, labels: ['LATE'], expectedMidi: 40 });
     }
@@ -391,12 +399,12 @@ test('top3: timing-bias prescription fires for chronic late hits', () => {
 test('top3: per-string weakness fires when one string dominates misses', () => {
     const notes = [];
     // String 1 misses heavily
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 1, f: 3, chartT: i, primary: 'MISSED_NO_DETECTION', severity: 1.0,
                      expectedMidi: 40 });
     }
     // String 0 hits cleanly
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: 10 + i, primary: 'HIT', severity: 0,
                      expectedMidi: 40 });
     }
@@ -455,7 +463,7 @@ test('top3: timing-bias prescription uses timingError as-is (no residual subtrac
     // the timing-bias signal — kept in the signature only for back-compat
     // with callers.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 150, labels: ['LATE'], expectedMidi: 40 });
     }
@@ -469,7 +477,7 @@ test('top3: timing-bias prescription uses timingError as-is (no residual subtrac
 test('top3: timing-bias output is independent of avOffset arg', () => {
     // Same data, different avOffset arg → same prescription text.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 150, labels: ['LATE'], expectedMidi: 40 });
     }
@@ -483,7 +491,7 @@ test('top3: timing-bias output is independent of avOffset arg', () => {
 
 test('top3: timing-bias does not fire when |median| ≤ 30 ms', () => {
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 25, labels: [], expectedMidi: 40 });
     }
@@ -495,7 +503,7 @@ test('top3: timing-bias does not fire when |median| ≤ 30 ms', () => {
 
 test('top3: timing-bias detects EARLY direction', () => {
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: -80, labels: ['EARLY'], expectedMidi: 40 });
     }
@@ -583,7 +591,7 @@ test('top3: timing-bias subtracts mic latency before computing median', () => {
     // raw = +180ms; mic latency = 150ms → effective median = +30ms (at threshold).
     // Should NOT fire (threshold is strictly > 30, the math gives equality).
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 180, labels: ['LATE'], expectedMidi: 40 });
     }
@@ -596,7 +604,7 @@ test('top3: timing-bias subtracts mic latency before computing median', () => {
 test('top3: timing-bias fires when mic-corrected median is still above threshold', () => {
     // raw = +250ms; mic latency = 150ms → effective median = +100ms. Should fire.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 250, labels: ['LATE'], expectedMidi: 40 });
     }
@@ -612,7 +620,7 @@ test('top3: mic latency arg is independent of avOffset arg', () => {
     // Residual 250-150=100ms is comfortably above default mode's 50ms
     // perfect-timing threshold so the prescription fires.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: 250, labels: [], expectedMidi: 40 });
     }
@@ -628,7 +636,7 @@ test('top3: mic latency arg is independent of avOffset arg', () => {
 test('top3: mic latency subtraction handles negative residuals (early)', () => {
     // raw = -100ms; mic latency = 0 → median = -100ms. Should fire EARLY.
     const notes = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 30; i++) {
         notes.push({ s: 0, f: 0, chartT: i, primary: 'HIT', severity: 0.3,
                      timingError: -100, labels: ['EARLY'], expectedMidi: 40 });
     }
