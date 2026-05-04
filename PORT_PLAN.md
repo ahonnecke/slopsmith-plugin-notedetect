@@ -16,8 +16,9 @@ shape during porting.
 ✓ Unit 3a — Coaching analysis pure functions   253110e
 ✓ Unit 3b — exportCoachingAnalysis entry point e2e6a9a
 ✓ Unit 3c — Coaching review modal base layout  7f532d1
+✓ Unit 3d — Modal heatmap SVGs                 7775a40
 
-☐ Unit 3d  Modal — heatmap SVGs
+☐ Unit 3f  Improvement deltas (current vs prior play)
 ☐ Unit 3a  Coaching analysis pure functions
 ☐ Unit 3b  _ndExportCoachingAnalysis entry point
 ☐ Unit 3c  Coaching review modal — base layout
