@@ -6745,6 +6745,16 @@ function createNoteDetector(options = {}) {
         const _hw = resolveHw();
         const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
         const stats = api.getStats();
+        // Serialize the full noteResults Map so the diagnostic dump
+        // carries per-note timing/pitch detail — not just a count.
+        // Without this I can't investigate detection regressions
+        // without asking the user to ceremoniously click detect-off
+        // to trigger the snapshotPlay path. The diagnostic dump fires
+        // every 30s automatically, so the latest dump always has
+        // enough data to sanity-check the matcher's behavior.
+        const noteResultsArr = [];
+        for (const v of noteResults.values()) noteResultsArr.push(v);
+
         const payload = {
             reason,
             timestamp: new Date().toISOString(),
@@ -6756,6 +6766,12 @@ function createNoteDetector(options = {}) {
             // Drift + onset thresholds + note-result count give the
             // full picture of "what's the matcher doing right now."
             noteResultsCount: noteResults.size,
+            // Full per-note judgments — what was expected, what was
+            // detected, hit/miss, timing/pitch error, ignored flag.
+            // Same shape S.2 persists, just under a different route
+            // because the diagnostics dump fires periodically without
+            // user action.
+            noteResults: noteResultsArr,
             avOffsetMs: _hw && _hw.getAvOffset ? _hw.getAvOffset() : null,
             inputGain,
             latencyOffset,
