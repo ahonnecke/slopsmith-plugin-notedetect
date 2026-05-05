@@ -68,6 +68,19 @@ test('bass E1 (41 Hz) with moderate noise (amp 0.3) stays within ±50 cents — 
     assert.ok(err < CENT_TOLERANCE, `bass E1 drift ${err.toFixed(1)} cents exceeds ${CENT_TOLERANCE}`);
 });
 
+test('bass A1 (55 Hz) with moderate noise (amp 0.3) stays within ±50 cents — gasoline regression', () => {
+    // User play 5 (260/297 hits = 87.5%) had 12 of 17 no-detection misses
+    // on midi 33 (A1, 55Hz). This test pins synthetic A1 detection so I
+    // can isolate algorithmic vs signal-quality issues. If this passes,
+    // the real-world A1 problem is in the input chain (pickup, EQ,
+    // body resonance), not YIN itself.
+    const sig = realisticBass(55.0, 0.3);
+    const r = core.yinDetect(sig, SR);
+    assert.ok(r.freq > 0, 'bass A1 with noise returned no detection');
+    const err = Math.abs(cents(r.freq, 55.0));
+    assert.ok(err < CENT_TOLERANCE, `bass A1 drift ${err.toFixed(1)} cents exceeds ${CENT_TOLERANCE}`);
+});
+
 test('5-string low B (31 Hz) with moderate noise (amp 0.3) stays within ±50 cents — regression guard', () => {
     const sig = realisticBass(30.87, 0.3);
     const r = core.yinDetect(sig, SR);
