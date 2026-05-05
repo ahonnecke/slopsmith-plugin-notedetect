@@ -5861,35 +5861,34 @@ function createNoteDetector(options = {}) {
                     ctx.stroke();
                 }
 
-                const labels = [];
-                if (showTimingErrors && judgment.timingState && judgment.timingState !== 'OK') {
-                    labels.push({
-                        color: '#ffb347',
-                        text: `${judgment.timingState === 'EARLY' ? '↑' : '↓'} ${judgment.timingError > 0 ? '+' : ''}${judgment.timingError}ms`,
-                    });
-                }
-                if (showPitchErrors && judgment.pitchState && judgment.pitchState !== 'OK') {
-                    labels.push({
-                        color: '#66c7ff',
-                        text: `${judgment.pitchState === 'SHARP' ? '♯' : '♭'} ${judgment.pitchError > 0 ? '+' : ''}${judgment.pitchError}¢`,
-                    });
-                }
-                if (labels.length > 0) {
-                    ctx.font = `bold ${Math.max(10, 11 * scale)}px sans-serif`;
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    for (let i = 0; i < labels.length; i++) {
-                        const yy = y + (i - (labels.length - 1) / 2) * 16 * scale - 18 * scale;
-                        ctx.lineWidth = 3;
-                        ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-                        ctx.strokeText(labels[i].text, x, yy);
-                        ctx.fillStyle = labels[i].color;
-                        drawTextReadable(labels[i].text, x, yy);
-                    }
-                }
+                // Removed the after-the-fact "↑ -300ms" / "♭ +200¢"
+                // labels on miss markers. User feedback: 'the "you
+                // missed" markers ... -300ms idk if that's what it
+                // thinks I did or what it is expecting, but it's not
+                // helpful'. The labels appeared AFTER the note had
+                // passed and were ambiguously-signed (negative meant
+                // EARLY but the visual arrow flipped, confusing the
+                // direction). The cause line in the HUD now surfaces
+                // the same info in plain text on the most recent miss
+                // ('late 80ms on s1/f5'), where it's actually readable
+                // mid-play. Proactive pre-note coaching (drift hint
+                // near approaching notes) ships next.
                 ctx.restore();
             }
         };
+
+        // Proactive coaching hint: when the drift estimator has
+        // stabilized AND the user is consistently off-target, paint
+        // a small chevron/text on each upcoming chart note saying
+        // which way to nudge their timing. The signal is the SAME
+        // driftEstimateMs the auto-cal latch reads — once auto-cal
+        // fires, drift resets to 0 and the hint goes silent
+        // (calibration absorbed the bias). Only fires for notes in
+        // the lookahead window (next ~2.5s) so the user has time
+        // to read and act.
+        const driftHintMs = (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
+                              && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS / 2)
+            ? driftEstimateMs : 0;
 
         if (notes) {
             for (const n of notes) {
@@ -5898,7 +5897,30 @@ function createNoteDetector(options = {}) {
                 if (n.mt) continue;
                 const key = noteKey(n, n.t);
                 const result = noteResults.get(key);
-                if (result) drawIndicator(n.s, n.f, n.t, result);
+                if (result) {
+                    drawIndicator(n.s, n.f, n.t, result);
+                } else if (driftHintMs !== 0 && n.t > renderT && n.t < renderT + 2.5) {
+                    // Unjudged + upcoming: show the drift hint.
+                    const p = hw.project(n.t - renderT);
+                    if (p) {
+                        const hintX = hw.fretX(n.f, p.scale || 1, W);
+                        const hintY = p.y * H;
+                        ctx.save();
+                        ctx.globalAlpha = 0.55;
+                        ctx.font = `${Math.max(9, 10 * (p.scale || 1))}px sans-serif`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'top';
+                        const text = driftHintMs > 0
+                            ? `↑ ${Math.round(driftHintMs)}ms earlier`
+                            : `↓ ${Math.round(-driftHintMs)}ms later`;
+                        ctx.lineWidth = 2;
+                        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+                        ctx.strokeText(text, hintX, hintY + 18 * (p.scale || 1));
+                        ctx.fillStyle = '#fbbf24';
+                        drawTextReadable(text, hintX, hintY + 18 * (p.scale || 1));
+                        ctx.restore();
+                    }
+                }
             }
         }
         if (chords) {
