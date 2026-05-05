@@ -35,20 +35,17 @@ shape during porting.
 ✓ Unit H2+ — onset-anchored matcher option     ccd0bf9
 ✓ Unit 3f — Improvement deltas (current vs prior) f1496fd
 ✓ Unit 3h — Mid-session iteration banner         92fc8b9
+✓ Unit S.1 — SQLite plays storage backend        bbfc232
+✓ Unit S.2 — Client snapshot + disable() hook    196fbdb
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
-☐ Unit 3e  Coaching review modal — history view
-            (BLOCKED — needs play-storage backend: POST/GET
-             /plays + GET /play/{id} + sqlite schema +
-             _ndSnapshotPlay session-boundary hook. Reference
-             routes.py is 397 lines; current is 193. Treat as
-             its own unit "S — storage" before 3e/3g/3i.)
-☐ Unit 3g  Top-3 prescriptions (cross-play, BLOCKED on storage)
-☐ Unit 3i  Fretboard heatmap (BLOCKED on storage)
+☐ Unit 3e  Coaching review modal — history view (UNBLOCKED, S.1+S.2 landed)
+☐ Unit 3g  Top-3 prescriptions (cross-play) (UNBLOCKED)
+☐ Unit 3i  Fretboard heatmap (UNBLOCKED)
 ☐ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
 ☐ Unit 4d  Recording UI in settings panel
