@@ -22,13 +22,21 @@ shape during porting.
 ✓ Unit 6d — IGNORED_DETECTOR_FAILURE demotion  4f22231
 ✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
 ✓ Unit 6e — Onset detection + buffer flush     4fabac6
+✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
+✓ Unit 6g — Stability voting (N-of-M)          7131698
+✓ Unit 6i — Open-string contamination demotion 3eb88b0
 ✓ Unit H1 — testInjectWav in factory           45ae617
 ✓ Unit H2 — replay-baseline.js + routes        f1bf669
+✓ Unit H1+ — chart-note injection from dumps    2c75be1
+✓ Unit H1++ — avOffset override in replay      d995193
+✓ Unit H2+ — onset-anchored matcher option     ccd0bf9
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
-☐ Unit 6g  Stability voting (2-of-3 frames before assigning midi)
 ☐ Unit 6h  Chart-aware refractory (tighten on fast-repeat lookahead)
-☐ Unit 6i  Sustain-bleed-aware WRONG_PITCH demotion
+☐ Unit 6j  YIN octave-down validation in _ndYinDetect
+            (DEFERRED — analysis showed user's case is open-string
+             contamination, not the harmonic-pick error 6j fixes;
+             validate via fixtures with cleaner muting first)
 ☐ Unit 3f  Improvement deltas (current vs prior play)
 ☐ Unit 3a  Coaching analysis pure functions
 ☐ Unit 3b  _ndExportCoachingAnalysis entry point
