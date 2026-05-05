@@ -3010,6 +3010,7 @@ function createNoteDetector(options = {}) {
                     // actual attack landed ~halfway through the chunk.
                     if (hw && hw.getTime) {
                         pendingOnsetChartT = hw.getTime() - _ND_ONSET_BUFFER_COMP_SEC;
+                        _dbgPendingSetCount++;
                     }
                     // Flush stability history too — voted MIDI from
                     // the previous note's sustain shouldn't survive
