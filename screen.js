@@ -2075,9 +2075,11 @@ async function _ndShowCoachingReview({ playId, source }) {
 
             ${topFixHtml}
 
-            ${_ndRenderPrescriptionsBlock(_ndComputePrescriptions(play.noteResults || [], {
-                arrangement: (play.settings && play.settings.arrangement) || (songInfo && songInfo.arrangement) || 'guitar',
-            })).replace('class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3"', 'class="mx-5 mt-4 bg-dark-800 border border-orange-700/40 rounded p-3"')}
+            <div id="nd-prescriptions-slot" class="mx-5 mt-4">
+                ${_ndRenderPrescriptionsBlock(_ndComputePrescriptions(play.noteResults || [], {
+                    arrangement: (play.settings && play.settings.arrangement) || (songInfo && songInfo.arrangement) || 'guitar',
+                })).replace('class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3"', 'class="bg-dark-800 border border-orange-700/40 rounded p-3"')}
+            </div>
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
                 ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct), 'nd-delta-pitch')}
@@ -2338,6 +2340,7 @@ function _ndFmtDeltaBadge(delta, axis) {
 
 async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, currentClusters) {
     if (!currentPlay || !currentPlay.songId) return;
+    let plays = [];
     let prior = null;
     try {
         const r = await fetch(
@@ -2345,22 +2348,51 @@ async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, cur
         );
         if (!r.ok) return;
         const data = await r.json();
-        const plays = (data && data.plays) || [];
+        plays = (data && data.plays) || [];
         prior = plays.find(p =>
             p && p.id !== currentPlay.id && !p.isDrill
         );
     } catch {
         return;
     }
+
+    const setHtml = (id, html) => {
+        const el = modal.querySelector('#' + id);
+        if (el) el.innerHTML = html;
+    };
+
+    // Unit 3g+: cross-play prescriptions. With ≥2 plays in history,
+    // aggregate noteResults across them and re-render the
+    // prescriptions panel from the combined set. Single-play
+    // signals (timing bias, weak string) get much more reliable on
+    // 5+ plays of data; chronic miss patterns surface where they'd
+    // be hidden by single-play noise. Skipped silently if there's
+    // only one play (the synchronously-rendered single-play panel
+    // is already accurate).
+    if (plays.length >= 2) {
+        const allNotes = [];
+        for (const p of plays) {
+            for (const r of (p.noteResults || [])) allNotes.push(r);
+        }
+        const arrangement = (currentPlay.settings && currentPlay.settings.arrangement) || 'guitar';
+        const top3 = _ndComputePrescriptions(allNotes, { arrangement });
+        const slot = modal.querySelector('#nd-prescriptions-slot');
+        if (slot && top3.length > 0) {
+            const html = _ndRenderPrescriptionsBlock(top3)
+                .replace('class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3"',
+                         'class="bg-dark-800 border border-orange-700/40 rounded p-3"')
+                .replace('Top 3 things to fix',
+                         `Top 3 things to fix · across ${plays.length} plays`);
+            slot.innerHTML = html;
+        }
+    }
+
     if (!prior) return;  // first attempt — leave slots empty
     const priorScores = _ndScoresFromNotes(prior.noteResults || []);
     const deltas = _ndComputeScoreDeltas(currentDerived, priorScores);
     if (!deltas) return;
 
-    const set = (id, html) => {
-        const el = modal.querySelector('#' + id);
-        if (el) el.innerHTML = html;
-    };
+    const set = setHtml;
     // Headline (Detection): rendered at the top right of the modal as
     // #nd-delta-combined. Use detection delta (scoresFromNotes returns
     // both combined as alias and detection itself; either matches).
