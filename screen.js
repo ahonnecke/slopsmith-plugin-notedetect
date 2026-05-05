@@ -1498,6 +1498,104 @@ function _ndAggregateBySection(noteResults, sections) {
 // implemented here: when no clusters are found, look at the weakest
 // sub-score (pitch / coverage / timing skew) and surface global
 // coaching advice.
+// Unit 3i: per-(string, fret) miss-rate grid. Pure — takes a flat
+// noteResults array (port shape: hit:bool, ignoredAsDetectorFailure
+// for sustain-bleed exclusion) and returns a 2D grid of
+// {hits, miss, total, missRate}. The renderer turns this into a
+// compact SVG fretboard with miss-rate-colored cells.
+//
+// stringCount: 4 for bass, 6 for guitar; default 6.
+// maxFret: cap fret-axis size; default 24 (the highest sane fret).
+//
+// We exclude `ignoredAsDetectorFailure` notes (sustain-bleed
+// artifacts) from BOTH numerator and denominator — same rule
+// _ndScoresFromNotes uses, so the heatmap can't show "you miss
+// every E2" when those misses were really detector failures.
+function _ndComputeFretboardHeatmap(noteResults, opts = {}) {
+    const stringCount = opts.stringCount || 6;
+    const maxFret = opts.maxFret || 24;
+    const grid = [];
+    for (let s = 0; s < stringCount; s++) {
+        grid[s] = [];
+        for (let f = 0; f <= maxFret; f++) {
+            grid[s][f] = { hits: 0, miss: 0, total: 0, missRate: null };
+        }
+    }
+    for (const r of (noteResults || [])) {
+        if (!r || r.ignoredAsDetectorFailure) continue;
+        // The note's source string/fret lives on .chartNote (matched)
+        // or .note (fallback). Both expose s/f when the chart had
+        // them. Chord notes have neither; skip — they'd map to
+        // multiple cells and we'd need per-note splitting.
+        const sf = r.chartNote || r.note || null;
+        if (!sf) continue;
+        if (typeof sf.s !== 'number' || sf.s < 0 || sf.s >= stringCount) continue;
+        if (typeof sf.f !== 'number' || sf.f < 0 || sf.f > maxFret) continue;
+        const cell = grid[sf.s][sf.f];
+        cell.total++;
+        if (r.hit) cell.hits++;
+        else cell.miss++;
+    }
+    for (let s = 0; s < stringCount; s++) {
+        for (let f = 0; f <= maxFret; f++) {
+            const c = grid[s][f];
+            c.missRate = c.total > 0 ? c.miss / c.total : null;
+        }
+    }
+    return grid;
+}
+
+// Render the heatmap as a CSS grid block (cells = colored divs)
+// suitable for embedding in the coaching modal. Returns a string;
+// caller drops it into innerHTML. Cells with no data render as a
+// faint backdrop; cells with data shade red→green by miss rate.
+// Frequency markers ('●' for ≥10 attempts, '·' for ≥3) prevent the
+// reader from over-weighting a single-attempt outlier cell.
+function _ndRenderFretboardHeatmapSvg(grid, stringCount, maxFret) {
+    let any = false;
+    for (let s = 0; s < stringCount && !any; s++) {
+        for (let f = 0; f <= maxFret; f++) {
+            if (grid[s][f].total > 0) { any = true; break; }
+        }
+    }
+    if (!any) {
+        return '<div class="text-gray-500 text-xs italic">No fretboard data — note results lacked string/fret info.</div>';
+    }
+    const cellPx = 14;
+    const labelCol = 18;
+    let body = `<div style="display:grid;grid-template-columns:${labelCol}px repeat(${maxFret + 1}, ${cellPx}px);gap:1px;font-size:8px">`;
+    body += '<div></div>';
+    for (let f = 0; f <= maxFret; f++) {
+        // Standard fretmarker positions; matches what most fretboard
+        // diagrams highlight so the user can locate frets at a glance.
+        const marker = f === 0 || f === 3 || f === 5 || f === 7
+            || f === 9 || f === 12 || f === 15 || f === 17
+            || f === 19 || f === 24;
+        body += `<div class="text-gray-600 text-center" style="line-height:${cellPx}px">${marker ? f : ''}</div>`;
+    }
+    for (let s = 0; s < stringCount; s++) {
+        body += `<div class="text-gray-500 text-right pr-1" style="line-height:${cellPx}px">s${s}</div>`;
+        for (let f = 0; f <= maxFret; f++) {
+            const c = grid[s][f];
+            let bg, content = '';
+            if (c.missRate === null) {
+                bg = 'rgba(60,60,70,0.3)';
+            } else {
+                const r = Math.round(c.missRate * 240);
+                const g = Math.round((1 - c.missRate) * 200);
+                bg = `rgba(${r}, ${g}, 60, 0.85)`;
+                if (c.total >= 3) content = c.total >= 10 ? '●' : '·';
+            }
+            const tip = c.total > 0
+                ? `s${s}/f${f}: ${c.miss}/${c.total} miss`
+                : `s${s}/f${f}: no data`;
+            body += `<div title="${tip}" style="background:${bg};text-align:center;color:#fff;line-height:${cellPx}px;font-size:8px">${content}</div>`;
+        }
+    }
+    body += '</div>';
+    return body;
+}
+
 function _ndExportCoachingAnalysis(play, opts = {}) {
     const { sections = [], totalDuration = 0, heatmapBinSec = 5 } = opts;
     const noteResults = (play && play.noteResults) || [];
@@ -1871,6 +1969,14 @@ async function _ndShowCoachingReview({ playId, source }) {
                 </button>
                 <div id="nd-review-history" class="hidden mt-3"></div>
             </div>
+
+            <div class="px-5 py-4 border-t border-gray-800">
+                <button id="nd-review-heatmap-toggle"
+                        class="text-gray-400 hover:text-gray-200 text-xs flex items-center gap-1">
+                    <span class="nd-heatmap-arrow">▸</span> Fretboard heatmap — where you missed
+                </button>
+                <div id="nd-review-heatmap" class="hidden mt-3 bg-dark-700 border border-gray-700 rounded p-2"></div>
+            </div>
         </div>
     `;
     document.body.appendChild(modal);
@@ -1932,6 +2038,40 @@ async function _ndShowCoachingReview({ playId, source }) {
             }
         } else {
             historyEl.classList.add('hidden');
+            arrow.textContent = '▸';
+        }
+    };
+
+    // Unit 3i: fretboard heatmap. Computed lazily on first expand —
+    // the analysis is cheap (single noteResults walk) but rendering
+    // the SVG is wasted work if the user never opens it. String
+    // count derived from arrangement (bass=4, else 6).
+    const heatmapToggle = modal.querySelector('#nd-review-heatmap-toggle');
+    const heatmapEl = modal.querySelector('#nd-review-heatmap');
+    let heatmapLoaded = false;
+    heatmapToggle.onclick = () => {
+        const arrow = heatmapToggle.querySelector('.nd-heatmap-arrow');
+        if (heatmapEl.classList.contains('hidden')) {
+            heatmapEl.classList.remove('hidden');
+            arrow.textContent = '▾';
+            if (!heatmapLoaded) {
+                heatmapLoaded = true;
+                const arrangement = (play.settings && play.settings.arrangement)
+                    || (songInfo && songInfo.arrangement) || 'guitar';
+                const stringCount = String(arrangement).toLowerCase() === 'bass' ? 4 : 6;
+                // Find the highest fret used so we don't render dozens
+                // of empty cells past fret 12 for an open-position song.
+                let maxFret = 0;
+                for (const r of (play.noteResults || [])) {
+                    const sf = r && (r.chartNote || r.note);
+                    if (sf && typeof sf.f === 'number' && sf.f > maxFret) maxFret = sf.f;
+                }
+                maxFret = Math.min(24, Math.max(12, maxFret));
+                const grid = _ndComputeFretboardHeatmap(play.noteResults || [], { stringCount, maxFret });
+                heatmapEl.innerHTML = _ndRenderFretboardHeatmapSvg(grid, stringCount, maxFret);
+            }
+        } else {
+            heatmapEl.classList.add('hidden');
             arrow.textContent = '▸';
         }
     };

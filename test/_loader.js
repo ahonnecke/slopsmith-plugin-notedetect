@@ -319,6 +319,11 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         // SVG markup). DOM-free; testable via string-content asserts.
         renderTimeHeatmapSvg: sandbox._ndRenderTimeHeatmapSvg,
         renderSectionHeatmapSvg: sandbox._ndRenderSectionHeatmapSvg,
+        // Unit 3i — fretboard heatmap pure functions. Compute returns
+        // a 2D grid keyed by (string, fret); render returns embeddable
+        // HTML for the coaching modal.
+        computeFretboardHeatmap: sandbox._ndComputeFretboardHeatmap,
+        renderFretboardHeatmapSvg: sandbox._ndRenderFretboardHeatmapSvg,
     };
 }
 
