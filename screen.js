@@ -1917,6 +1917,105 @@ async function _ndShowCoachingReview({ playId, source }) {
             arrow.textContent = '▸';
         }
     };
+
+    // Unit 3f: patch improvement-delta badges by fetching the most-recent
+    // comparable prior play and computing per-axis deltas. Async so the
+    // modal renders immediately and the badges fill in when the fetch
+    // resolves. Failures are silent — first plays + network errors just
+    // leave the slots empty.
+    _ndPatchImprovementDeltas(modal, play, derived, clusters).catch(() => {});
+}
+
+// Pure: format a delta as a colored badge with arrow + text.
+//   axis='timing' — delta is signed |current| - |prior| in ms;
+//                   negative = tighter to chart = better.
+//   axis='pct'    — delta is signed fraction (current - prior);
+//                   positive = better.
+function _ndFmtDeltaBadge(delta, axis) {
+    if (delta == null) return '<span class="text-gray-600">—</span>';
+    if (Math.abs(delta) < 0.0001 && axis !== 'timing') {
+        return '<span class="text-gray-500">no change</span>';
+    }
+    let text, better;
+    if (axis === 'timing') {
+        const sign = delta > 0 ? '+' : '';
+        text = `${sign}${Math.round(delta)}ms`;
+        better = delta < 0;  // less |timing| = tighter = better
+    } else {
+        const pp = Math.round(delta * 100);
+        if (pp === 0) return '<span class="text-gray-500">no change</span>';
+        const sign = pp > 0 ? '+' : '';
+        text = `${sign}${pp}pp`;
+        better = pp > 0;
+    }
+    const color = better ? '#10b981' : '#f97316';
+    const arrow = better ? '↑' : '↓';
+    return `<span style="color:${color}">${arrow} ${text}</span> vs last`;
+}
+
+async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, currentClusters) {
+    if (!currentPlay || !currentPlay.songId) return;
+    let prior = null;
+    try {
+        const r = await fetch(
+            `/api/plugins/note_detect/plays?songId=${encodeURIComponent(currentPlay.songId)}&limit=10`
+        );
+        if (!r.ok) return;
+        const data = await r.json();
+        const plays = (data && data.plays) || [];
+        prior = plays.find(p =>
+            p && p.id !== currentPlay.id && !p.isDrill
+        );
+    } catch {
+        return;
+    }
+    if (!prior) return;  // first attempt — leave slots empty
+    const priorScores = _ndScoresFromNotes(prior.noteResults || []);
+    const deltas = _ndComputeScoreDeltas(currentDerived, priorScores);
+    if (!deltas) return;
+
+    const set = (id, html) => {
+        const el = modal.querySelector('#' + id);
+        if (el) el.innerHTML = html;
+    };
+    // Headline (Detection): rendered at the top right of the modal as
+    // #nd-delta-combined. Use detection delta (scoresFromNotes returns
+    // both combined as alias and detection itself; either matches).
+    set('nd-delta-combined',
+        deltas.detection != null
+            ? _ndFmtDeltaBadge(deltas.detection, 'pct')
+            : '<span class="text-gray-600">first attempt</span>');
+    set('nd-delta-pitch',
+        deltas.pitchPct != null ? _ndFmtDeltaBadge(deltas.pitchPct, 'pct') : '');
+    set('nd-delta-coverage',
+        deltas.coverage != null ? _ndFmtDeltaBadge(deltas.coverage, 'pct') : '');
+    // Timing delta: tighter is better regardless of sign. Pass the
+    // SIGNED |abs| delta so _ndFmtDeltaBadge's "less is better"
+    // interpretation is correct.
+    if (typeof currentDerived.timingMedianMs === 'number'
+            && typeof priorScores.timingMedianMs === 'number') {
+        const tightenDelta = Math.abs(currentDerived.timingMedianMs)
+                           - Math.abs(priorScores.timingMedianMs);
+        set('nd-delta-timing', _ndFmtDeltaBadge(tightenDelta, 'timing'));
+    }
+
+    // Per-cluster deltas: for each current cluster, find the most-
+    // overlapping prior cluster and surface "↑ +Xpp" next to its focus
+    // line if the user got better at the same trouble spot. Silent
+    // when no overlap (the trouble spot is new) or sub-1pp (noise).
+    if (currentClusters && currentClusters.length) {
+        const priorClusters = _ndFindMissClusters(prior.noteResults || []);
+        for (let i = 0; i < currentClusters.length; i++) {
+            const cur = currentClusters[i];
+            const match = _ndFindOverlappingPriorCluster(cur, priorClusters);
+            if (!match) continue;
+            const curScore = _ndScoresFromNotes(cur.notes).detection;
+            const priorClusterScore = _ndScoresFromNotes(match.notes).detection;
+            const delta = curScore - priorClusterScore;
+            if (Math.abs(delta) < 0.005) continue;
+            set(`nd-cluster-delta-${i}`, _ndFmtDeltaBadge(delta, 'pct'));
+        }
+    }
 }
 
 async function _ndCrepeDetect(buffer) {
