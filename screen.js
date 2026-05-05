@@ -1086,6 +1086,14 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 // tempo wobble within ~10 s without locking onto a single bad hit.
 const _ND_DRIFT_WINDOW = 8;
 const _ND_DRIFT_MIN_SAMPLES = 4;
+// Auto-calibration: when the drift estimator stabilizes with the
+// full window AND the magnitude exceeds this threshold, push the
+// drift into avOffset so it's actually compensated (instead of just
+// shifting the matcher's search center). 50 ms is the precision-zone
+// boundary — below that the player perceives "good timing" and we
+// shouldn't move the goalposts. Above that they're systematically
+// off in a way the drift estimator confidently sees.
+const _ND_AUTO_CAL_THRESHOLD_MS = 50;
 
 // Stability voting. YIN's first ~100ms after a fresh pluck is
 // transient-jittery — a bass D2 might bounce D1 → D2 → A1 → D2
@@ -2908,6 +2916,9 @@ function createNoteDetector(options = {}) {
     // residual A/V drift the user's static calibration didn't catch.
     let driftBuffer = [];
     let driftEstimateMs = 0;
+    // Auto-calibration latch: one-shot per session so we don't keep
+    // oscillating avOffset on every new hit. Reset on resetScoring.
+    let autoCalApplied = false;
     // Onset state. inNote tracks the RMS-envelope hysteresis;
     // reattackRmsBuf is the rolling RMS history used by the re-attack
     // trigger to detect a fresh pluck during sustain.
@@ -4228,6 +4239,36 @@ function createNoteDetector(options = {}) {
             driftEstimateMs = sorted.length % 2 === 0
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
+        }
+        // Auto-calibration: once the buffer is full AND the median
+        // exceeds the precision-zone threshold, push the drift into
+        // avOffset so the chart-time-to-audio-time mapping reflects
+        // the real input latency. Without this the user has to [/]
+        // their way through every song to find the right offset.
+        // One-shot per session — flips back via resetScoring.
+        if (!autoCalApplied
+                && driftBuffer.length >= _ND_DRIFT_WINDOW
+                && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS) {
+            const _hw = resolveHw();
+            if (_hw && typeof _hw.setAvOffset === 'function' && typeof _hw.getAvOffset === 'function') {
+                const prev = _hw.getAvOffset() || 0;
+                // Drift sign: positive = player late = chart fires
+                // before audio reaches the user → push avOffset
+                // forward (positive) by the drift amount so the
+                // chart waits for the audio. Same sign convention as
+                // the manual [/] keys (which let the user nudge
+                // avOffset positive when feeling late).
+                const next = prev + driftEstimateMs;
+                _hw.setAvOffset(next);
+                autoCalApplied = true;
+                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms`);
+                // Driftbuffer should be reset post-application so the
+                // next session computes drift fresh (otherwise the
+                // first few hits after calibration would still show
+                // the pre-cal bias and re-trigger the threshold).
+                driftBuffer = [];
+                driftEstimateMs = 0;
+            }
         }
     }
 
@@ -5921,6 +5962,7 @@ function createNoteDetector(options = {}) {
         // latency doesn't leak into the next track's calibration.
         driftBuffer = [];
         driftEstimateMs = 0;
+        autoCalApplied = false;
         // Onset state — same reasoning. Don't carry inNote=true into
         // the next session or the first note will be missed by the
         // refractory check.
