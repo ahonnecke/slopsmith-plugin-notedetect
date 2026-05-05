@@ -43,14 +43,14 @@ shape during porting.
 ✓ Diagnostics fix — moved to /config (RO bug)    32db583
 ✓ Unit 3g — Top-3 prescriptions (single-play)    a3ef527
 ✓ Unit UX-restart — Restart song button          bef9aa3
+✓ Unit 3i+ — Heatmap cross-play overlay          7fa9a80
+✓ Unit 3g+ — Prescriptions cross-play patch      4f9c4f1
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
-☐ Unit 3g+ Top-3 prescriptions cross-play (follow-up to single-play 3g)
-☐ Unit 3i+ Fretboard heatmap cross-play overlay (follow-up to 3i)
 ☐ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
 ☐ Unit 4d  Recording UI in settings panel
