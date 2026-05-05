@@ -34,6 +34,7 @@ shape during porting.
 ✓ Unit H1++ — avOffset override in replay      d995193
 ✓ Unit H2+ — onset-anchored matcher option     ccd0bf9
 ✓ Unit 3f — Improvement deltas (current vs prior) f1496fd
+✓ Unit 3h — Mid-session iteration banner         92fc8b9
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
@@ -41,9 +42,13 @@ shape during porting.
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
 ☐ Unit 3e  Coaching review modal — history view
-☐ Unit 3g  Top-3 prescriptions (cross-play)
-☐ Unit 3h  Mid-session iteration banner
-☐ Unit 3i  Fretboard heatmap
+            (BLOCKED — needs play-storage backend: POST/GET
+             /plays + GET /play/{id} + sqlite schema +
+             _ndSnapshotPlay session-boundary hook. Reference
+             routes.py is 397 lines; current is 193. Treat as
+             its own unit "S — storage" before 3e/3g/3i.)
+☐ Unit 3g  Top-3 prescriptions (cross-play, BLOCKED on storage)
+☐ Unit 3i  Fretboard heatmap (BLOCKED on storage)
 ☐ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
 ☐ Unit 4d  Recording UI in settings panel
