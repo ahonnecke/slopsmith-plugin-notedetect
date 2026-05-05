@@ -1116,6 +1116,14 @@ const _ND_ONSET_BUFFER_COMP_SEC = 0.020;
 const _ND_ONSET_LEVEL = 0.015;           // RMS above → entering a note
 const _ND_ONSET_EXIT_LEVEL = 0.008;      // RMS below → note ended
 const _ND_REATTACK_REFRACTORY_SEC = 0.20; // refractory after onset
+// When the chart predicts a note within this lookahead, tighten the
+// re-attack refractory to FAST_SEC. Otherwise the 200ms baseline is too
+// long — the second pluck of a fast repeat (e.g. 16th notes at 120 BPM
+// = 125ms apart) lands inside the refractory window and never registers.
+// Chart-awareness lets the detector be sensitive to upcoming fast
+// repeats without introducing false re-fires on slow notes.
+const _ND_REATTACK_REFRACTORY_FAST_SEC = 0.080;
+const _ND_FAST_REPEAT_LOOKAHEAD_SEC = 0.250;
 const _ND_REATTACK_MIN_LEVEL = 0.015;    // re-attack must reach this RMS
 const _ND_REATTACK_REARM_LEVEL = 0.008;  // dip below this re-arms re-attack gate
 const _ND_REATTACK_RATIO = 1.5;          // RMS spike must be N× recent min
@@ -2956,7 +2964,17 @@ function createNoteDetector(options = {}) {
                 if (reattackRmsBuf.length > _ND_REATTACK_WINDOW) reattackRmsBuf.shift();
 
                 const nowSec = performance.now() / 1000;
-                const refractoryOk = (nowSec - lastOnsetPerfSec) > _ND_REATTACK_REFRACTORY_SEC;
+                // Chart-aware refractory: when a chart note is coming
+                // within 250ms, tighten the refractory to 80ms so a
+                // rapid second pluck (16th notes / 120 BPM) isn't
+                // suppressed. Outside the lookahead window keep the
+                // 200ms baseline that suppresses body-peak retriggers
+                // on slow notes.
+                const fastRepeatExpected = chartHasNoteWithin(_ND_FAST_REPEAT_LOOKAHEAD_SEC);
+                const effRefractorySec = fastRepeatExpected
+                    ? _ND_REATTACK_REFRACTORY_FAST_SEC
+                    : _ND_REATTACK_REFRACTORY_SEC;
+                const refractoryOk = (nowSec - lastOnsetPerfSec) > effRefractorySec;
 
                 // Re-arm the re-attack gate when the envelope dips
                 // below rearm level — confirms previous sustain has
@@ -2975,7 +2993,8 @@ function createNoteDetector(options = {}) {
                 // running min, gated by prior release. Catches rapid
                 // same-pitch plucks where sustain keeps inNote=true
                 // between attacks.
-                else if (inNote && refractoryOk && reattackArmed
+                else if (inNote && refractoryOk
+                         && (reattackArmed || fastRepeatExpected)
                          && rms > _ND_REATTACK_MIN_LEVEL
                          && reattackRmsBuf.length >= 3) {
                     const recentMin = Math.min(...reattackRmsBuf.slice(0, -1));
@@ -3447,87 +3466,35 @@ function createNoteDetector(options = {}) {
         return `${time.toFixed(3)}_${note.s}_${note.f}`;
     }
 
-    // ── Renderer note-state provider (slopsmith#254) ──────────────────
-    // How long (s) a missed note's gem stays red-washed on the highway.
-    // Short on purpose — the slide-down miss marker (drawOverlay) carries
-    // the longer-lived feedback; the gem wash is just an instant cue.
-    const NOTE_MISS_GEM_TTL = 0.6;
-    // Grace (ms) after an on-pitch detection during which a sustained
-    // note still counts as actively held — smooths render-vs-pitch frame
-    // rate mismatch (see _susActiveUntil).
-    const NOTE_SUS_GRACE_MS = 250;
-
-    // Registered via highway.setNoteStateProvider(). The active renderer
-    // calls this per visible chart note / chord-note. Returns null (render
-    // normally), or { state, alpha } where state ∈ {'active','hit','miss'}:
-    //   'active' — sustained note still ringing AND currently on-pitch (full glow)
-    //   'hit'    — recently struck cleanly (glow fading over hitGlowDuration)
-    //   'miss'   — recently judged a miss (brief red wash)
-    // `note` is the chart note object; for chord notes `chartTime` is the
-    // chord's time (matches how noteResults keys chord notes). Must stay
-    // cheap: called per note per renderer per frame.
-    function noteStateFor(note, chartTime) {
-        if (!enabled || !note || !Number.isFinite(chartTime)) return null;
-        const key = noteKey(note, chartTime);
-        const j = noteResults.get(key);
-        if (!j) return null;  // not judged yet — render normally
-
-        // Renderer clock for the visual age / TTL math — `getTime() +
-        // avOffset` is the same basis `drawOverlay()` uses for its slide-
-        // down miss markers and matches when the user *sees* the note
-        // cross the strike line. The `-latencyOffset` correction is for
-        // *audio* timing (correlating mic input to chart notes in
-        // matchNotes/checkMisses); applying it here would start the
-        // post-hit fade ~latencyOffset (default 80 ms) before the gem
-        // visually arrived, shortening the visible glow window.
-        const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
-            + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
-
-        if (j.hit) {
-            const sus = +note.sus || 0;
-            // Sustained note still inside its ring window AND currently
-            // being played on-pitch → hold it at full glow.
-            if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
-                return { state: 'active', alpha: 1 };
-            }
-            // Otherwise: brief post-strike glow that fades out over
-            // hitGlowDuration.
-            const age = songT - chartTime;
-            if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
-            const glowDur = Math.max(0.1, hitGlowDuration);
-            if (age >= glowDur) return null;
-            return { state: 'hit', alpha: 1 - age / glowDur };
-        }
-        // Missed (timing window expired, or matched-but-not-clean).
-        const age = songT - chartTime;
-        if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
-        return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
-    }
-
-    // Is the live monophonic detection on target for `note`? Maintains a
-    // short grace window in _susActiveUntil so a held note doesn't flicker
-    // between audio frames. Chord notes don't get a per-frame polyphonic
-    // re-score today — for a sustained chord this returns false once the
-    // monophonic detector loses the pitch, so the chord falls through to
-    // the post-strike glow fade in noteStateFor.
-    // TODO(slopsmith#254 follow-up): re-run the constraint chord scorer
-    // per audio frame for sustained-and-hit chords so held chords glow
-    // the same way held single notes do.
-    function _sustainStillHeld(key, note) {
-        const nowMs = (typeof performance !== 'undefined' && performance.now)
-            ? performance.now() : Date.now();
-        if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
-            const expectedMidi = _ndMidiFromStringFret(
-                note.s, note.f, currentArrangement, currentStringCount, tuningOffsets, capo
-            );
-            if (Number.isFinite(expectedMidi)
-                && Math.abs(_ndNearestOctaveCents(detectedMidi, expectedMidi)) <= pitchTolerance) {
-                _susActiveUntil.set(key, nowMs + NOTE_SUS_GRACE_MS);
-                return true;
+    // Chart-aware refractory helper. Returns true when the chart has
+    // any non-muted note (or chord) within `lookaheadSec` of the
+    // current chart time. The audio onset detector consults this to
+    // tighten its refractory window when a fast repeat is expected.
+    function chartHasNoteWithin(lookaheadSec) {
+        if (!hw || !hw.getTime) return false;
+        const t = hw.getTime();
+        const notes = hw.getNotes ? hw.getNotes() : null;
+        const chords = hw.getChords ? hw.getChords() : null;
+        const tEnd = t + lookaheadSec;
+        if (notes && notes.length > 0) {
+            const start = bsearch(notes, t);
+            for (let i = start; i < notes.length; i++) {
+                const n = notes[i];
+                if (n.t > tEnd) break;
+                if (!n.mt) return true;
             }
         }
-        const until = _susActiveUntil.get(key);
-        return Number.isFinite(until) && until > nowMs;
+        if (chords && chords.length > 0) {
+            const start = bsearch(chords, t);
+            for (let i = start; i < chords.length; i++) {
+                const c = chords[i];
+                if (c.t > tEnd) break;
+                for (const cn of (c.notes || [])) {
+                    if (!cn.mt) return true;
+                }
+            }
+        }
+        return false;
     }
 
     function bsearch(arr, target) {
@@ -7656,7 +7623,11 @@ function createNoteDetector(options = {}) {
             if (reattackRmsBuf.length > _ND_REATTACK_WINDOW) reattackRmsBuf.shift();
 
             const nowSec = performance.now() / 1000;
-            const refractoryOk = (nowSec - lastOnsetPerfSec) > _ND_REATTACK_REFRACTORY_SEC;
+            const fastRepeatExpected = chartHasNoteWithin(_ND_FAST_REPEAT_LOOKAHEAD_SEC);
+            const effRefractorySec = fastRepeatExpected
+                ? _ND_REATTACK_REFRACTORY_FAST_SEC
+                : _ND_REATTACK_REFRACTORY_SEC;
+            const refractoryOk = (nowSec - lastOnsetPerfSec) > effRefractorySec;
 
             if (rms < _ND_REATTACK_REARM_LEVEL) reattackArmed = true;
 
@@ -7664,7 +7635,8 @@ function createNoteDetector(options = {}) {
             if (rms > _ND_ONSET_LEVEL && !inNote && refractoryOk) {
                 inNote = true;
                 fireOnset = true;
-            } else if (inNote && refractoryOk && reattackArmed
+            } else if (inNote && refractoryOk
+                       && (reattackArmed || fastRepeatExpected)
                        && rms > _ND_REATTACK_MIN_LEVEL
                        && reattackRmsBuf.length >= 3) {
                 const recentMin = Math.min(...reattackRmsBuf.slice(0, -1));
