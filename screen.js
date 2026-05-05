@@ -4252,35 +4252,54 @@ function createNoteDetector(options = {}) {
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
         }
-        // Auto-calibration: once the buffer is full AND the median
-        // exceeds the precision-zone threshold, push the drift into
-        // avOffset so the chart-time-to-audio-time mapping reflects
-        // the real input latency. Without this the user has to [/]
-        // their way through every song to find the right offset.
-        // One-shot per session — flips back via resetScoring.
+        // Auto-calibration: once the buffer hits MIN_SAMPLES AND the
+        // median exceeds the precision-zone threshold, push the drift
+        // through slopsmith's setAvOffsetMs so the value PERSISTS to
+        // /api/settings. Persisting matters because:
+        //
+        //   - hw.setAvOffset() updates only the highway's render-time
+        //     shift (in-memory, this session only).
+        //   - window.setAvOffsetMs() persists via POST /api/settings
+        //     so future songs + future browser sessions start with
+        //     the calibrated value.
+        //
+        // Once persisted, song switches load the calibrated avOffset
+        // automatically — no more "first 8 hits of every song wasted"
+        // because subsequent songs see drift well under threshold and
+        // auto-cal doesn't re-fire. Calibration cost amortizes across
+        // all future plays for this audio routing setup.
+        //
+        // Lowered the sample count from _ND_DRIFT_WINDOW (8) to
+        // _ND_DRIFT_MIN_SAMPLES (4) so the first calibration fires
+        // sooner on the very first session after a setup change.
         if (!autoCalApplied
-                && driftBuffer.length >= _ND_DRIFT_WINDOW
+                && driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
                 && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS) {
+            // Read current value from slopsmith's persisted state if
+            // available (window.setAvOffsetMs reads/writes _avOffsetMs);
+            // fall back to the highway getter for sandbox/test contexts.
+            let prev = 0;
             const _hw = resolveHw();
-            if (_hw && typeof _hw.setAvOffset === 'function' && typeof _hw.getAvOffset === 'function') {
-                const prev = _hw.getAvOffset() || 0;
-                // Drift sign: positive = player late = chart fires
-                // before audio reaches the user → push avOffset
-                // forward (positive) by the drift amount so the
-                // chart waits for the audio. Same sign convention as
-                // the manual [/] keys (which let the user nudge
-                // avOffset positive when feeling late).
-                const next = prev + driftEstimateMs;
-                _hw.setAvOffset(next);
-                autoCalApplied = true;
-                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms`);
-                // Driftbuffer should be reset post-application so the
-                // next session computes drift fresh (otherwise the
-                // first few hits after calibration would still show
-                // the pre-cal bias and re-trigger the threshold).
-                driftBuffer = [];
-                driftEstimateMs = 0;
+            if (_hw && typeof _hw.getAvOffset === 'function') {
+                prev = _hw.getAvOffset() || 0;
             }
+            const next = prev + driftEstimateMs;
+            // Prefer the slopsmith persistent path; fall back to the
+            // highway-only update if slopsmith isn't around (unit
+            // tests, headless harness without app.js, etc.).
+            if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+                window.setAvOffsetMs(next);
+                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms (persisted)`);
+            } else if (_hw && typeof _hw.setAvOffset === 'function') {
+                _hw.setAvOffset(next);
+                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms (session-only — slopsmith setter unavailable)`);
+            } else {
+                return;
+            }
+            autoCalApplied = true;
+            // Reset drift buffer so post-cal hits measure new alignment.
+            driftBuffer = [];
+            driftEstimateMs = 0;
         }
     }
 
