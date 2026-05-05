@@ -2018,6 +2018,67 @@ async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, cur
     }
 }
 
+// Unit 3h: mid-session iteration banner. Fires after each drill loop
+// iteration with a quick "X/Y clean" toast so the user sees impact
+// without opening the full modal. Stacks consecutive iterations
+// briefly, auto-dismisses after 4s. Translates port-shape judgments
+// (hit + timingState + pitchState + ignoredAsDetectorFailure) into
+// the four pre-port primary buckets the toast renders.
+let _ndIterationBannerCount = 0;
+function _ndShowIterationBanner(noteResults) {
+    const arr = noteResults instanceof Map
+        ? [...noteResults.values()]
+        : (Array.isArray(noteResults) ? noteResults : []);
+    let clean = 0, dirty = 0, missWrong = 0, missNone = 0;
+    for (const r of arr) {
+        if (!r || r.ignoredAsDetectorFailure) continue;
+        if (r.hit) {
+            const timingOk = r.timingState === 'OK' || r.timingState == null;
+            const pitchOk = r.pitchState === 'OK' || r.pitchState == null;
+            if (timingOk && pitchOk) clean++;
+            else dirty++;
+        } else if (typeof r.detectedMidi === 'number' && r.detectedMidi >= 0
+                   && r.pitchState && r.pitchState !== 'OK') {
+            // Detector saw something but pitch was off — wrong-pitch miss.
+            missWrong++;
+        } else {
+            missNone++;
+        }
+    }
+    const total = clean + dirty + missWrong + missNone;
+    if (total === 0) return;
+    _ndIterationBannerCount++;
+    const id = `nd-iteration-toast-${_ndIterationBannerCount}`;
+
+    // Stack: shift older toasts down so consecutive iterations are
+    // visible briefly before the previous fades.
+    document.querySelectorAll('.nd-iteration-toast').forEach((el, i) => {
+        el.style.top = `${20 + (i + 1) * 70}px`;
+    });
+
+    const toast = document.createElement('div');
+    toast.id = id;
+    toast.className = 'nd-iteration-toast fixed right-4 z-[200] bg-dark-800 border border-gray-600 rounded-lg px-4 py-2 text-sm shadow-2xl';
+    toast.style.top = '20px';
+    toast.style.transition = 'opacity 0.3s, transform 0.3s';
+    const cleanPct = total > 0 ? ((clean / total) * 100).toFixed(0) : '0';
+    toast.innerHTML = `
+        <div class="text-gray-400 text-[10px] mb-0.5">Iteration ${_ndIterationBannerCount} — ${total} notes, ${cleanPct}% clean</div>
+        <div class="flex gap-3 items-center">
+            <span class="text-green-400">✓ ${clean}</span>
+            ${dirty > 0     ? `<span class="text-yellow-400">⚠ ${dirty}</span>`     : ''}
+            ${missWrong > 0 ? `<span class="text-orange-400">✗ ${missWrong}</span>` : ''}
+            ${missNone > 0  ? `<span class="text-red-400">∅ ${missNone}</span>`     : ''}
+        </div>
+    `;
+    document.body.appendChild(toast);
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(20px)';
+        setTimeout(() => toast.remove(), 350);
+    }, 4000);
+}
+
 async function _ndCrepeDetect(buffer) {
     if (!_ndShared.model) return { freq: -1, confidence: 0 };
     try {
@@ -6143,6 +6204,10 @@ function createNoteDetector(options = {}) {
             drillGoalReached = true;
         }
         updateDrillHud();
+        // Unit 3h: surface a toast banner for this iteration so the
+        // player sees impact without opening the modal. Pass the array
+        // before clear() — the banner reads judgments to bucket them.
+        _ndShowIterationBanner(arr);
         // The iteration is over — clear noteResults so the next
         // iteration re-judges from scratch instead of carrying stale
         // hits forward.
