@@ -2916,9 +2916,13 @@ function createNoteDetector(options = {}) {
     // residual A/V drift the user's static calibration didn't catch.
     let driftBuffer = [];
     let driftEstimateMs = 0;
-    // Auto-calibration latch: one-shot per session so we don't keep
-    // oscillating avOffset on every new hit. Reset on resetScoring.
-    let autoCalApplied = false;
+    // Auto-calibration: was a one-shot latch. That latch was wrong —
+    // a player whose drift accumulates mid-song (e.g. tempo speeds up
+    // or the player gets tired and lags) couldn't re-calibrate. Now
+    // auto-cal can fire repeatedly; the natural cooldown is the
+    // buffer reset (needs 4 more hits to trigger again) plus the
+    // 50ms threshold (small offsets don't oscillate). Removed
+    // autoCalApplied entirely.
     // Onset state. inNote tracks the RMS-envelope hysteresis;
     // reattackRmsBuf is the rolling RMS history used by the re-attack
     // trigger to detect a fresh pluck during sustain.
@@ -4252,28 +4256,22 @@ function createNoteDetector(options = {}) {
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
         }
-        // Auto-calibration: once the buffer hits MIN_SAMPLES AND the
-        // median exceeds the precision-zone threshold, push the drift
-        // through slopsmith's setAvOffsetMs so the value PERSISTS to
-        // /api/settings. Persisting matters because:
+        // Auto-calibration: fires whenever the drift buffer is full
+        // (4+ samples) AND the median exceeds the precision-zone
+        // threshold (50ms). Used to be a one-shot latch — that
+        // produced this exact failure mode: player at hit #4 had
+        // drift +60ms, latch fired, avOffset shifted +60ms; player
+        // continued accumulating drift to +234ms, latch already
+        // burned, no further correction. Now: each firing resets
+        // the buffer (so re-arm requires 4 more hits) AND the 50ms
+        // threshold prevents oscillation around small offsets. Net
+        // effect: convergence in 8-12 hits even when initial drift
+        // is mis-estimated, and adaptive to mid-song drift changes.
         //
-        //   - hw.setAvOffset() updates only the highway's render-time
-        //     shift (in-memory, this session only).
-        //   - window.setAvOffsetMs() persists via POST /api/settings
-        //     so future songs + future browser sessions start with
-        //     the calibrated value.
-        //
-        // Once persisted, song switches load the calibrated avOffset
-        // automatically — no more "first 8 hits of every song wasted"
-        // because subsequent songs see drift well under threshold and
-        // auto-cal doesn't re-fire. Calibration cost amortizes across
-        // all future plays for this audio routing setup.
-        //
-        // Lowered the sample count from _ND_DRIFT_WINDOW (8) to
-        // _ND_DRIFT_MIN_SAMPLES (4) so the first calibration fires
-        // sooner on the very first session after a setup change.
-        if (!autoCalApplied
-                && driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
+        // Persistence: routes through window.setAvOffsetMs so the
+        // value persists to /api/settings; subsequent songs + future
+        // browser sessions start with the calibrated value.
+        if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
                 && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS) {
             // Read current value from slopsmith's persisted state if
             // available (window.setAvOffsetMs reads/writes _avOffsetMs);
@@ -4296,8 +4294,8 @@ function createNoteDetector(options = {}) {
             } else {
                 return;
             }
-            autoCalApplied = true;
             // Reset drift buffer so post-cal hits measure new alignment.
+            // Re-fire is gated by buffer-fill (4 hits) + threshold (50ms).
             driftBuffer = [];
             driftEstimateMs = 0;
         }
@@ -6047,12 +6045,24 @@ function createNoteDetector(options = {}) {
         if (skipBtn) skipBtn.classList.toggle('hidden', !enabled);
     }
 
-    // Unit UX-restart: seek audio to 0 and clear scoring. Does NOT
-    // snapshot the abandoned attempt — restart is for "I messed up
-    // the start" not "I want to save this run", and persisting
-    // half-finished plays would dominate history with low-quality
-    // data. End any active drill first so the audio's saved playback
-    // rate gets restored before the seek.
+    // Unit UX-restart: seek audio to 0 and clear scoring.
+    //
+    // Original design: did NOT snapshot the abandoned attempt under
+    // the theory that restart is for "I messed up the start" and
+    // saving half-finished plays would clutter history. User pushback
+    // (2026-05-05): "playing, and then restarting the song makes the
+    // recording not work in the report I see 30 seconds of play".
+    // The current behavior throws away pre-restart play data even
+    // when there's substantial signal (e.g. a 2-minute attempt the
+    // player wants to abandon mid-bridge). Worse: it silently makes
+    // the just-played session DISAPPEAR from history.
+    //
+    // New design: snapshot the play before resetting if there's any
+    // judged data at all. snapshotPlay's empty-noteResults check
+    // already filters trivial restarts (right after another
+    // restart, before any judgments accumulated). Threshold: at
+    // least one judgment in noteResults — let the user decide what
+    // counts as "worth saving" rather than imposing a minimum.
     function restartSong() {
         if (drillActive) endDrill();
         const audio = document.getElementById('audio');
@@ -6060,6 +6070,12 @@ function createNoteDetector(options = {}) {
             console.warn('[note_detect] restartSong: no <audio id="audio"> element');
             return;
         }
+        // Snapshot the current attempt so it persists before reset.
+        // Fire-and-forget (no await) — the seek + reset shouldn't
+        // wait for the network round-trip to start the fresh attempt.
+        // snapshotPlay returns null when noteResults is empty, so
+        // restart-then-restart doesn't double-snapshot.
+        snapshotPlay('restart').catch(() => {});
         try { audio.currentTime = 0; } catch (e) {
             console.warn('[note_detect] restartSong: seek failed:', e);
             return;
@@ -6147,7 +6163,6 @@ function createNoteDetector(options = {}) {
         // latency doesn't leak into the next track's calibration.
         driftBuffer = [];
         driftEstimateMs = 0;
-        autoCalApplied = false;
         // Live HUD state — same per-session reset so the strip doesn't
         // carry the previous song's judgments.
         hudRecent = [];
