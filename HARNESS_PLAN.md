@@ -163,3 +163,35 @@ fixtures.
 - Discard a fixture that "doesn't match the new shape" without
   asking the user first — those WAVs are the user's only ground
   truth for what they actually played.
+
+## Known limitations (2026-05-05)
+
+- **Run-to-run variance ±15-20% on detection score for the same
+  fixture.** Three runs of `gasoline-2026-04-27T20-52-46.wav` gave
+  42.4%, 42.9%, 54.1%. The variance comes from non-deterministic
+  audio rendering in headless puppeteer's AudioContext — chunks
+  arrive at slightly different effective sample rates each run,
+  shifting the matcher's chart-time alignment.
+
+  Mitigation paths (not yet shipped):
+  1. Use `OfflineAudioContext` for replay so audio renders at
+     fixed-time-per-chunk without realtime CPU contention.
+     Significant rewrite of `testInjectWav`.
+  2. Run each fixture 3x and report mean ± stdev. Triples replay
+     time but gives stable comparisons.
+  3. Generate synthetic fixtures with known ground truth and
+     deterministic audio so detector regressions surface against
+     a fixed baseline. Existing `test/synth/` may have material.
+
+- **Many fixtures lack `dump.json` sidecars** so the harness can't
+  inject chart notes for them. Affects mexico-, take-, timing-
+  plucks, several level_new files. The user could regenerate
+  sidecars by replaying through the live plugin — or we ship a
+  CLI that builds a sidecar from a known-correct chart loaded by
+  song name. Deferred.
+
+- **Open-string contamination dominates the user's recordings.**
+  ~60% of chart notes on `gasoline-2026-04-27T20-52-46.wav`
+  produce open-string detection (det=28/40 instead of expected
+  38). Unit 6i demotes these correctly, but the score is a
+  function of the recording quality more than the detector.
