@@ -218,10 +218,15 @@ substitutions in the overlay.
 ```bash
 make help              # list targets
 make test              # run the node:test suite (no deps)
+make test-yin          # only the YIN tests (fast iteration on detector)
+make syntax            # parse-check screen.js
+make stat              # git diff --stat + status -s
 make dev               # start slopsmith with this plugin mounted
 make logs              # tail the container
 make verify-mount      # confirm the plugin is visible inside
+make pull-recording    # copy newest /tmp/nd_recordings/*.wav out of the container
 make down              # stop slopsmith
+bin/nd-grep <pat> [N]  # head-limited grep over screen.js
 ```
 
 `make dev` launches Slopsmith at `http://localhost:$SLOPSMITH_PORT` with this

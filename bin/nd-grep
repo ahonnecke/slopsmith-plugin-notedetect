@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# nd-grep — search screen.js (the multi-thousand-line plugin module) with
+# line numbers, head-limited so common symbols don't blow up the terminal.
+#
+# Usage:
+#   bin/nd-grep <pattern>            # 20 results, ERE, case-sensitive
+#   bin/nd-grep <pattern> <N>        # N results
+#   bin/nd-grep -i onset 40          # extra grep flags pass through
+
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+target=screen.js
+limit=20
+flags=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -*) flags+=("$1"); shift ;;
+        *) break ;;
+    esac
+done
+
+if [[ $# -lt 1 ]]; then
+    echo "usage: nd-grep [grep-flags] <pattern> [limit]" >&2
+    exit 2
+fi
+
+pattern="$1"; shift
+if [[ $# -ge 1 ]]; then
+    limit="$1"; shift
+fi
+
+grep -nE ${flags[@]+"${flags[@]}"} -- "$pattern" "$target" | head -"$limit"
+exit 0

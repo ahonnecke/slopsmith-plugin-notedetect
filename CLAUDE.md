@@ -99,6 +99,24 @@ The pre-port branch used a different shape (`primary: 'HIT' |
 porting analysis code from the pre-port branch, translate to the
 factory shape rather than carrying the pre-port shape forward.
 
+## Use the make targets, not inline commands
+
+Past sessions repeated long inline commands hundreds of times. The
+common ones now have shortcuts — use them so token budget goes to
+analysis, not retyping. `make help` lists everything.
+
+| If you'd type…                                                                             | Use instead              |
+|--------------------------------------------------------------------------------------------|--------------------------|
+| `node --test test/yin-*.test.js \| tail -N`                                                 | `make test-yin`          |
+| `node -e "new Function(require('fs').readFileSync('screen.js','utf-8'))..."`                | `make syntax`            |
+| `git diff --stat && echo --- && git status -s`                                              | `make stat`              |
+| `docker exec slopsmith-web-1 ls -lt /tmp/nd_recordings/` then `docker cp …`                  | `make pull-recording`    |
+| `grep -nE 'pat' screen.js \| head -N`                                                       | `bin/nd-grep pat N`      |
+| `node test/analyze-replay.js` / diff two replay JSONs                                       | `make replay-analyze` / `make replay-diff OLD=… NEW=…` |
+
+If you find yourself running the same multi-pipe one-liner more than
+twice, propose adding it as a target rather than typing it a third time.
+
 ## What NOT to ask the user
 
 - "Can you paste your console output?" — the diagnostics dumper
