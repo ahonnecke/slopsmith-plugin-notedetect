@@ -7557,6 +7557,15 @@ function createNoteDetector(options = {}) {
         if (enabled) {
             throw new Error('testInjectWav: instance already enabled; call disable() first');
         }
+        // Reset all matcher state so per-fixture replays start clean.
+        // Without this, noteResults from the previous fixture persist
+        // into the next (because we exit with enabled=false, and the
+        // outer disable() the harness calls early-returns on
+        // !enabled). The 5th gasoline fixture in the original sweep
+        // showed total=156 on a 6-note fixture — 150 leftover entries
+        // from fixture 4. resetScoring clears noteResults, drift,
+        // onset, and stability state in one call.
+        resetScoring();
         const chartStartTimeSec = Number.isFinite(opts.chartStartTimeSec)
             ? opts.chartStartTimeSec
             : 0;
