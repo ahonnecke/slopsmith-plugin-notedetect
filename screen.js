@@ -3892,20 +3892,25 @@ function createNoteDetector(options = {}) {
                 matcherMidi, detectedConfidence,
                 { pitchError: winner.pitchError }
             );
-            // Open-string contamination demotion (Unit 6i). When the
-            // matcher only "hit" because octave-folding made an
-            // open-string detection look correct (e.g. YIN read open
-            // E1 = MIDI 28, fold to E2 = MIDI 40, expected D2 = MIDI
-            // 38, |40-38|=200¢ barely passes), this is sympathetic
-            // resonance, not a player hit. Mark ignoredAsDetectorFailure
-            // so the score doesn't credit it.
+            // Open-string contamination handling (Unit 6i refined).
             //
-            // Conditions: detected MIDI is in the bass open-string set
-            // (or its 2nd-harmonic class), the detected MIDI is NOT
-            // the expected MIDI (so we're not demoting clean hits on
-            // notes that happen to be played open), and pitch error
-            // is at the wide-tolerance boundary (≥150¢, indicating
-            // octave-aliasing rather than a clean match).
+            // When YIN locks on an open bass-string MIDI (because of
+            // sympathetic resonance from an unmuted string) instead
+            // of the played note, octave-folding can make it "barely
+            // pass" the wide pitch tolerance as a 200¢ pseudo-hit.
+            //
+            // Whether to credit this as a hit depends on whether the
+            // player ACTUALLY plucked:
+            //   - With an onset anchor (gateOpts.matchAnchorChartT
+            //     set): an onset just fired → player plucked → credit
+            //     the hit even though pitch reading is contaminated.
+            //     The chart note becomes a hit; coaching can later
+            //     surface "you have open-string contamination" via
+            //     the noteResults entry without inflating the score.
+            //   - Without an onset anchor: this is sustain-bleed
+            //     attribution (no recent pluck) → mark
+            //     ignoredAsDetectorFailure so the score doesn't
+            //     credit a chart note the player never plucked.
             const detRound = Math.round(matcherMidi);
             const detIsOpen = _ND_BASS_OPEN_STRING_MIDIS.has(detRound)
                 || _ND_BASS_OPEN_STRING_OCTAVE_MIDIS.has(detRound);
