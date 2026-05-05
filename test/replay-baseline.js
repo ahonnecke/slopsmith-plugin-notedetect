@@ -114,7 +114,13 @@ async function runOne(page, fixture) {
     if (!ctx || !ctx.chartNotes || ctx.chartNotes.length === 0) {
         throw new Error(`no chart notes — dump.json sidecar missing or empty for ${fixture.name}`);
     }
-    return await page.evaluate(async (url, chartStart, notes, arrangement, tuning, capo) => {
+    // For bass fixtures, default to HPS — YIN's octave-down bias on
+    // low-frequency bass strings produces near-octave 199¢ hits that
+    // the wide threshold barely passes. HPS scores harmonic stacks
+    // and doesn't share that bias. Override via REPLAY_METHOD env.
+    const method = process.env.REPLAY_METHOD
+        || (ctx.arrangement === 'bass' ? 'hps' : 'yin');
+    return await page.evaluate(async (url, chartStart, notes, arrangement, tuning, capo, m) => {
         if (!window.noteDetect || typeof window.noteDetect.testInjectWav !== 'function') {
             throw new Error('window.noteDetect.testInjectWav unavailable — plugin not loaded?');
         }
@@ -128,8 +134,9 @@ async function runOne(page, fixture) {
             arrangement,
             tuning,
             capo,
+            method: m,
         });
-    }, wavUrl, fixture.chartStartTime || 0, ctx.chartNotes, ctx.arrangement, ctx.tuning, ctx.capo);
+    }, wavUrl, fixture.chartStartTime || 0, ctx.chartNotes, ctx.arrangement, ctx.tuning, ctx.capo, method);
 }
 
 function fmtPct(n) {

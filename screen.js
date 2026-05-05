@@ -1107,6 +1107,12 @@ const _ND_STABILITY_REQUIRED = 2;     // N-of-M for "stable"
 // buffer-flush logic never engaged. Lower defaults make the trigger
 // sensitive enough for the routed path while staying above typical
 // 0.005 noise floor.
+// Buffer-comp offset applied to onset chart-time. The onset trigger
+// fires on a chunk that's half pre-attack (previous note's tail) and
+// half post-attack — compensating chart-time backwards by ~half the
+// chunk duration centers the onset on the actual attack. 20ms ≈ half
+// of a 2048-sample chunk at 48kHz.
+const _ND_ONSET_BUFFER_COMP_SEC = 0.020;
 const _ND_ONSET_LEVEL = 0.015;           // RMS above → entering a note
 const _ND_ONSET_EXIT_LEVEL = 0.008;      // RMS below → note ended
 const _ND_REATTACK_REFRACTORY_SEC = 0.20; // refractory after onset
@@ -2243,6 +2249,15 @@ function createNoteDetector(options = {}) {
     // suppress single-frame octave-down anomalies on bass.
     let rawMidiHistory = [];
     let stableMidi = -1;
+    // Onset-gated matching state. The pre-port matcher only ran
+    // matchNotes when an onset had recently fired — without this gate,
+    // sustain-bleed frames (where YIN locks on the previous note's
+    // sustain) would attempt to match chart notes that aren't really
+    // being plucked. pendingOnsetChartT is set when an onset fires
+    // (audio thread); the match consumes and clears it.
+    let pendingOnsetChartT = null;
+    let lastMatchMidi = -1;
+    let lastMatchTime = 0;
 
     // Scoring
     let hits = 0;
@@ -2970,6 +2985,20 @@ function createNoteDetector(options = {}) {
                     lastOnsetPerfSec = nowSec;
                     reattackArmed = false;
                     onsetCount++;
+                    // Stamp the onset's chart-time so processFrame
+                    // can gate matchNotes on it (the post-port
+                    // architectural fix). Compensate backwards by
+                    // half the chunk duration — the trigger chunk
+                    // straddles pre-attack and post-attack so the
+                    // actual attack landed ~halfway through the chunk.
+                    if (hw && hw.getTime) {
+                        pendingOnsetChartT = hw.getTime() - _ND_ONSET_BUFFER_COMP_SEC;
+                    }
+                    // Flush stability history too — voted MIDI from
+                    // the previous note's sustain shouldn't survive
+                    // into the new note's matching window.
+                    rawMidiHistory = [];
+                    stableMidi = -1;
                     accumBuffer = new Float32Array(0);
                     pendingBuffer = null;
                     return;
@@ -3365,43 +3394,34 @@ function createNoteDetector(options = {}) {
         // (see detectInterval) before processFrame is called, so reading
         // it later from matchNotes would either skip (null) or pick up a
         // newer buffer captured mid-processing.
-        await matchNotes(buffer);
-
-        // Reference-recording capture: tap the same audio the detector
-        // just analysed. Gated on (a) the user having armed a take and
-        // (b) the song actually playing — we don't want to fill the
-        // buffer with silence from someone leaving Detect running on
-        // the home screen.
-        if (_recArmed && _recSongPlaying) {
-            _recSampleRate = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || _recSampleRate);
-            // Client-side cap mirrors the routes.py 32 MB ceiling so a
-            // runaway arm (user walks away with Detect still capturing)
-            // can't balloon the page's heap before the server-side cap
-            // rejects the upload. 32 MB / 4 bytes per Float32 ≈ 8M
-            // samples ≈ 190 s at 44.1 kHz (~3.2 min) — well past a
-            // single benchmark take. When we hit it, the buffer stays
-            // at the cap and `_recCappedAt` is set so the save path
-            // can surface a "truncated" note on the resulting WAV.
-            //
-            // Track the running sample count in `_recTotalSamples`
-            // rather than `_recChunks.reduce(...)` per frame. The
-            // reduce was O(n) per frame and O(n²) over a take — a
-            // measurable hit on the detection hot path on long
-            // recordings.
-            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
-            if (_recTotalSamples >= maxSamples) {
-                if (!_recCappedAt) _recCappedAt = _recTotalSamples / (_recSampleRate || 44100);
-                // Silently drop further frames — the cap is the upper bound
-                // and we'd rather keep the first N minutes than truncate the
-                // tail of a long take.
+        //
+        // Onset anchoring (the actual fix the harness surfaced): when
+        // an onset has recently fired, anchor the matcher's search
+        // window on the onset's chart-time rather than the current
+        // chart-time. Pitch resolution lags 50-85ms past the onset,
+        // so by the time matchNotes runs with a confident stableMidi,
+        // tRaw has drifted past the actual pluck. Without anchoring,
+        // sustain-frame matches end up at tRaw - 250ms = false-early
+        // (the regression the harness showed). Anchoring on the
+        // onset's chart-time fixes attribution.
+        //
+        // We do NOT gate matching itself on the onset state — gating
+        // too tightly means re-attack onsets that reset stability
+        // mid-converge produce zero hits (verified — dropped from
+        // 4/6 to 1/4). The anchor stays valid for ~300ms post-onset
+        // so subsequent frames with a converged stableMidi still
+        // benefit. After 300ms, anchor expires and we fall back to
+        // the tRaw search center.
+        let matchAnchorChartT = null;
+        if (pendingOnsetChartT != null && hw && hw.getTime) {
+            const sinceOnset = hw.getTime() - pendingOnsetChartT;
+            if (sinceOnset >= 0 && sinceOnset < 0.300) {
+                matchAnchorChartT = pendingOnsetChartT;
             } else {
-                // slice() because the analyser may overwrite the buffer the
-                // next time processFrame fires.
-                const copy = buffer.slice();
-                _recChunks.push(copy);
-                _recTotalSamples += copy.length;
+                pendingOnsetChartT = null;  // expired
             }
         }
+        matchNotes(buffer, { matchAnchorChartT, gateSingleNote: false });
     }
 
     // ── Note matching ─────────────────────────────────────────────────
@@ -3658,9 +3678,9 @@ function createNoteDetector(options = {}) {
         if (emit) dispatchJudgment(judgment);
     }
 
-    async function matchNotes(frameBuffer) {
+    function matchNotes(frameBuffer, gateOpts) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        // Two clocks:
+        // Three clocks now:
         //   tRaw    — the player's actual "now" relative to chart time.
         //             Used as judgedAt so timingError on the judgment
         //             reflects RAW player timing. Coaching reads
@@ -3673,11 +3693,22 @@ function createNoteDetector(options = {}) {
         //             residual A/V offset so the matcher finds the
         //             right chart note even when the player's static
         //             calibration is off by ~50-200ms.
-        // The split keeps drift comp from leaking into player-facing
-        // feedback while still doing its job at the matcher level.
+        //   anchor  — the onset's chart-time when matching is
+        //             onset-gated. Pitch resolution lags 50-85ms past
+        //             the onset, so by the time matchNotes runs,
+        //             tRaw has drifted into the future relative to
+        //             the actual pluck. Anchoring on the onset's
+        //             chart-time fixes the attribution so a chart
+        //             note at onset_chartT + 30ms gets matched even
+        //             though tRaw is 100ms past the onset.
         const driftSec = driftEstimateMs / 1000;
         const tRaw = hw.getTime() + avOffsetSec - latencyOffset;
-        const t = tRaw - driftSec;
+        const onsetAnchor = gateOpts && Number.isFinite(gateOpts.matchAnchorChartT)
+            ? gateOpts.matchAnchorChartT
+            : null;
+        const gateSingleNote = !!(gateOpts && gateOpts.gateSingleNote);
+        const tForSearch = onsetAnchor != null ? onsetAnchor : (tRaw - driftSec);
+        const t = tForSearch;
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -3789,7 +3820,13 @@ function createNoteDetector(options = {}) {
         // otherwise sneak through as 199¢ "hits" on bass.
         const matcherMidi = stableMidi >= 0 ? stableMidi : -1;
         const pitchPassing = [];
+        // Single-note path is gated when there's no pending onset
+        // anchor — sustain frames don't get to claim chart notes
+        // (the post-port architectural fix). Chord path below runs
+        // unconditionally (it doesn't depend on a confident pitch).
+        const skipSingleNote = gateSingleNote;
         for (const [, group] of byTime) {
+            if (skipSingleNote) break;
             if (group.length !== 1) continue;
             if (matcherMidi < 0) continue;
             const cn = group[0];
@@ -5166,6 +5203,10 @@ function createNoteDetector(options = {}) {
         // Stability voting state.
         rawMidiHistory = [];
         stableMidi = -1;
+        // Onset-gated matching state.
+        pendingOnsetChartT = null;
+        lastMatchMidi = -1;
+        lastMatchTime = 0;
     }
 
     // Narrower reset used by the A/V auto-calibrate Apply button.
@@ -7507,6 +7548,15 @@ function createNoteDetector(options = {}) {
         if (Number.isFinite(opts.capo)) {
             capo = opts.capo;
         }
+        // Detector method override. The harness defaults to HPS for
+        // bass fixtures (override via opts.method). YIN's octave-down
+        // bias on bass produced the 199¢ "hits" the harness surfaced;
+        // HPS scores harmonic stacks rather than picking a single
+        // fundamental, which fixes the bass-octave-down case.
+        if (typeof opts.method === 'string'
+            && ['yin', 'hps', 'crepe'].includes(opts.method)) {
+            detectionMethod = opts.method;
+        }
 
         // Build audio graph manually — bypasses startAudio's
         // getUserMedia path. Reuses module-scoped audio constants.
@@ -7573,6 +7623,11 @@ function createNoteDetector(options = {}) {
                 lastOnsetPerfSec = nowSec;
                 reattackArmed = false;
                 onsetCount++;
+                if (hw && hw.getTime) {
+                    pendingOnsetChartT = hw.getTime() - _ND_ONSET_BUFFER_COMP_SEC;
+                }
+                rawMidiHistory = [];
+                stableMidi = -1;
                 accumBuffer = new Float32Array(0);
                 pendingBuffer = null;
                 return;
