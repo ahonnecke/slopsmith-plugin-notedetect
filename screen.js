@@ -2129,7 +2129,13 @@ async function _ndShowCoachingReview({ playId, source }) {
                         class="text-gray-400 hover:text-gray-200 text-xs flex items-center gap-1">
                     <span class="nd-heatmap-arrow">▸</span> Fretboard heatmap — where you missed
                 </button>
-                <div id="nd-review-heatmap" class="hidden mt-3 bg-dark-700 border border-gray-700 rounded p-2"></div>
+                <div id="nd-review-heatmap" class="hidden mt-3">
+                    <div class="flex items-center gap-2 mb-2 text-xs">
+                        <button id="nd-heatmap-mode-this" class="px-2 py-0.5 bg-blue-700 text-white rounded">This play</button>
+                        <button id="nd-heatmap-mode-all" class="px-2 py-0.5 bg-dark-600 hover:bg-dark-500 text-gray-300 rounded">Last 10 plays</button>
+                    </div>
+                    <div id="nd-heatmap-grid" class="bg-dark-700 border border-gray-700 rounded p-2"></div>
+                </div>
             </div>
         </div>
     `;
@@ -2200,8 +2206,85 @@ async function _ndShowCoachingReview({ playId, source }) {
     // the analysis is cheap (single noteResults walk) but rendering
     // the SVG is wasted work if the user never opens it. String
     // count derived from arrangement (bass=4, else 6).
+    //
+    // Unit 3i+: 'Last 10 plays' toggle aggregates noteResults across
+    // recent plays of this song so chronic miss patterns surface
+    // (single-play noise vs cross-play consistency). Cached per
+    // mode so toggling doesn't re-fetch.
     const heatmapToggle = modal.querySelector('#nd-review-heatmap-toggle');
     const heatmapEl = modal.querySelector('#nd-review-heatmap');
+    const heatmapGrid = modal.querySelector('#nd-heatmap-grid');
+    const heatmapBtnThis = modal.querySelector('#nd-heatmap-mode-this');
+    const heatmapBtnAll = modal.querySelector('#nd-heatmap-mode-all');
+    const arrangement = (play.settings && play.settings.arrangement)
+        || (songInfo && songInfo.arrangement) || 'guitar';
+    const stringCount = String(arrangement).toLowerCase() === 'bass' ? 4 : 6;
+    // Cap maxFret on the higher of (this play's max fret, 12) so an
+    // open-position song doesn't render 24 columns of empty cells.
+    let modalMaxFret = 0;
+    for (const r of (play.noteResults || [])) {
+        const sf = r && (r.chartNote || r.note);
+        if (sf && typeof sf.f === 'number' && sf.f > modalMaxFret) modalMaxFret = sf.f;
+    }
+    modalMaxFret = Math.min(24, Math.max(12, modalMaxFret));
+
+    let heatmapThisRendered = false;
+    let heatmapAllRendered = null;  // null=not loaded, ''=loading, html=ready
+    const setMode = (mode) => {
+        if (mode === 'this') {
+            heatmapBtnThis.className = 'px-2 py-0.5 bg-blue-700 text-white rounded';
+            heatmapBtnAll.className = 'px-2 py-0.5 bg-dark-600 hover:bg-dark-500 text-gray-300 rounded';
+            if (!heatmapThisRendered) {
+                heatmapThisRendered = true;
+                const grid = _ndComputeFretboardHeatmap(play.noteResults || [], { stringCount, maxFret: modalMaxFret });
+                // Stash the rendered HTML so a re-toggle doesn't recompute.
+                heatmapGrid._htmlThis = _ndRenderFretboardHeatmapSvg(grid, stringCount, modalMaxFret);
+            }
+            heatmapGrid.innerHTML = heatmapGrid._htmlThis;
+        } else {
+            heatmapBtnAll.className = 'px-2 py-0.5 bg-blue-700 text-white rounded';
+            heatmapBtnThis.className = 'px-2 py-0.5 bg-dark-600 hover:bg-dark-500 text-gray-300 rounded';
+            if (heatmapAllRendered === null && play.songId) {
+                heatmapAllRendered = '';
+                heatmapGrid.innerHTML = '<div class="text-gray-500 text-xs italic p-2">Loading aggregate...</div>';
+                fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(play.songId)}&limit=10`)
+                    .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+                    .then(data => {
+                        const allNotes = [];
+                        let aggMaxFret = modalMaxFret;
+                        for (const p of (data.plays || [])) {
+                            for (const r of (p.noteResults || [])) {
+                                allNotes.push(r);
+                                const sf = r && (r.chartNote || r.note);
+                                if (sf && typeof sf.f === 'number' && sf.f > aggMaxFret) aggMaxFret = sf.f;
+                            }
+                        }
+                        aggMaxFret = Math.min(24, Math.max(12, aggMaxFret));
+                        if (allNotes.length === 0) {
+                            heatmapAllRendered = '<div class="text-gray-500 text-xs italic p-2">No prior plays for this song yet.</div>';
+                        } else {
+                            const grid = _ndComputeFretboardHeatmap(allNotes, { stringCount, maxFret: aggMaxFret });
+                            heatmapAllRendered = _ndRenderFretboardHeatmapSvg(grid, stringCount, aggMaxFret);
+                        }
+                        // Only paint if user is still viewing the all-plays mode.
+                        if (heatmapBtnAll.className.includes('bg-blue-700')) {
+                            heatmapGrid.innerHTML = heatmapAllRendered;
+                        }
+                    })
+                    .catch(() => {
+                        heatmapAllRendered = '<div class="text-red-400 text-xs p-2">Aggregate fetch failed.</div>';
+                        if (heatmapBtnAll.className.includes('bg-blue-700')) {
+                            heatmapGrid.innerHTML = heatmapAllRendered;
+                        }
+                    });
+            } else if (heatmapAllRendered) {
+                heatmapGrid.innerHTML = heatmapAllRendered;
+            }
+        }
+    };
+    heatmapBtnThis.onclick = () => setMode('this');
+    heatmapBtnAll.onclick = () => setMode('all');
+
     let heatmapLoaded = false;
     heatmapToggle.onclick = () => {
         const arrow = heatmapToggle.querySelector('.nd-heatmap-arrow');
@@ -2210,19 +2293,7 @@ async function _ndShowCoachingReview({ playId, source }) {
             arrow.textContent = '▾';
             if (!heatmapLoaded) {
                 heatmapLoaded = true;
-                const arrangement = (play.settings && play.settings.arrangement)
-                    || (songInfo && songInfo.arrangement) || 'guitar';
-                const stringCount = String(arrangement).toLowerCase() === 'bass' ? 4 : 6;
-                // Find the highest fret used so we don't render dozens
-                // of empty cells past fret 12 for an open-position song.
-                let maxFret = 0;
-                for (const r of (play.noteResults || [])) {
-                    const sf = r && (r.chartNote || r.note);
-                    if (sf && typeof sf.f === 'number' && sf.f > maxFret) maxFret = sf.f;
-                }
-                maxFret = Math.min(24, Math.max(12, maxFret));
-                const grid = _ndComputeFretboardHeatmap(play.noteResults || [], { stringCount, maxFret });
-                heatmapEl.innerHTML = _ndRenderFretboardHeatmapSvg(grid, stringCount, maxFret);
+                setMode('this');
             }
         } else {
             heatmapEl.classList.add('hidden');
