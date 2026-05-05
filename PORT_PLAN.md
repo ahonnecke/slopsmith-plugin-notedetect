@@ -20,6 +20,7 @@ shape during porting.
 ✓ Unit 6a — Drift compensation                  cafeb98
 ✓ Unit 6b — Tier-2 nearest-time selection      dff9855
 ✓ Unit 6d — IGNORED_DETECTOR_FAILURE demotion  4f22231
+✓ Unit 6h — Chart-aware refractory             850e136
 ✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
 ✓ Unit 6e — Onset detection + buffer flush     4fabac6
 ✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
@@ -32,7 +33,6 @@ shape during porting.
 ✓ Unit H2+ — onset-anchored matcher option     ccd0bf9
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
-☐ Unit 6h  Chart-aware refractory (tighten on fast-repeat lookahead)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
