@@ -37,15 +37,18 @@ shape during porting.
 ✓ Unit 3h — Mid-session iteration banner         92fc8b9
 ✓ Unit S.1 — SQLite plays storage backend        bbfc232
 ✓ Unit S.2 — Client snapshot + disable() hook    196fbdb
+✓ Unit 3e — History line chart                    40c6427
+✓ Unit 3i — Fretboard heatmap (single-play)       71d77f5
+✓ Modal wiring — coaching-review button on summary 6a9b695
+✓ Diagnostics fix — moved to /config (RO bug)    32db583
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
-☐ Unit 3e  Coaching review modal — history view (UNBLOCKED, S.1+S.2 landed)
-☐ Unit 3g  Top-3 prescriptions (cross-play) (UNBLOCKED)
-☐ Unit 3i  Fretboard heatmap (UNBLOCKED)
+☐ Unit 3g  Top-3 prescriptions (cross-play) (UNBLOCKED, biggest remaining unit)
+☐ Unit 3i+ Fretboard heatmap cross-play overlay (follow-up to 3i)
 ☐ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
 ☐ Unit 4d  Recording UI in settings panel
