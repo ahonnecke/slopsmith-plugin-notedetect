@@ -33,12 +33,13 @@ from fastapi.responses import FileResponse
 
 # Write to the plugin's own directory rather than /tmp because
 # slopsmith typically runs in a container where /tmp is tmpfs and
-# isn't bind-mounted to the host. The plugin dir IS bind-mounted
-# (that's how live screen.js edits work in dev), so dumps land
-# directly on the host filesystem and can be read without docker
-# exec. The dir is computed at module-import time relative to this
-# file's path — same trick as plugins/__init__.py uses.
-_DIAG_DIR = Path(__file__).parent / "diagnostics"
+# Diagnostics dump dir is resolved lazily in setup() under
+# context["config_dir"] for the same reason plays.db is — the plugin
+# bind-mount is READ-ONLY inside the container, so any path under
+# Path(__file__).parent fails silently with "read-only filesystem"
+# on every write. The earlier note suggesting `<plugin_dir>/diagnostics/`
+# was wrong and explains why no diagnostics were ever collected.
+_DIAG_DIR: Path | None = None
 # Fixture WAVs live under test/fixtures/ on the host (bind-mounted
 # into the container at the same path). The replay-baseline harness
 # (test/replay-baseline.js) drives puppeteer to fetch fixtures via
@@ -170,6 +171,8 @@ def _slug(s: str | None) -> str:
 def _prune_old_dumps() -> None:
     """Drop everything beyond the newest _DIAG_RETENTION files. Called
     on every write so the directory stays bounded without a cron."""
+    if _DIAG_DIR is None:
+        return
     try:
         files = sorted(
             _DIAG_DIR.glob("*.json"),
@@ -189,14 +192,16 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
     """Plugin loader entry point. Called once at startup by the
     slopsmith plugin loader (see plugins/__init__.py:setup_plugin)."""
 
-    # Resolve the plays DB path under context["config_dir"]. The
-    # plugin dir itself is mounted read-only in the slopsmith
-    # container, so /config (writable, persistent, bind-mounted to
-    # host) is the only valid home for state files. Same convention
-    # the highway_3d and practice_journal plugins use.
-    global _PLAYS_DB_PATH
+    # Resolve the plays DB path AND diagnostics dir under
+    # context["config_dir"]. The plugin dir itself is mounted
+    # read-only in the slopsmith container, so /config (writable,
+    # persistent, bind-mounted to host) is the only valid home for
+    # state files. Same convention the highway_3d and practice_journal
+    # plugins use.
+    global _PLAYS_DB_PATH, _DIAG_DIR
     config_dir = Path(context.get("config_dir") or "/config")
     _PLAYS_DB_PATH = config_dir / "note_detect" / "plays.db"
+    _DIAG_DIR = config_dir / "note_detect" / "diagnostics"
 
     # Initialize the plays DB schema. Idempotent — safe even if the
     # file already exists from a prior run.
@@ -334,6 +339,9 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return {"ok": False, "error": "payload must be an object"}
 
+        if _DIAG_DIR is None:
+            return {"ok": False, "error": "diag dir not configured"}
+
         song_id = payload.get("songId") or payload.get("songTitle") or "unknown"
         ts = time.strftime("%Y-%m-%dT%H-%M-%S")
         slug = _slug(str(song_id))
@@ -415,7 +423,7 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
     def list_diagnostics() -> dict[str, Any]:
         # Useful for ad-hoc browsing — returns the most-recent dumps
         # newest-first as a small JSON listing.
-        if not _DIAG_DIR.is_dir():
+        if _DIAG_DIR is None or not _DIAG_DIR.is_dir():
             return {"files": []}
         try:
             files = sorted(
