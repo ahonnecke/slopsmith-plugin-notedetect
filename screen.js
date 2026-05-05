@@ -3165,6 +3165,7 @@ function createNoteDetector(options = {}) {
     instanceRoot.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
     let detectBtn = null;
     let gearBtn = null;
+    let restartBtn = null;
 
     // Draw hook — registered once per instance; removed in destroy().
     // The hook itself early-returns when !enabled, so the cost is
@@ -5655,6 +5656,19 @@ function createNoteDetector(options = {}) {
         if (closeBtn) controls.insertBefore(detectBtn, closeBtn);
         else controls.appendChild(detectBtn);
 
+        // Unit UX-restart: restart the current song from t=0 with a
+        // clean slate. The user reported needing this when they mess
+        // up the start of a song \u2014 re-picking from the playlist is
+        // too many clicks. Hidden until detect is enabled (no point
+        // restarting if you weren't being scored).
+        restartBtn = document.createElement('button');
+        restartBtn.className = 'nd-restart-btn px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+        restartBtn.textContent = '\u21ba';  // ANTICLOCKWISE OPEN CIRCLE ARROW
+        restartBtn.title = 'Restart song \u2014 seek to start, reset scoring';
+        restartBtn.onclick = restartSong;
+        if (closeBtn) controls.insertBefore(restartBtn, closeBtn);
+        else controls.appendChild(restartBtn);
+
         gearBtn = document.createElement('button');
         gearBtn.className = 'nd-gear-btn px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
         gearBtn.textContent = '\u2699';
@@ -5684,6 +5698,41 @@ function createNoteDetector(options = {}) {
             detectBtn.textContent = 'Detect';
         }
         if (gearBtn) gearBtn.classList.toggle('hidden', !enabled);
+        if (restartBtn) restartBtn.classList.toggle('hidden', !enabled);
+    }
+
+    // Unit UX-restart: seek audio to 0 and clear scoring. Does NOT
+    // snapshot the abandoned attempt — restart is for "I messed up
+    // the start" not "I want to save this run", and persisting
+    // half-finished plays would dominate history with low-quality
+    // data. End any active drill first so the audio's saved playback
+    // rate gets restored before the seek.
+    function restartSong() {
+        if (drillActive) endDrill();
+        const audio = document.getElementById('audio');
+        if (!audio) {
+            console.warn('[note_detect] restartSong: no <audio id="audio"> element');
+            return;
+        }
+        try { audio.currentTime = 0; } catch (e) {
+            console.warn('[note_detect] restartSong: seek failed:', e);
+            return;
+        }
+        resetScoring();
+        // Resume playback so the user doesn't have to also click
+        // play. If detection is enabled and the user just seeked,
+        // they want to start playing immediately — pause-after-
+        // restart is the wrong default.
+        try { audio.play().catch(() => {}); } catch (e) {}
+        // Visual feedback: brief flash on the restart button so the
+        // user sees the action registered. Detection state itself
+        // doesn't change (still enabled, just zeroed).
+        if (restartBtn) {
+            restartBtn.classList.add('bg-blue-700');
+            setTimeout(() => {
+                if (restartBtn) restartBtn.classList.remove('bg-blue-700');
+            }, 200);
+        }
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
@@ -6494,6 +6543,7 @@ function createNoteDetector(options = {}) {
         } catch (e) {}
         if (detectBtn) { detectBtn.remove(); detectBtn = null; }
         if (gearBtn) { gearBtn.remove(); gearBtn = null; }
+        if (restartBtn) { restartBtn.remove(); restartBtn = null; }
         if (instanceRoot.parentNode) instanceRoot.remove();
         _ndInstances.delete(api);
     }
@@ -8505,6 +8555,9 @@ function createNoteDetector(options = {}) {
         // disable() (e.g. mid-song save). Returns the new play_id or null.
         snapshotPlay,
         getLastSnapshotPlayId: () => lastSnapshotPlayId,
+        // Unit UX-restart — exposed so keyboard shortcuts or other
+        // plugins can trigger restart programmatically.
+        restartSong,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
