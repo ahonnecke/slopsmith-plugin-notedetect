@@ -39,12 +39,13 @@ const HEADED = args.includes('--headed');
 // Fixtures the server flagged as `excluded: true` (tuning mismatch
 // etc.) are skipped by default. --include-excluded opts in.
 const INCLUDE_EXCLUDED = args.includes('--include-excluded');
-// Per-replay timeout. Fixtures are full-song recordings (2-4 minutes
-// at 1× playback) and testInjectWav waits playback + drain + miss
-// sweep, so the puppeteer protocol call routinely exceeds the
-// default 180s. 10 minutes covers the longest expected fixture
-// with headroom.
-const TIMEOUT_MS = 600_000;
+// Per-replay timeout. Fixtures are full-song recordings;
+// gasoline-2026-04-27T20-57-08.wav is 15 minutes long and timed
+// out at 10 min. Bumping to 20 min so super-long fixtures
+// complete (with headroom for drain + miss sweep). Considering
+// OfflineAudioContext for the next harness iteration to render
+// faster than realtime.
+const TIMEOUT_MS = 1_200_000;
 
 function globToRegex(pattern) {
     const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
