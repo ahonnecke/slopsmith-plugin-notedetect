@@ -6123,18 +6123,13 @@ function createNoteDetector(options = {}) {
         enabled = false;
         // Unit S.2: snapshot the play before tear-down so the
         // session's noteResults persist. Fire-and-forget — disable
-        // returns quickly to keep the UI responsive. On non-silent
-        // disables, chain the coaching review modal so the user
-        // sees the post-game analysis (Units 3a-3f/3h all hang off
-        // _ndShowCoachingReview, which fetches the just-snapshotted
-        // play by id). Silent disables (destroy, song switch) skip
-        // the modal — they're tear-downs the user didn't trigger.
-        const wantReview = !disableOptions || !disableOptions.silent;
-        snapshotPlay('disable').then((playId) => {
-            if (playId != null && wantReview && typeof _ndShowCoachingReview === 'function') {
-                _ndShowCoachingReview({ playId, source: 'disable' }).catch(() => {});
-            }
-        }).catch(() => {});
+        // returns quickly to keep the UI responsive. The "Coaching
+        // review" button on showSummary's overlay reads
+        // lastSnapshotPlayId once this resolves; we don't auto-open
+        // the modal because the legacy showSummary overlay is still
+        // a useful at-a-glance view, and stacking two modals on
+        // disable was confusing.
+        snapshotPlay('disable').catch(() => {});
         // One last diagnostics dump on the way out so the final
         // session state lands on disk before we tear everything
         // down. Fire-and-forget; we don't await it because disable
@@ -7735,15 +7730,12 @@ function createNoteDetector(options = {}) {
                 </div>
                 ${breakdownHtml}
                 ${sectionHtml}
-                <div class="mt-4 flex gap-2">
-                    ${tuningMode ? `
-                    <button class="nd-summary-download flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-semibold text-white transition">
-                        Download Diagnostic JSON
-                    </button>` : ''}
-                    <button class="nd-summary-close ${tuningMode ? 'px-4' : 'flex-1'} py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
-                        Close
-                    </button>
-                </div>
+                <button class="nd-summary-coach mt-4 w-full py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm text-white transition disabled:opacity-50 disabled:cursor-wait" disabled>
+                    Loading coaching review...
+                </button>
+                <button class="nd-summary-close mt-2 w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                    Close
+                </button>
             </div>
         `;
         overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
@@ -7754,6 +7746,48 @@ function createNoteDetector(options = {}) {
         // a training consent modal is taking the screen on song:ended.
         if (opts && opts.startHidden) overlay.style.display = 'none';
         instanceRoot.appendChild(overlay);
+
+        // Wire the coaching-review button. snapshotPlay was kicked
+        // off in disable(); we poll lastSnapshotPlayId so the button
+        // enables as soon as the POST resolves. If snapshotPlay
+        // returned null (no songId) the button stays disabled with
+        // an explanatory label rather than crashing on click.
+        const coachBtn = overlay.querySelector('.nd-summary-coach');
+        if (coachBtn) {
+            const enableBtn = (playId) => {
+                coachBtn.disabled = false;
+                coachBtn.textContent = 'Coaching review →';
+                coachBtn.onclick = () => {
+                    overlay.remove();
+                    if (typeof _ndShowCoachingReview === 'function') {
+                        _ndShowCoachingReview({ playId, source: 'summary' })
+                            .catch(() => {});
+                    }
+                };
+            };
+            const disableBtn = (label) => {
+                coachBtn.disabled = true;
+                coachBtn.textContent = label;
+            };
+            if (lastSnapshotPlayId != null) {
+                enableBtn(lastSnapshotPlayId);
+            } else {
+                // Poll for the in-flight snapshotPlay POST. Caps at 5s
+                // — beyond that, the POST has likely failed (server
+                // down, no songId derivable) and the button stays in
+                // its "unavailable" state.
+                let waited = 0;
+                const tick = setInterval(() => {
+                    if (lastSnapshotPlayId != null) {
+                        clearInterval(tick);
+                        enableBtn(lastSnapshotPlayId);
+                    } else if ((waited += 200) >= 5000) {
+                        clearInterval(tick);
+                        disableBtn('Coaching review unavailable');
+                    }
+                }, 200);
+            }
+        }
 
         publishToJournal(accuracy);
         return true;
