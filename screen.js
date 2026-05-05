@@ -3271,6 +3271,18 @@ function createNoteDetector(options = {}) {
     // Visual-feedback tracking
     let lastHitCount = 0;
     let lastMissCount = 0;
+    // HUD recent-results ring: last 8 judgments rendered as an
+    // emoji-tier strip so the user can see what just happened
+    // without watching the highway. Each entry is one of:
+    //   '✓' clean hit, '⚠' dirty hit, '✗' wrong-pitch miss,
+    //   '∅' no-detection miss, '·' detector-failure (ignored)
+    // Cause line shows the last non-OK judgment in plain text:
+    //   "late 80ms on s1/f5", "wrong pitch (heard E1, want D2)",
+    //   "no signal".
+    const _ND_HUD_RECENT_MAX = 8;
+    let hudRecent = [];        // array of {kind, label} max length _ND_HUD_RECENT_MAX
+    let hudLastCause = null;   // string or null
+    let hudLastJudgmentSeen = 0;  // sentinel for "is there a new judgment to surface?"
 
     // DOM refs
     const container = opts.container || document.getElementById('player');
@@ -4313,7 +4325,60 @@ function createNoteDetector(options = {}) {
                 drillDirty = true;
             }
         }
+        // Live HUD signal: track the last few judgments so the user
+        // sees WHY the % moved, not just that it did. The strip
+        // shows recent results at a glance; the cause line spells
+        // out the most recent non-OK judgment in plain text.
+        _hudPushJudgment(judgment);
         if (emit) dispatchJudgment(judgment);
+    }
+
+    function _hudPushJudgment(j) {
+        if (!j) return;
+        let kind = '·';
+        if (j.ignoredAsDetectorFailure) {
+            kind = '·';  // sustain bleed / detector failure — gray dot
+        } else if (j.hit) {
+            const tOk = j.timingState === 'OK' || j.timingState == null;
+            const pOk = j.pitchState === 'OK' || j.pitchState == null;
+            kind = (tOk && pOk) ? '✓' : '⚠';
+        } else if (typeof j.detectedMidi === 'number' && j.detectedMidi >= 0
+                   && j.pitchState && j.pitchState !== 'OK') {
+            kind = '✗';  // wrong-pitch miss — detector saw something off-target
+        } else {
+            kind = '∅';  // no detection at all
+        }
+        hudRecent.push(kind);
+        if (hudRecent.length > _ND_HUD_RECENT_MAX) hudRecent.shift();
+
+        // Cause line: only update on non-OK judgments so a clean run
+        // doesn't keep flashing a stale cause.
+        if (j.ignoredAsDetectorFailure) {
+            // Surface sustain-bleed explicitly — this is the user's
+            // "perfect until first low E, then flaky" experience.
+            const expected = Number.isFinite(j.expectedMidi) ? _ndMidiToName(j.expectedMidi) : '?';
+            const detected = Number.isFinite(j.detectedMidi) && j.detectedMidi >= 0 ? _ndMidiToName(j.detectedMidi) : '?';
+            hudLastCause = `sustain bleed: ${detected} ringing through ${expected}`;
+        } else if (j.hit && (j.timingState && j.timingState !== 'OK')) {
+            const sf = j.chartNote || j.note || {};
+            const stringFret = (typeof sf.s === 'number' && typeof sf.f === 'number')
+                ? ` on s${sf.s}/f${sf.f}` : '';
+            const dir = j.timingError > 0 ? 'late' : 'early';
+            hudLastCause = `${dir} ${Math.abs(Math.round(j.timingError))}ms${stringFret}`;
+        } else if (j.hit && (j.pitchState && j.pitchState !== 'OK')) {
+            const cents = typeof j.pitchError === 'number' ? Math.round(j.pitchError) : '?';
+            const dir = j.pitchState === 'SHARP' ? '♯' : '♭';
+            hudLastCause = `pitch off ${dir}${Math.abs(cents)}¢`;
+        } else if (!j.hit) {
+            const expected = Number.isFinite(j.expectedMidi) ? _ndMidiToName(j.expectedMidi) : '?';
+            if (typeof j.detectedMidi === 'number' && j.detectedMidi >= 0) {
+                const detected = _ndMidiToName(j.detectedMidi);
+                hudLastCause = `wrong pitch: heard ${detected}, want ${expected}`;
+            } else {
+                hudLastCause = `no signal for ${expected}`;
+            }
+        }
+        hudLastJudgmentSeen++;
     }
 
     function matchNotes(frameBuffer, gateOpts) {
@@ -5462,6 +5527,9 @@ function createNoteDetector(options = {}) {
             <div class="nd-hud-accuracy text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
             <div class="nd-hud-streak text-xs text-gray-400 mt-0.5"></div>
             <div class="nd-hud-counts text-[10px] text-gray-600 mt-0.5"></div>
+            <div class="nd-hud-recent text-[10px] mt-1 font-mono tracking-wider"></div>
+            <div class="nd-hud-timing text-[10px] mt-0.5 font-mono"></div>
+            <div class="nd-hud-cause text-[10px] mt-0.5 text-amber-400 font-mono max-w-[240px]"></div>
             <div class="nd-hud-detected text-[10px] text-cyan-400 mt-1 font-mono"></div>
             <div class="nd-drill mt-2 hidden text-right">
                 <div class="nd-drill-header text-[10px] text-amber-300 font-mono"></div>
@@ -5514,6 +5582,45 @@ function createNoteDetector(options = {}) {
         const countsEl = instanceRoot.querySelector('.nd-hud-counts');
         const detectedEl = instanceRoot.querySelector('.nd-hud-detected');
         const flashEl = instanceRoot.querySelector('.nd-flash-overlay');
+        const recentEl = instanceRoot.querySelector('.nd-hud-recent');
+        const timingEl = instanceRoot.querySelector('.nd-hud-timing');
+        const causeEl = instanceRoot.querySelector('.nd-hud-cause');
+
+        // Recent strip: ✓⚠✗∅· tier of the last 8 judgments. Colored
+        // per-character so the user can see "I was clean, then 3
+        // sustain-bleeds, then 1 wrong-pitch" at a glance.
+        if (recentEl) {
+            const colorOf = (k) => ({
+                '✓': '#10b981',
+                '⚠': '#f59e0b',
+                '✗': '#fb923c',
+                '∅': '#ef4444',
+                '·': '#6b7280',
+            }[k] || '#6b7280');
+            recentEl.innerHTML = hudRecent
+                .map(k => `<span style="color:${colorOf(k)}">${k}</span>`)
+                .join('');
+        }
+
+        // Timing/drift status: live drift estimate + auto-cal latch.
+        // Tells the user whether the system thinks they're consistently
+        // off and whether avOffset has been auto-corrected yet.
+        if (timingEl) {
+            if (driftBuffer.length < _ND_DRIFT_MIN_SAMPLES) {
+                timingEl.textContent = '';
+            } else {
+                const d = Math.round(driftEstimateMs);
+                const direction = d > 0 ? 'LATE' : d < 0 ? 'EARLY' : 'OK';
+                const color = Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS ? '#f59e0b' : '#10b981';
+                const cal = autoCalApplied ? ' · cal ✓' : (Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS ? ' · cal pending' : '');
+                timingEl.innerHTML = `<span style="color:${color}">${direction} ${d > 0 ? '+' : ''}${d}ms${cal}</span>`;
+            }
+        }
+
+        // Cause line: most recent non-OK judgment in plain text.
+        if (causeEl) {
+            causeEl.textContent = hudLastCause || '';
+        }
 
         if (accEl && total > 0) {
             const accuracy = Math.round((hits / total) * 100);
@@ -5963,6 +6070,10 @@ function createNoteDetector(options = {}) {
         driftBuffer = [];
         driftEstimateMs = 0;
         autoCalApplied = false;
+        // Live HUD state — same per-session reset so the strip doesn't
+        // carry the previous song's judgments.
+        hudRecent = [];
+        hudLastCause = null;
         // Onset state — same reasoning. Don't carry inNote=true into
         // the next session or the first note will be missed by the
         // refractory check.
