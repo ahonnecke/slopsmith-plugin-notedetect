@@ -8,15 +8,24 @@ a question whose answer is here, re-read this file first.
 - **Slopsmith runs in a Docker container.** The host is the user's
   machine; the container is the FastAPI server (`uvicorn server:app`)
   on port 8000, mapped to host port 8088 (`http://localhost:8088`).
-- **Plugin dirs are bind-mounted** from the host into the container.
-  Editing `/home/ahonnecke/src/slopsmith-plugin-notedetect/screen.js`
-  on the host changes what the running server serves. That's why
-  cache-buster headers (no-cache + Last-Modified) work for live
-  development.
+- **Plugin dirs are bind-mounted READ-ONLY** from the host into the
+  container at `/opt/user-plugins/note_detect`. Editing
+  `/home/ahonnecke/src/slopsmith-plugin-notedetect/screen.js` on the
+  host changes what the running server serves (cache-buster headers
+  do the rest). BUT: the container CANNOT WRITE back into the plugin
+  dir. Anything that needs to write (state files, sqlite DBs, dumps)
+  must go to a writable path. Verify with
+  `docker inspect slopsmith-web-1 --format '{{range .Mounts}}{{.Source}}
+  -> {{.Destination}} ({{.Mode}}){{println}}{{end}}'`.
+- **`/config` is the writable persistent location.** It's a docker
+  named volume `slopsmith_rocksmith-config` mounted at /config (rw),
+  passed to plugins as `context["config_dir"]`. Survives container
+  restarts. Use `<config_dir>/note_detect/...` for plays DB,
+  recordings, etc. (Same convention highway_3d / practice_journal use.)
 - **`/tmp` inside the container is NOT the host's `/tmp`.** It's
-  tmpfs scoped to the container. To write files the host can read
-  (e.g. for me to inspect without docker exec), write to a path
-  under the bind-mounted plugin dir — `<plugin_dir>/diagnostics/`.
+  overlay/tmpfs scoped to the container. Writable but doesn't persist
+  across `docker restart` and host can't read it without
+  docker exec/cp.
 - **`routes.py` is loaded ONCE at server startup.** Adding or editing
   `routes.py` requires a slopsmith container restart. `screen.js` is
   hot-reloaded on browser refresh thanks to cache-buster headers; the

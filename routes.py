@@ -1,23 +1,29 @@
 """Server-side routes for the note detection plugin.
 
-Currently exposes a single diagnostics-dump endpoint that the plugin
-posts to periodically and at session boundaries. The dumps land in
-/tmp/nd_diagnostics/ so they can be read directly from local disk
-without the user having to paste console output. This is the auto-
-collect path the user asked for after getting tired of manually
-pasting getStats() results during port debugging.
+Three concerns live here:
 
-The dump file naming is `<song-slug>-<iso-timestamp>.json` so multiple
-sessions can be browsed chronologically. When no song info is
-available (mid-page-load, before highway.getSongInfo() returns), we
-fall back to "unknown".
+1. Diagnostics dump endpoint (POST/GET /diagnostics) — periodic state
+   capture so the user doesn't have to paste console output.
+2. Fixture serving (GET /fixtures, /fixtures/{name}) — replay
+   harness consumes these for offline detector validation.
+3. Plays storage (POST /plays, GET /plays, GET /play/{id}) — Unit S.1.
+   SQLite-backed snapshots of session-end note results so the modal,
+   history view, prescriptions, and fretboard heatmap can show
+   improvement-over-time + cross-play aggregates.
+
+All three use the bind-mounted plugin directory (NOT /tmp, which is
+tmpfs inside the slopsmith container) so files persist across
+container restarts and are readable from the host.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +48,113 @@ _FIXTURES_DIR = Path(__file__).parent / "test" / "fixtures"
 # Cap retained dumps so a long-running session doesn't fill /tmp.
 # Newest 50 retained; older silently dropped on each write.
 _DIAG_RETENTION = 50
+
+# SQLite DB for play snapshots. Path is resolved lazily inside
+# setup() because we need context["config_dir"] — the plugin dir
+# itself is bind-mounted READ-ONLY in the slopsmith container, so
+# the DB has to live under /config (writable, persists across
+# container restarts, host-readable). Per song we keep the newest
+# _PLAYS_RETENTION_PER_SONG plays so a long-running player doesn't
+# blow up the DB; older plays drop on each write.
+_PLAYS_DB_PATH: Path | None = None
+_PLAYS_RETENTION_PER_SONG = 50
+
+_PLAYS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plays (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id TEXT NOT NULL,
+  play_id_client TEXT,
+  played_at TEXT NOT NULL,
+  reason TEXT,
+  is_drill INTEGER DEFAULT 0,
+  drill_section_name TEXT,
+  hits INTEGER,
+  misses INTEGER,
+  total INTEGER,
+  detection REAL,
+  precision_pct REAL,
+  coverage REAL,
+  pitch_pct REAL,
+  timing_median_ms REAL,
+  timing_std_ms REAL,
+  combined_weighted_score REAL,
+  settings_json TEXT,
+  note_results_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plays_song ON plays(song_id, played_at DESC);
+"""
+
+
+@contextmanager
+def _plays_db() -> Generator[sqlite3.Connection]:
+    """Per-request SQLite connection. Row factory + FK enforcement.
+    Caller must be inside a request handler — the connection is
+    short-lived and committed/closed on context exit."""
+    if _PLAYS_DB_PATH is None:
+        raise RuntimeError("plays db path not configured — setup() never ran")
+    conn = sqlite3.connect(str(_PLAYS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _init_plays_db() -> None:
+    """Create the plays table on first startup. Idempotent — safe to
+    call on every server boot."""
+    if _PLAYS_DB_PATH is None:
+        raise RuntimeError("plays db path not configured — setup() never ran")
+    _PLAYS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _plays_db() as conn:
+        conn.executescript(_PLAYS_SCHEMA)
+
+
+def _prune_plays(conn: sqlite3.Connection, song_id: str) -> None:
+    """Drop oldest plays beyond _PLAYS_RETENTION_PER_SONG for this
+    song. Keeps the DB bounded without a cron — runs on each insert."""
+    extra = conn.execute(
+        "SELECT id FROM plays WHERE song_id = ? "
+        "ORDER BY played_at DESC, id DESC "
+        "LIMIT -1 OFFSET ?",
+        (song_id, _PLAYS_RETENTION_PER_SONG),
+    ).fetchall()
+    for row in extra:
+        conn.execute("DELETE FROM plays WHERE id = ?", (row["id"],))
+
+
+def _row_to_play(row: sqlite3.Row) -> dict[str, Any]:
+    """Reconstruct the JSON shape the client expects from a plays row.
+    note_results_json is the full snapshot — port-shape judgments
+    (hit + timingState + pitchState + ignoredAsDetectorFailure +
+    chartNote, etc.) — stored as a blob and returned untouched."""
+    return {
+        "id": row["id"],
+        "songId": row["song_id"],
+        "playId": row["play_id_client"],
+        "playedAt": row["played_at"],
+        "reason": row["reason"],
+        "isDrill": bool(row["is_drill"]),
+        "drillSectionName": row["drill_section_name"],
+        "summary": {
+            "hits": row["hits"],
+            "misses": row["misses"],
+            "total": row["total"],
+            "detection": row["detection"],
+            "precision": row["precision_pct"],
+            "coverage": row["coverage"],
+            "pitchPct": row["pitch_pct"],
+            "timingMedianMs": row["timing_median_ms"],
+            "timingStdMs": row["timing_std_ms"],
+            "combinedWeightedScore": row["combined_weighted_score"],
+        },
+        "settings": (
+            json.loads(row["settings_json"]) if row["settings_json"] else None
+        ),
+        "noteResults": json.loads(row["note_results_json"]),
+    }
 
 
 def _slug(s: str | None) -> str:
@@ -75,6 +188,137 @@ def _prune_old_dumps() -> None:
 def setup(app: FastAPI, context: dict[str, Any]) -> None:
     """Plugin loader entry point. Called once at startup by the
     slopsmith plugin loader (see plugins/__init__.py:setup_plugin)."""
+
+    # Resolve the plays DB path under context["config_dir"]. The
+    # plugin dir itself is mounted read-only in the slopsmith
+    # container, so /config (writable, persistent, bind-mounted to
+    # host) is the only valid home for state files. Same convention
+    # the highway_3d and practice_journal plugins use.
+    global _PLAYS_DB_PATH
+    config_dir = Path(context.get("config_dir") or "/config")
+    _PLAYS_DB_PATH = config_dir / "note_detect" / "plays.db"
+
+    # Initialize the plays DB schema. Idempotent — safe even if the
+    # file already exists from a prior run.
+    try:
+        _init_plays_db()
+    except Exception:
+        # Don't crash plugin load on a DB failure — the diagnostics +
+        # fixtures endpoints should still work even if /plays is broken.
+        pass
+
+    @app.post("/api/plugins/note_detect/plays")
+    async def post_plays(request: Request) -> dict[str, Any]:
+        """Snapshot a finished play. Body: {songId, playId, reason,
+        isDrill, drillSectionName, startedAt, summary, settings,
+        noteResults}. Returns {id} for the new row.
+
+        noteResults is stored as a JSON blob (not normalized into
+        rows) — the client knows the shape, and the only access
+        patterns are 'list plays' + 'load one full play', neither of
+        which queries inner fields."""
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(400, f"invalid json: {e}")
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "payload must be an object")
+        song_id = payload.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId is required")
+        note_results = payload.get("noteResults")
+        if not isinstance(note_results, list):
+            raise HTTPException(400, "noteResults must be a list")
+        summary = payload.get("summary") or {}
+        played_at = payload.get("playedAt") or time.strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        try:
+            with _plays_db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO plays ("
+                    "song_id, play_id_client, played_at, reason, "
+                    "is_drill, drill_section_name, "
+                    "hits, misses, total, "
+                    "detection, precision_pct, coverage, pitch_pct, "
+                    "timing_median_ms, timing_std_ms, "
+                    "combined_weighted_score, "
+                    "settings_json, note_results_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?)",
+                    (
+                        str(song_id),
+                        payload.get("playId"),
+                        played_at,
+                        payload.get("reason"),
+                        1 if payload.get("isDrill") else 0,
+                        payload.get("drillSectionName"),
+                        summary.get("hits"),
+                        summary.get("misses"),
+                        summary.get("total"),
+                        summary.get("detection"),
+                        summary.get("precision"),
+                        summary.get("coverage"),
+                        summary.get("pitchPct"),
+                        summary.get("timingMedianMs"),
+                        summary.get("timingStdMs"),
+                        summary.get("combinedWeightedScore"),
+                        (
+                            json.dumps(payload["settings"])
+                            if payload.get("settings") is not None
+                            else None
+                        ),
+                        json.dumps(note_results),
+                    ),
+                )
+                play_id = cur.lastrowid
+                _prune_plays(conn, str(song_id))
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
+        return {"ok": True, "id": play_id}
+
+    @app.get("/api/plugins/note_detect/plays")
+    def list_plays(songId: str | None = None, limit: int = 10) -> dict[str, Any]:
+        """List plays newest-first. Optional songId filter (most
+        callers want this — history view + improvement deltas only
+        compare against the same song). Limit caps at 50 to bound
+        the response size; the per-song retention is the same so
+        callers can request as many as exist."""
+        try:
+            limit = max(1, min(50, int(limit)))
+        except (TypeError, ValueError):
+            limit = 10
+        try:
+            with _plays_db() as conn:
+                if songId:
+                    rows = conn.execute(
+                        "SELECT * FROM plays WHERE song_id = ? "
+                        "ORDER BY played_at DESC, id DESC LIMIT ?",
+                        (songId, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM plays "
+                        "ORDER BY played_at DESC, id DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
+        return {"plays": [_row_to_play(r) for r in rows]}
+
+    @app.get("/api/plugins/note_detect/play/{play_id}")
+    def get_play(play_id: int) -> dict[str, Any]:
+        """Fetch one play by id. Used by the coaching review modal."""
+        try:
+            with _plays_db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM plays WHERE id = ?", (play_id,)
+                ).fetchone()
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
+        if row is None:
+            raise HTTPException(404, f"play {play_id} not found")
+        return _row_to_play(row)
 
     @app.post("/api/plugins/note_detect/diagnostics")
     async def post_diagnostics(request: Request) -> dict[str, Any]:
