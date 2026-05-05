@@ -1913,16 +1913,23 @@ async function _ndShowCoachingReview({ playId, source }) {
         };
     });
 
-    // History toggle is wired here but the body remains a stub until
-    // Unit 3e implements the line chart + section trends.
+    // Unit 3e: lazy-load the history line chart on first expand.
+    // Subsequent expands toggle visibility without re-fetching.
     const historyToggle = modal.querySelector('#nd-review-history-toggle');
     const historyEl = modal.querySelector('#nd-review-history');
+    let historyLoaded = false;
     historyToggle.onclick = () => {
         const arrow = historyToggle.querySelector('.nd-history-arrow');
         if (historyEl.classList.contains('hidden')) {
             historyEl.classList.remove('hidden');
             arrow.textContent = '▾';
-            historyEl.innerHTML = '<div class="text-gray-500 text-xs italic">History view ships in a follow-on unit.</div>';
+            if (!historyLoaded && play && play.songId) {
+                historyLoaded = true;
+                historyEl.innerHTML = '<div class="text-gray-500 text-xs italic">Loading history...</div>';
+                _ndRenderReviewHistory(historyEl, play.songId).catch(() => {
+                    historyEl.innerHTML = '<div class="text-red-400 text-xs">History fetch failed.</div>';
+                });
+            }
         } else {
             historyEl.classList.add('hidden');
             arrow.textContent = '▸';
@@ -2027,6 +2034,87 @@ async function _ndPatchImprovementDeltas(modal, currentPlay, currentDerived, cur
             set(`nd-cluster-delta-${i}`, _ndFmtDeltaBadge(delta, 'pct'));
         }
     }
+}
+
+// Unit 3e: lazy-loaded history view inside the coaching review modal.
+// Fetches the last N plays for this song from the storage backend
+// and renders a small line chart of detection-% trend, with reference
+// lines at 50/70/90 so the player can see goal-zone progression.
+// Drill plays render as smaller stroked dots so iteration noise
+// doesn't visually dominate the full-song trend.
+async function _ndRenderReviewHistory(container, songId) {
+    let plays = [];
+    try {
+        const r = await fetch(
+            `/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=10`
+        );
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        plays = (data && data.plays) || [];
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-xs">History fetch failed: ${e.message}</div>`;
+        return;
+    }
+    if (plays.length < 2) {
+        container.innerHTML = '<div class="text-gray-500 text-xs italic">Need at least 2 plays for a trend.</div>';
+        return;
+    }
+    // Server returns newest-first; reverse for left-to-right
+    // chronological display so the rightmost dot is "now."
+    const ordered = [...plays].reverse();
+    const lineChart = _ndRenderHistoryLineChart(ordered);
+    container.innerHTML = `
+        <div class="text-gray-400 text-xs mb-1">Detection across last ${ordered.length} play${ordered.length === 1 ? '' : 's'}</div>
+        <div class="bg-dark-700 border border-gray-700 rounded p-2">${lineChart}</div>
+    `;
+}
+
+function _ndRenderHistoryLineChart(plays) {
+    const W = 600, H = 100, M = 8;
+    // Pull detection from each play's summary. Plays from the v1
+    // schema have it; older rows might be null which we filter out.
+    const pts = plays.map(p => {
+        const v = p && p.summary && p.summary.detection;
+        return v == null ? null : Math.max(0, Math.min(1, v));
+    });
+    if (pts.every(v => v == null)) {
+        return '<div class="text-gray-500 text-xs italic">No score data yet (older plays predate scoring fields).</div>';
+    }
+    const xStep = pts.length > 1 ? (W - 2 * M) / (pts.length - 1) : 0;
+    const y = (v) => M + (1 - v) * (H - 2 * M);
+    let path = '';
+    let dotMarkup = '';
+    pts.forEach((v, i) => {
+        if (v == null) return;
+        const cx = M + i * xStep;
+        const cy = y(v);
+        path += (path === '' ? `M ${cx} ${cy}` : ` L ${cx} ${cy}`);
+        const playId = plays[i].id;
+        const isDrill = plays[i].isDrill;
+        // Drill plays get a smaller dot with a blue ring so the
+        // visual weight matches their context (iteration noise vs
+        // full-song attempts).
+        dotMarkup += `<circle cx="${cx}" cy="${cy}" r="${isDrill ? 3 : 4}" `
+            + `fill="${_ndScoreColor(v)}" `
+            + `stroke="${isDrill ? '#60a5fa' : 'transparent'}" `
+            + `stroke-width="${isDrill ? 1.5 : 0}">`
+            + `<title>play ${playId}: ${Math.round(v * 100)}%${isDrill ? ' (drill)' : ''}</title>`
+            + `</circle>`;
+    });
+    // 50/70/90% reference lines so the user sees goal-zone trends.
+    const ref = (v, color, label) => `
+        <line x1="${M}" x2="${W - M}" y1="${y(v)}" y2="${y(v)}" stroke="${color}" stroke-width="0.5" stroke-dasharray="2,2"/>
+        <text x="${W - M + 2}" y="${y(v) + 3}" fill="${color}" font-size="9">${label}</text>
+    `;
+    return `
+        <svg width="100%" viewBox="0 0 ${W + 28} ${H}" preserveAspectRatio="none">
+            ${ref(0.9, '#10b981', '90')}
+            ${ref(0.7, '#eab308', '70')}
+            ${ref(0.5, '#f97316', '50')}
+            <path d="${path}" stroke="#9ca3af" stroke-width="1.5" fill="none"/>
+            ${dotMarkup}
+        </svg>
+    `;
 }
 
 // Unit 3h: mid-session iteration banner. Fires after each drill loop
