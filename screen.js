@@ -1121,6 +1121,23 @@ const _ND_REATTACK_REARM_LEVEL = 0.008;  // dip below this re-arms re-attack gat
 const _ND_REATTACK_RATIO = 1.5;          // RMS spike must be N× recent min
 const _ND_REATTACK_WINDOW = 8;           // recent-min window (chunks)
 
+// Bass open strings: MIDIs 28 (E1), 33 (A1), 38 (D2), 43 (G2). When
+// YIN/HPS detects one of these but the chart expected a different
+// MIDI, the most likely cause is sympathetic resonance — the open
+// string is ringing alongside the played note. The detector picks the
+// (louder) open-string fundamental rather than the played note's
+// fundamental, octave-folding then makes the wrong detection "barely
+// pass" the 200¢ wide tolerance. That's not a player hit; it's the
+// detector failing to suppress sympathetic energy.
+const _ND_BASS_OPEN_STRING_MIDIS = new Set([28, 33, 38, 43]);
+// Octave above each open string. YIN on a 4096-sample buffer at low
+// bass frequencies (E1=41Hz, A1=55Hz) can lock onto the 2nd harmonic
+// rather than the weak fundamental, so an unmuted ringing open A1
+// reads as A2 (MIDI 45). Detecting either pattern as open-string
+// contamination matches the underlying physics — same muting issue,
+// different YIN output.
+const _ND_BASS_OPEN_STRING_OCTAVE_MIDIS = new Set([40, 45, 50, 55]);
+
 // Detector-failure demotion. The score should reflect playing
 // quality, not detector limitations. Misses caused by sustain bleed
 // or onset-detector refractory (rather than the player's error) get
@@ -3875,6 +3892,28 @@ function createNoteDetector(options = {}) {
                 matcherMidi, detectedConfidence,
                 { pitchError: winner.pitchError }
             );
+            // Open-string contamination demotion (Unit 6i). When the
+            // matcher only "hit" because octave-folding made an
+            // open-string detection look correct (e.g. YIN read open
+            // E1 = MIDI 28, fold to E2 = MIDI 40, expected D2 = MIDI
+            // 38, |40-38|=200¢ barely passes), this is sympathetic
+            // resonance, not a player hit. Mark ignoredAsDetectorFailure
+            // so the score doesn't credit it.
+            //
+            // Conditions: detected MIDI is in the bass open-string set
+            // (or its 2nd-harmonic class), the detected MIDI is NOT
+            // the expected MIDI (so we're not demoting clean hits on
+            // notes that happen to be played open), and pitch error
+            // is at the wide-tolerance boundary (≥150¢, indicating
+            // octave-aliasing rather than a clean match).
+            const detRound = Math.round(matcherMidi);
+            const detIsOpen = _ND_BASS_OPEN_STRING_MIDIS.has(detRound)
+                || _ND_BASS_OPEN_STRING_OCTAVE_MIDIS.has(detRound);
+            const detMatchesExpected = detRound === winner.expectedMidi;
+            const pitchAtBoundary = Math.abs(winner.pitchError) >= 150;
+            if (detIsOpen && !detMatchesExpected && pitchAtBoundary) {
+                judgment.ignoredAsDetectorFailure = true;
+            }
             recordJudgment(winner.key, judgment);
         }
 
