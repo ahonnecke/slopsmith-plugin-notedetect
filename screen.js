@@ -3269,6 +3269,7 @@ function createNoteDetector(options = {}) {
     let detectBtn = null;
     let gearBtn = null;
     let restartBtn = null;
+    let skipBtn = null;
 
     // Draw hook — registered once per instance; removed in destroy().
     // The hook itself early-returns when !enabled, so the cost is
@@ -5772,6 +5773,21 @@ function createNoteDetector(options = {}) {
         if (closeBtn) controls.insertBefore(restartBtn, closeBtn);
         else controls.appendChild(restartBtn);
 
+        // Unit UX-skip-intro: jump audio to 5s before the first chart
+        // note. Songs that open with silence or non-instrument intros
+        // waste the player's time at every restart; this is "skip the
+        // boring part" for charts. Five seconds is the runway \u2014 long
+        // enough for the player to settle and reach the first
+        // detection-window, short enough that they don't get bored
+        // again.
+        skipBtn = document.createElement('button');
+        skipBtn.className = 'nd-skip-btn px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
+        skipBtn.textContent = '\u23ed';  // BLACK RIGHT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR
+        skipBtn.title = 'Skip to 5s before first chart note';
+        skipBtn.onclick = skipToFirstNote;
+        if (closeBtn) controls.insertBefore(skipBtn, closeBtn);
+        else controls.appendChild(skipBtn);
+
         gearBtn = document.createElement('button');
         gearBtn.className = 'nd-gear-btn px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
         gearBtn.textContent = '\u2699';
@@ -5802,6 +5818,7 @@ function createNoteDetector(options = {}) {
         }
         if (gearBtn) gearBtn.classList.toggle('hidden', !enabled);
         if (restartBtn) restartBtn.classList.toggle('hidden', !enabled);
+        if (skipBtn) skipBtn.classList.toggle('hidden', !enabled);
     }
 
     // Unit UX-restart: seek audio to 0 and clear scoring. Does NOT
@@ -5834,6 +5851,47 @@ function createNoteDetector(options = {}) {
             restartBtn.classList.add('bg-blue-700');
             setTimeout(() => {
                 if (restartBtn) restartBtn.classList.remove('bg-blue-700');
+            }, 200);
+        }
+    }
+
+    // Unit UX-skip-intro: seek audio forward to 5s before the first
+    // chart note. Useful for songs with silent intros / non-bass
+    // intros where waiting through the lead-in every restart wastes
+    // the player's time. No scoring reset — intros typically have
+    // no chart notes (that's why we're skipping), so checkMisses
+    // doesn't see any "missed" notes in the skipped region.
+    function skipToFirstNote() {
+        const audio = document.getElementById('audio');
+        if (!audio) {
+            console.warn('[note_detect] skipToFirstNote: no <audio id="audio"> element');
+            return;
+        }
+        const _hw = resolveHw();
+        const notes = (_hw && _hw.getNotes && _hw.getNotes()) || [];
+        // First note's chart time. Notes are sorted by t in slopsmith
+        // (highway invariant) so [0] is the earliest. If the chart
+        // has no notes the button is meaningless — bail with a
+        // console hint rather than silently doing nothing.
+        if (!notes.length) {
+            console.warn('[note_detect] skipToFirstNote: no chart notes loaded');
+            return;
+        }
+        const firstNoteT = notes[0].t;
+        // 5-second runway. Clamp to 0 so songs whose first note is
+        // at t<5 don't seek to a negative time. avOffset is in the
+        // ±30ms range — well within the 5s buffer, so no need to
+        // explicitly translate chart-time to audio-time.
+        const targetT = Math.max(0, firstNoteT - 5);
+        try { audio.currentTime = targetT; } catch (e) {
+            console.warn('[note_detect] skipToFirstNote: seek failed:', e);
+            return;
+        }
+        try { audio.play().catch(() => {}); } catch (e) {}
+        if (skipBtn) {
+            skipBtn.classList.add('bg-blue-700');
+            setTimeout(() => {
+                if (skipBtn) skipBtn.classList.remove('bg-blue-700');
             }, 200);
         }
     }
@@ -6647,6 +6705,7 @@ function createNoteDetector(options = {}) {
         if (detectBtn) { detectBtn.remove(); detectBtn = null; }
         if (gearBtn) { gearBtn.remove(); gearBtn = null; }
         if (restartBtn) { restartBtn.remove(); restartBtn = null; }
+        if (skipBtn) { skipBtn.remove(); skipBtn = null; }
         if (instanceRoot.parentNode) instanceRoot.remove();
         _ndInstances.delete(api);
     }
@@ -8661,6 +8720,9 @@ function createNoteDetector(options = {}) {
         // Unit UX-restart — exposed so keyboard shortcuts or other
         // plugins can trigger restart programmatically.
         restartSong,
+        // Unit UX-skip-intro — same rationale; programmatic skip-to-
+        // first-note for callers that bypass the button.
+        skipToFirstNote,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
