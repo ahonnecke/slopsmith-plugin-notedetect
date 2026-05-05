@@ -4303,6 +4303,35 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Fix C — slot-claim leak prevention. A chart slot is "claimed
+    // for real" only if its noteResults entry is NOT a detector-
+    // failure demotion (sustain bleed / open-string contamination).
+    // Ignored entries are placeholders left by Unit 6i's demotion
+    // path: the detector heard SOMETHING but flagged it as a
+    // detector limitation, not a real player attempt. The chart
+    // slot should remain available for subsequent real detections
+    // to score against — otherwise the player's actual attempt at
+    // a note gets eaten by a phantom claim.
+    //
+    // Used in matchNotes' "already judged?" gates. Was just
+    // noteResults.has(key) which blocked re-judgment unconditionally.
+    function _slotIsClaimed(key) {
+        const existing = noteResults.get(key);
+        if (!existing) return false;
+        // hit=true && ignored: phantom claim, allow overwrite
+        // hit=true && !ignored: real hit, leave alone
+        // hit=false: real miss recorded, leave alone (don't undo a miss)
+        return !existing.ignoredAsDetectorFailure;
+    }
+
+    // ── Score-update bookkeeping for re-judgment paths ────────────
+    // When a phantom (ignored) entry is replaced by a real judgment,
+    // the score counters need to update. Currently recordJudgment
+    // just bumps hits/misses on the new judgment; if the previous
+    // phantom didn't bump anything (it was ignored), the new real
+    // judgment correctly bumps. So no special bookkeeping needed —
+    // just call recordJudgment again.
+
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
         noteResults.set(key, judgment);
         if (count) {
@@ -4553,7 +4582,10 @@ function createNoteDetector(options = {}) {
             if (matcherMidi < 0) continue;
             const cn = group[0];
             const key = noteKey(cn, cn.t);
-            if (noteResults.has(key)) continue;
+            // Fix C: was noteResults.has(key). Allow re-judgment when
+            // the existing entry is a sustain-bleed phantom so a real
+            // attempt at this chart note can still score.
+            if (_slotIsClaimed(key)) continue;
             const expectedMidi = _ndMidiFromStringFret(
                 cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
             );
@@ -4638,7 +4670,10 @@ function createNoteDetector(options = {}) {
                 // Chord-level resolved key. checkMisses() honours this so a
                 // failed chord becomes one miss event (not one per string).
                 const chordKey = `${group[0].t.toFixed(3)}_chord`;
-                if (noteResults.has(chordKey)) continue;
+                // Fix C: same logic as single-note path — let
+                // sustain-bleed phantoms be replaced by real chord
+                // attempts.
+                if (_slotIsClaimed(chordKey)) continue;
 
                 // Two paths:
                 //  - Browser: call _ndScoreChord against the FFT
@@ -4904,7 +4939,9 @@ function createNoteDetector(options = {}) {
                 for (let i = 0; i < group.length; i++) {
                     const cn = group[i];
                     const key = noteKey(cn, cn.t);
-                    if (noteResults.has(key)) continue;
+                    // Fix C: per-string slot inside a chord — phantom
+                    // hits should yield to real attempts here too.
+                    if (_slotIsClaimed(key)) continue;
                     if (!chordJudgment.hit) {
                         // Chord passed energy/ratio threshold but missed the clean-hit
                         // threshold. Use makeMissJudgment so each per-string entry is
