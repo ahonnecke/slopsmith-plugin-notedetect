@@ -324,6 +324,11 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         // HTML for the coaching modal.
         computeFretboardHeatmap: sandbox._ndComputeFretboardHeatmap,
         renderFretboardHeatmapSvg: sandbox._ndRenderFretboardHeatmapSvg,
+        // Unit 3g — top-3 prescriptions (single-play). Compute returns
+        // [{text, detail, score, signal}, ...] sorted by score desc;
+        // render returns embeddable HTML for the modal.
+        computePrescriptions: sandbox._ndComputePrescriptions,
+        renderPrescriptionsBlock: sandbox._ndRenderPrescriptionsBlock,
     };
 }
 

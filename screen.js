@@ -1596,6 +1596,156 @@ function _ndRenderFretboardHeatmapSvg(grid, stringCount, maxFret) {
     return body;
 }
 
+// Unit 3g: top-3 prescriptions. Reduces a single play's noteResults
+// into 3 ranked, actionable suggestions. The reference branch
+// aggregated across plays + ran a failure-mode classifier — that's
+// a much larger port. This single-play version uses three signals:
+//
+//   A. Top trouble cluster — the densest miss zone in the song
+//      (already computed by _ndFindMissClusters; we just package it
+//      with chart-time labels so the user can locate it).
+//   B. Systematic timing bias — median timingError on hits. If the
+//      player is consistently early/late by more than a threshold,
+//      surface a "anticipate the click" / "hold one extra moment"
+//      coaching cue.
+//   C. Weakest string — string with miss rate ≥ 1.5× overall AND
+//      ≥40% absolute. One per-string prescription max.
+//
+// Each candidate has {text, detail, score, signal}. We sort by
+// score desc and return the top 3. Empty array → "not enough data
+// yet" placeholder is the renderer's responsibility.
+function _ndComputePrescriptions(noteResults, opts = {}) {
+    const candidates = [];
+    if (!noteResults || noteResults.length === 0) return candidates;
+
+    const arrangement = opts.arrangement || 'guitar';
+    const timingThresholdMs = opts.timingThresholdMs || 50;
+
+    // ── Signal A: top trouble cluster ────────────────────────────
+    const clusters = _ndFindMissClusters(noteResults);
+    if (clusters.length > 0) {
+        const top = clusters[0];
+        const mm = Math.floor(top.startSec / 60);
+        const ss = Math.floor(top.startSec % 60).toString().padStart(2, '0');
+        const endMm = Math.floor(top.endSec / 60);
+        const endSs = Math.floor(top.endSec % 60).toString().padStart(2, '0');
+        const missCount = top.notes.filter(n => n && !n.hit && !n.ignoredAsDetectorFailure).length;
+        candidates.push({
+            text: `Drill ${mm}:${ss}–${endMm}:${endSs} — ${missCount} miss${missCount === 1 ? '' : 'es'} clustered here.`,
+            detail: `Densest trouble zone in the song`,
+            score: missCount * (top.endSec - top.startSec + 1),
+            signal: 'cluster',
+        });
+    }
+
+    // ── Signal B: systematic timing bias ──────────────────────────
+    const timingErrors = [];
+    for (const r of noteResults) {
+        if (!r || r.ignoredAsDetectorFailure) continue;
+        if (r.hit && typeof r.timingError === 'number' && Number.isFinite(r.timingError)) {
+            timingErrors.push(r.timingError);
+        }
+    }
+    // Need a meaningful sample before scolding — single-play noise
+    // shouldn't fire a "you're consistently late" cue. 30 hits ≈ a
+    // verse of bass; that's our floor.
+    if (timingErrors.length >= 30) {
+        timingErrors.sort((a, b) => a - b);
+        const median = timingErrors[Math.floor((timingErrors.length - 1) * 0.5)];
+        const absMedian = Math.abs(median);
+        if (absMedian > timingThresholdMs) {
+            const direction = median > 0 ? 'late' : 'early';
+            const action = median > 0
+                ? "You're consistently behind the beat. Anticipate the click instead of waiting for the visual cue."
+                : "You're consistently ahead of the beat. Hold the upbeat for one extra moment before plucking.";
+            candidates.push({
+                text: `You're ${Math.round(absMedian)}ms ${direction} on hits. ${action}`,
+                detail: `Median across ${timingErrors.length} hits · threshold ${timingThresholdMs}ms`,
+                score: absMedian * Math.min(timingErrors.length, 50) / 100,
+                signal: 'timing_bias',
+            });
+        }
+    }
+
+    // ── Signal C: weakest string ──────────────────────────────────
+    const stringStats = new Map();
+    for (const r of noteResults) {
+        if (!r || r.ignoredAsDetectorFailure) continue;
+        const sf = r.chartNote || r.note;
+        if (!sf || typeof sf.s !== 'number') continue;
+        const stat = stringStats.get(sf.s) || { attempts: 0, misses: 0 };
+        stat.attempts++;
+        if (!r.hit) stat.misses++;
+        stringStats.set(sf.s, stat);
+    }
+    let totalAttempts = 0, totalMisses = 0;
+    for (const stat of stringStats.values()) {
+        totalAttempts += stat.attempts;
+        totalMisses += stat.misses;
+    }
+    const overallMissRate = totalAttempts > 0 ? totalMisses / totalAttempts : 0;
+    if (totalAttempts >= 10) {
+        // String index → display label. Slopsmith uses string 0 = lowest
+        // pitch (matching tab convention) — bass goes E A D G, guitar
+        // E A D G B E. Picked the string with the worst rate that
+        // exceeds both an absolute floor (40%) and a relative one
+        // (1.5× overall) so we don't flag a clean string as weak just
+        // because it had one bad attempt.
+        const isBass = String(arrangement).toLowerCase() === 'bass';
+        const stringNames = isBass
+            ? ['E (low)', 'A', 'D', 'G (high)']
+            : ['E (low)', 'A', 'D', 'G', 'B', 'E (high)'];
+        let worst = null;
+        for (const [s, stat] of stringStats) {
+            if (stat.attempts < 5) continue;
+            const rate = stat.misses / stat.attempts;
+            if (rate >= 0.4 && rate >= overallMissRate * 1.5) {
+                if (!worst || rate > worst.rate) {
+                    worst = { s, rate, attempts: stat.attempts, misses: stat.misses };
+                }
+            }
+        }
+        if (worst) {
+            const stringLabel = stringNames[worst.s] || `string ${worst.s + 1}`;
+            candidates.push({
+                text: `${stringLabel} string is your weak point — ${Math.round(worst.rate * 100)}% miss rate vs ${Math.round(overallMissRate * 100)}% overall.`,
+                detail: `${worst.misses} of ${worst.attempts} attempts on this string failed`,
+                score: (worst.rate - overallMissRate) * worst.attempts,
+                signal: 'per_string',
+            });
+        }
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.slice(0, 3);
+}
+
+// Render the top-3 prescriptions as a colored panel. Empty list
+// surfaces a "not enough data yet" placeholder. Tier numbers (1/2/3)
+// pick up colored severity ramp matching the rest of the modal:
+// red → orange → yellow.
+function _ndRenderPrescriptionsBlock(top3) {
+    if (!top3 || top3.length === 0) {
+        return `<div class="bg-dark-800 border border-gray-700 rounded p-3 mb-3">
+            <div class="text-gray-400 text-xs">Not enough data yet for actionable advice. Play through the full song or loop a section.</div>
+        </div>`;
+    }
+    const tierColor = ['#f87171', '#fb923c', '#facc15'];
+    const rows = top3.map((p, i) => `
+        <div class="flex items-start gap-2 mb-2 last:mb-0">
+            <span class="text-base font-bold mt-0.5" style="color:${tierColor[i] || '#facc15'}">${i + 1}.</span>
+            <div class="flex-1 min-w-0">
+                <div class="text-gray-100 text-sm">${p.text}</div>
+                ${p.detail ? `<div class="text-gray-500 text-[10px] font-mono">${p.detail}</div>` : ''}
+            </div>
+        </div>
+    `).join('');
+    return `<div class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3">
+        <div class="text-orange-400 text-xs font-semibold mb-2 uppercase tracking-wide">Top 3 things to fix</div>
+        ${rows}
+    </div>`;
+}
+
 function _ndExportCoachingAnalysis(play, opts = {}) {
     const { sections = [], totalDuration = 0, heatmapBinSec = 5 } = opts;
     const noteResults = (play && play.noteResults) || [];
@@ -1924,6 +2074,10 @@ async function _ndShowCoachingReview({ playId, source }) {
             </div>
 
             ${topFixHtml}
+
+            ${_ndRenderPrescriptionsBlock(_ndComputePrescriptions(play.noteResults || [], {
+                arrangement: (play.settings && play.settings.arrangement) || (songInfo && songInfo.arrangement) || 'guitar',
+            })).replace('class="bg-dark-800 border border-orange-700/40 rounded p-3 mb-3"', 'class="mx-5 mt-4 bg-dark-800 border border-orange-700/40 rounded p-3"')}
 
             <div class="grid grid-cols-3 gap-3 px-5 py-4 border-b border-gray-700">
                 ${_ndRenderSubScoreTile('Pitch', pitchPctText, _ndScoreColor(derived.pitchPct), 'nd-delta-pitch')}
