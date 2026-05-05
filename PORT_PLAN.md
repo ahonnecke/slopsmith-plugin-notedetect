@@ -20,7 +20,9 @@ shape during porting.
 ✓ Unit 6a — Drift compensation                  cafeb98
 ✓ Unit 6b — Tier-2 nearest-time selection      dff9855
 ✓ Unit 6d — IGNORED_DETECTOR_FAILURE demotion  4f22231
-✓ Unit 6h — Chart-aware refractory             850e136
+✗ Unit 6h — Chart-aware refractory (REGRESSED on user's audio,
+              reverted in cce383f — body-peak resonance slipped
+              through tightened 80ms refractory)
 ✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
 ✓ Unit 6e — Onset detection + buffer flush     4fabac6
 ✓ Unit 6f — Dual-threshold judgment + raw timing aac2ce2
