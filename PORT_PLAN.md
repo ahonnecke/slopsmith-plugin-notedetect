@@ -33,25 +33,19 @@ shape during porting.
 ✓ Unit H1+ — chart-note injection from dumps    2c75be1
 ✓ Unit H1++ — avOffset override in replay      d995193
 ✓ Unit H2+ — onset-anchored matcher option     ccd0bf9
+✓ Unit 3f — Improvement deltas (current vs prior) f1496fd
 
 ☐ Unit 6c  Sibling-claim accounting (coaching cosmetic, low priority)
 ☐ Unit 6j  YIN octave-down validation in _ndYinDetect
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
-☐ Unit 3f  Improvement deltas (current vs prior play)
-☐ Unit 3a  Coaching analysis pure functions
-☐ Unit 3b  _ndExportCoachingAnalysis entry point
-☐ Unit 3c  Coaching review modal — base layout
-☐ Unit 3d  Coaching review modal — heatmap SVGs
 ☐ Unit 3e  Coaching review modal — history view
-☐ Unit 3f  Improvement deltas (current vs prior play)
 ☐ Unit 3g  Top-3 prescriptions (cross-play)
 ☐ Unit 3h  Mid-session iteration banner
 ☐ Unit 3i  Fretboard heatmap
 ☐ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
-☐ Unit 4c  Replay through pipeline (_ndInjectTestWav)
 ☐ Unit 4d  Recording UI in settings panel
 ```
 
