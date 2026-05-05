@@ -53,6 +53,30 @@ check-slopsmith:
 test: ## Run the plugin's node:test suite (no deps)
 	npm test
 
+.PHONY: test-yin
+test-yin: ## Run only the YIN test files (fast iteration during detector tuning)
+	@node --test test/yin-*.test.js 2>&1 | grep -E "^(# (tests|pass|fail|skipped)|not ok)" || true
+
+.PHONY: syntax
+syntax: ## Parse screen.js as JS (catches typos before browser reload)
+	@node -e "new Function(require('fs').readFileSync('screen.js','utf-8')); console.log('screen.js: OK');"
+
+.PHONY: stat
+stat: ## Show staged/unstaged diff stats and short status (frequent during porting)
+	@git diff --stat
+	@echo "---"
+	@git status -s
+
+.PHONY: pull-recording
+pull-recording: check-slopsmith ## Copy newest /tmp/nd_recordings/*.wav out of the container
+	@latest=$$($(COMPOSE) exec -T web sh -c 'ls -1t /tmp/nd_recordings/*.wav 2>/dev/null | head -1' | tr -d '\r'); \
+	    test -n "$$latest" || { echo "no recordings in container"; exit 1; }; \
+	    name=$$(basename $$latest .wav); \
+	    dest=test/fixtures/staging/$${name}-$$(date +%s).wav; \
+	    mkdir -p test/fixtures/staging; \
+	    docker cp $$($(COMPOSE) ps -q web):$$latest $$dest; \
+	    echo "pulled: $$dest"
+
 .PHONY: replay-baseline
 replay-baseline: ## Run all WAV fixtures through the detector via puppeteer (slopsmith must be running)
 	node test/replay-baseline.js --url http://localhost:$(SLOPSMITH_PORT) $(REPLAY_ARGS)
@@ -60,6 +84,14 @@ replay-baseline: ## Run all WAV fixtures through the detector via puppeteer (slo
 .PHONY: replay-gasoline
 replay-gasoline: ## Replay just the gasoline fixtures
 	node test/replay-baseline.js --url http://localhost:$(SLOPSMITH_PORT) --fixture-glob 'gasoline*.wav'
+
+.PHONY: replay-analyze
+replay-analyze: ## Summarize the most recent replay-results JSON
+	@node test/analyze-replay.js
+
+.PHONY: replay-diff
+replay-diff: ## Diff two replay results: make replay-diff OLD=... NEW=...
+	@node test/analyze-replay.js --diff $(OLD) $(NEW)
 
 .PHONY: rebuild
 rebuild: check-slopsmith ## Rebuild slopsmith container image (after slopsmith requirements.txt changes)
