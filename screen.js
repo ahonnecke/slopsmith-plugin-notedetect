@@ -6035,10 +6035,18 @@ function createNoteDetector(options = {}) {
         enabled = false;
         // Unit S.2: snapshot the play before tear-down so the
         // session's noteResults persist. Fire-and-forget — disable
-        // returns quickly to keep the UI responsive; the POST
-        // resolves out-of-band and the resulting play_id is
-        // discarded (modal/history view re-fetch via /plays).
-        snapshotPlay('disable').catch(() => {});
+        // returns quickly to keep the UI responsive. On non-silent
+        // disables, chain the coaching review modal so the user
+        // sees the post-game analysis (Units 3a-3f/3h all hang off
+        // _ndShowCoachingReview, which fetches the just-snapshotted
+        // play by id). Silent disables (destroy, song switch) skip
+        // the modal — they're tear-downs the user didn't trigger.
+        const wantReview = !disableOptions || !disableOptions.silent;
+        snapshotPlay('disable').then((playId) => {
+            if (playId != null && wantReview && typeof _ndShowCoachingReview === 'function') {
+                _ndShowCoachingReview({ playId, source: 'disable' }).catch(() => {});
+            }
+        }).catch(() => {});
         // One last diagnostics dump on the way out so the final
         // session state lands on disk before we tear everything
         // down. Fire-and-forget; we don't await it because disable
