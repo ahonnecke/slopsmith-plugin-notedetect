@@ -48,8 +48,15 @@ const INCLUDE_EXCLUDED = args.includes('--include-excluded');
 const TIMEOUT_MS = 1_200_000;
 
 function globToRegex(pattern) {
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    return new RegExp(`^${escaped}$`);
+    // Convert glob to regex preserving character classes ([abc], [0-9])
+    // and wildcards (*, ?). Comma-separated alternation also supported:
+    // `gasoline-*.wav,level_*.wav` matches either prefix.
+    const alts = pattern.split(',').map(p => p.trim()).filter(Boolean);
+    const re = (p) => p
+        .replace(/[.+^${}()|\\]/g, '\\$&')   // escape regex special chars
+        .replace(/\*/g, '.*')                // * → .*
+        .replace(/\?/g, '.');                // ? → .
+    return new RegExp(`^(?:${alts.map(re).join('|')})$`);
 }
 
 async function discoverFixtures() {
