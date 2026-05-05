@@ -299,6 +299,10 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         scoreColor: sandbox._ndScoreColor,
         fmtMmSs: sandbox._ndFmtMmSs,
         isDuplicateLoop: sandbox._ndIsDuplicateLoop,
+        // Unit S.2 — pure helper for grouping plays by song; closure-
+        // internal snapshotPlay uses this to produce the song_id
+        // primary key for the plays DB.
+        currentSongId: sandbox._ndCurrentSongId,
         scoresFromNotes: sandbox._ndScoresFromNotes,
         computeScoreDeltas: sandbox._ndComputeScoreDeltas,
         findMissClusters: sandbox._ndFindMissClusters,

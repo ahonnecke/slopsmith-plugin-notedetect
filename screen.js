@@ -1026,6 +1026,17 @@ function _ndFmtMmSs(t) {
     return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+// Stable-ish key for grouping plays of "the same song" — filename
+// alone collides across arrangements (lead vs bass), so we
+// concatenate filename+arrangement. Falls back to title when
+// filename is missing (e.g. fixtures without a song_audio path).
+function _ndCurrentSongId(songInfo) {
+    if (!songInfo) return null;
+    const file = songInfo.filename || songInfo.title || null;
+    const arr = songInfo.arrangement || 'default';
+    return file ? `${file}__${arr}` : null;
+}
+
 // Pure: does a (start, end) loop range duplicate any in `existingLoops`
 // within `tolSec` on both endpoints? Used by drill auto-save to avoid
 // piling identical loops into the user's saved-loops list each time
@@ -2398,6 +2409,10 @@ function createNoteDetector(options = {}) {
     let drillIterScores = [];       // detection score (0..1) per loop iteration
     let drillBestScore = 0;
     let drillGoalReached = false;   // sticky once user crosses the goal
+    // Unit S.2: most-recent snapshotPlay() id, populated when the
+    // POST resolves. Modal triggers read this to call /play/{id}
+    // without re-fetching the list. null until first session boundary.
+    let lastSnapshotPlayId = null;
     // Loop-restart detection (chartTime backward jump > 1s). Refractory
     // suppresses audio-engine seek bouncing from firing 4-6× per real
     // restart.
@@ -5956,9 +5971,74 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Unit S.2: snapshot the current session's noteResults to the
+    // server so the modal/history/heatmap have something to read on
+    // a future visit. Returns the new play_id (or null on no-op /
+    // failure). Fire-and-forget at session boundaries; deliberately
+    // independent of the modal trigger so silent disables (drill
+    // teardown) still persist.
+    async function snapshotPlay(reason) {
+        if (!isDefault) return null;  // non-default instances would step on each other
+        if (noteResults.size === 0) return null;
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const songId = _ndCurrentSongId(songInfo);
+        if (!songId) return null;
+        const arr = [];
+        for (const v of noteResults.values()) arr.push(v);
+        const scores = _ndScoresFromNotes(arr);
+        const payload = {
+            songId,
+            playId: new Date().toISOString().replace(/[:.]/g, '-'),
+            playedAt: new Date().toISOString(),
+            reason,
+            isDrill: !!drillActive,
+            drillSectionName: drillFocus || null,
+            startedAt: Date.now(),
+            summary: {
+                hits: scores.hits,
+                misses: scores.misses,
+                total: scores.total,
+                detection: scores.detection,
+                precision: scores.precision,
+                pitchPct: scores.pitchPct,
+                coverage: scores.coverage,
+                timingMedianMs: scores.timingMedianMs,
+                timingStdMs: scores.timingStdMs,
+                combinedWeightedScore: scores.combined,
+            },
+            settings: {
+                arrangement: songInfo.arrangement || null,
+                tuning: songInfo.tuning || null,
+                avOffsetMs: _hw && _hw.getAvOffset ? _hw.getAvOffset() : null,
+            },
+            noteResults: arr,
+        };
+        try {
+            const r = await fetch('/api/plugins/note_detect/plays', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (!r.ok) return null;
+            const data = await r.json();
+            const id = (data && data.id) || null;
+            if (id != null) lastSnapshotPlayId = id;
+            return id;
+        } catch (e) {
+            return null;
+        }
+    }
+
     function disable(disableOptions) {
         if (!enabled) return;
         enabled = false;
+        // Unit S.2: snapshot the play before tear-down so the
+        // session's noteResults persist. Fire-and-forget — disable
+        // returns quickly to keep the UI responsive; the POST
+        // resolves out-of-band and the resulting play_id is
+        // discarded (modal/history view re-fetch via /plays).
+        snapshotPlay('disable').catch(() => {});
         // One last diagnostics dump on the way out so the final
         // session state lands on disk before we tear everything
         // down. Fire-and-forget; we don't await it because disable
@@ -7996,6 +8076,11 @@ function createNoteDetector(options = {}) {
         // pipeline. Used by test/replay-baseline.js (Unit H2) to run
         // the user's recorded fixtures offline.
         testInjectWav,
+        // Unit S.2 — manual snapshot trigger. Useful for callers that
+        // want to persist the current session at a point other than
+        // disable() (e.g. mid-song save). Returns the new play_id or null.
+        snapshotPlay,
+        getLastSnapshotPlayId: () => lastSnapshotPlayId,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
