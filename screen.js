@@ -1026,6 +1026,79 @@ function _ndFmtMmSs(t) {
     return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+// Pure: status-line message for the "Apply latency from recent
+// hits" button. Tested in test/cal-message.test.js so accidental
+// off-by-one / boundary errors get caught by the harness instead
+// of by the user staring at a panel saying "Need 0 more hits".
+//
+// Inputs:
+//   samples:    driftBuffer.length (0..N)
+//   driftMs:    rolling-median timing error (rounded to int)
+//   avOffsetMs: current avOffset (rounded to int)
+//   minSamples: _ND_DRIFT_MIN_SAMPLES (default 4)
+// Returns: { text, applyEnabled }
+function _ndCalRefreshMessage(samples, driftMs, avOffsetMs, minSamples) {
+    const min = Number.isFinite(minSamples) ? minSamples : 4;
+    if (samples < min) {
+        const need = min - samples;
+        return {
+            text: `Need ${need} more hit${need === 1 ? '' : 's'} before calibration. Current avOffset: ${avOffsetMs}ms.`,
+            applyEnabled: false,
+        };
+    }
+    const direction = driftMs > 0 ? 'late' : driftMs < 0 ? 'early' : 'on the beat';
+    const sign = driftMs > 0 ? '+' : '';
+    return {
+        text: `Median bias across ${samples} hit${samples === 1 ? '' : 's'}: ${sign}${driftMs}ms (${direction}). Current avOffset: ${avOffsetMs}ms. Click Apply to set avOffset → ${avOffsetMs - driftMs}ms.`,
+        applyEnabled: true,
+    };
+}
+
+// Pure: compute the deltas between captured onset times and
+// expected click times, separating valid plucks from likely
+// click-bleed (near-zero delta = the click itself echoing
+// through speakers → bass body → DI). Returns the full
+// post-match analysis the cal needs to decide success/failure.
+//
+// Inputs:
+//   captures:    array of audioCtx.currentTime values when onsets fired
+//   expectedTimes: array of audioCtx.currentTime values at scheduled clicks
+//   beatSec:     1.0 at 60bpm
+//   matchFraction: how much of the beat counts as "near a click"
+//                  (0.6 means ±600ms at 60bpm)
+//   bleedThresholdSec: |delta| below this treated as click-bleed
+//                       (0 = disabled; 0.05 = the prior 50ms filter)
+// Returns: { deltas: [seconds...], clickThroughDeltas: [ms...] }
+function _ndMatchCalCaptures(captures, expectedTimes, beatSec, matchFraction, bleedThresholdSec) {
+    const halfBeat = beatSec * matchFraction;
+    const bleedSec = bleedThresholdSec || 0;
+    const deltas = [];
+    const clickThroughDeltas = [];
+    for (const cap of captures) {
+        let nearest = null;
+        for (const exp of expectedTimes) {
+            const d = cap - exp;
+            if (Math.abs(d) < halfBeat) {
+                if (nearest == null || Math.abs(d) < Math.abs(nearest)) nearest = d;
+            }
+        }
+        if (nearest == null) continue;
+        if (bleedSec > 0 && Math.abs(nearest) < bleedSec) {
+            clickThroughDeltas.push(Math.round(nearest * 1000));
+            continue;
+        }
+        deltas.push(nearest);
+    }
+    return { deltas, clickThroughDeltas };
+}
+
+// Pure: median of an array of numbers. Returns null on empty.
+function _ndMedian(arr) {
+    if (!arr || arr.length === 0) return null;
+    const sorted = [...arr].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+}
+
 // Stable-ish key for grouping plays of "the same song" — filename
 // alone collides across arrangements (lead vs bass), so we
 // concatenate filename+arrangement. Falls back to title when
@@ -5556,17 +5629,11 @@ function createNoteDetector(options = {}) {
             }
             const samples = driftBuffer.length;
             const drift = Math.round(driftEstimateMs);
-            const av = (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function')
-                ? (resolveHw() && resolveHw().getAvOffset ? resolveHw().getAvOffset() : 0)
-                : 0;
-            if (samples < _ND_DRIFT_MIN_SAMPLES) {
-                calStatus.textContent = `Need ${_ND_DRIFT_MIN_SAMPLES - samples} more hit(s) before calibration. Current avOffset: ${Math.round(av)}ms.`;
-                calApply.disabled = true;
-            } else {
-                const direction = drift > 0 ? 'late' : drift < 0 ? 'early' : 'on';
-                calStatus.textContent = `Median bias across ${samples} hit(s): ${drift > 0 ? '+' : ''}${drift}ms (${direction}). Current avOffset: ${Math.round(av)}ms. Click Apply to set avOffset → ${Math.round(av) - drift}ms.`;
-                calApply.disabled = false;
-            }
+            const _hwLocal = resolveHw();
+            const av = Math.round((_hwLocal && _hwLocal.getAvOffset ? _hwLocal.getAvOffset() : 0) || 0);
+            const msg = _ndCalRefreshMessage(samples, drift, av, _ND_DRIFT_MIN_SAMPLES);
+            calStatus.textContent = msg.text;
+            calApply.disabled = !msg.applyEnabled;
         };
         const calStatusTimer = setInterval(refreshCalStatus, 500);
         refreshCalStatus();
@@ -6351,56 +6418,28 @@ function createNoteDetector(options = {}) {
         onsetCaptureCallback = null;
         try { clickGain.disconnect(); } catch (e) {}
 
-        // Match each capture to nearest expected click within
-        // ±0.45*beatSec. Outside that window = capture from outside
-        // the click sequence (warm-up pluck, ambient noise, etc).
-        //
-        // Filter out near-zero-delta captures (|delta| < 50ms): if
-        // the user's speakers play the click loud enough that the
-        // bass body resonates and the DI picks it up, the click
-        // itself fires an onset at delta ≈ 0. That's NOT the user's
-        // pluck — including it would pull the median to 0 and the
-        // calibration would silently set avOffset = 0.
-        const deltas = [];
-        // 0.6 × beatSec match window (600ms at 60bpm). Was 0.45 —
-        // reaction time + pipeline latency can exceed 450ms on
-        // some setups; widening to 600ms keeps captures from
-        // adjacent clicks separate (clicks are 1s apart) while
-        // accepting the legitimate full range of pluck timing.
-        const halfBeat = beatSec * 0.6;
-        const clickThroughDeltas = [];  // tracked for diagnostic
-        for (const cap of captures) {
-            let nearest = null;
-            for (const exp of expectedTimes) {
-                const d = cap - exp;
-                if (Math.abs(d) < halfBeat) {
-                    if (nearest == null || Math.abs(d) < Math.abs(nearest)) nearest = d;
-                }
-            }
-            if (nearest == null) continue;
-            if (Math.abs(nearest) < 0.050) {
-                // Likely the click-itself echoing through speakers
-                // → bass body → DI. Not a user pluck.
-                clickThroughDeltas.push(Math.round(nearest * 1000));
-                continue;
-            }
-            deltas.push(nearest);
-        }
+        // Match captures to expected clicks via the pure helper
+        // (tested in test/cal-message.test.js). bleedThresholdSec=0
+        // disables the auto-filter — the previous 50ms bleed filter
+        // killed legitimately-timed plucks for users on headphones
+        // who nailed the click. We surface the count of near-zero
+        // deltas as a diagnostic for the speakers-in-room case but
+        // don't drop them.
+        const matchFraction = 0.6;  // ±600ms window at 60bpm
+        const { deltas, clickThroughDeltas } = _ndMatchCalCaptures(
+            captures, expectedTimes, beatSec, matchFraction, 0,
+        );
 
         if (deltas.length < 3) {
-            const bleed = clickThroughDeltas.length > 0
-                ? ` (also detected ${clickThroughDeltas.length} click-bleed events near 0ms — use headphones to eliminate)`
-                : '';
             return {
                 ok: false,
-                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total). Need 3+. Pluck firmly with each click${bleed}.`,
+                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total within match window). Need 3+. Pluck firmly with each click.`,
                 captures: captures.length,
                 deltas: deltas.map(d => Math.round(d * 1000)),
                 clickThroughDeltas,
             };
         }
-        deltas.sort((a, b) => a - b);
-        const medianSec = deltas[Math.floor(deltas.length / 2)];
+        const medianSec = _ndMedian(deltas);
         const latencyMs = Math.round(medianSec * 1000);
 
         // Apply: avOffset = -latencyMs (click cal measures absolute

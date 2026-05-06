@@ -303,6 +303,12 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         // internal snapshotPlay uses this to produce the song_id
         // primary key for the plays DB.
         currentSongId: sandbox._ndCurrentSongId,
+        // Calibration pure helpers — extracted from the closure so
+        // the messages, match logic, and median math are testable
+        // without booting the full audio pipeline.
+        calRefreshMessage: sandbox._ndCalRefreshMessage,
+        matchCalCaptures: sandbox._ndMatchCalCaptures,
+        median: sandbox._ndMedian,
         scoresFromNotes: sandbox._ndScoresFromNotes,
         computeScoreDeltas: sandbox._ndComputeScoreDeltas,
         findMissClusters: sandbox._ndFindMissClusters,
