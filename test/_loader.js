@@ -309,6 +309,9 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         calRefreshMessage: sandbox._ndCalRefreshMessage,
         matchCalCaptures: sandbox._ndMatchCalCaptures,
         median: sandbox._ndMedian,
+        trimmedMean: sandbox._ndTrimmedMean,
+        driftFromBuffer: sandbox._ndDriftFromBuffer,
+        avOffsetSeed: sandbox._ndAvOffsetSeed,
         // Onset-detector state machine — same logic as processFrame
         // but pure for testability. The live processFrame remains the
         // canonical caller; this exists so test suites can drive

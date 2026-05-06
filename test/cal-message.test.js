@@ -4,7 +4,10 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { loadDetectionCore } = require('./_loader');
 
-const { calRefreshMessage, matchCalCaptures, median } = loadDetectionCore();
+const {
+    calRefreshMessage, matchCalCaptures, median,
+    trimmedMean, driftFromBuffer, avOffsetSeed,
+} = loadDetectionCore();
 
 // ── _ndCalRefreshMessage ──────────────────────────────────────────────
 
@@ -151,4 +154,122 @@ test('median: even length picks middle (lower of two middles)', () => {
 
 test('median: handles negative values', () => {
     assert.strictEqual(median([-100, -50, 0, 50, 100]), 0);
+});
+
+// ── _ndTrimmedMean ────────────────────────────────────────────────────
+
+test('trimmedMean: empty returns null', () => {
+    assert.strictEqual(trimmedMean([], 0.25), null);
+    assert.strictEqual(trimmedMean(null, 0.25), null);
+});
+
+test('trimmedMean: single element returns itself (trim=0)', () => {
+    assert.strictEqual(trimmedMean([42], 0), 42);
+});
+
+test('trimmedMean: 0.25 trim drops bottom and top quarter', () => {
+    // 8 elements, trim = floor(8 * 0.25) = 2 from each end.
+    // Middle 4: [3, 4, 5, 6]. Mean = 4.5.
+    const r = trimmedMean([1, 2, 3, 4, 5, 6, 7, 8], 0.25);
+    assert.strictEqual(r, 4.5);
+});
+
+test('trimmedMean: outlier rejection — single huge value pulled mean is rejected', () => {
+    // 16 hits all around 100, except one outlier at 1000. Mean is
+    // pulled to 156; trimmed mean stays near 100.
+    const data = [98, 99, 100, 100, 100, 100, 100, 100,
+                  100, 100, 100, 100, 101, 102, 103, 1000];
+    const mean = data.reduce((s, v) => s + v, 0) / data.length;
+    assert.ok(mean > 150, `naive mean=${mean} pulled by outlier`);
+    const trimmed = trimmedMean(data, 0.25);
+    assert.ok(trimmed >= 99 && trimmed <= 102,
+        `trimmed mean=${trimmed} stays near true center`);
+});
+
+test('trimmedMean: returns null if would trim everything', () => {
+    // 3 elements with 50% trim = 1 from each end → middle is 1.
+    // OK.
+    assert.notStrictEqual(trimmedMean([1, 2, 3], 0.5), null);
+    // 3 elements with 0.6 trim = floor(1.8)=1 from each end → 1 left
+    assert.strictEqual(trimmedMean([1, 2, 3], 0.6), 2);
+    // 2 elements with 0.5 trim = 1 from each end → 0 left → null
+    assert.strictEqual(trimmedMean([1, 2], 0.5), null);
+});
+
+test('trimmedMean: trim=0 is plain mean', () => {
+    assert.strictEqual(trimmedMean([10, 20, 30], 0), 20);
+});
+
+// ── _ndDriftFromBuffer ────────────────────────────────────────────────
+
+test('driftFromBuffer: empty → 0', () => {
+    assert.strictEqual(driftFromBuffer([], 16), 0);
+    assert.strictEqual(driftFromBuffer(null, 16), 0);
+});
+
+test('driftFromBuffer: small sample uses median', () => {
+    // 4 samples, below the calMin threshold of 16. Median picks
+    // middle (sorted [10,20,30,500]) = 30. Trimmed mean would be
+    // mean([20]) = 20.
+    assert.strictEqual(driftFromBuffer([10, 30, 500, 20], 16), 30);
+});
+
+test('driftFromBuffer: large sample uses trimmed mean', () => {
+    // 16 samples — trim 4 from each end. Sorted ascending.
+    // Sustain-bleed phantom values like -300 dropped, mid 8 kept.
+    const buf = [
+        -300, -250,  // outliers (early)
+        80, 85, 90, 95, 100, 105, 110, 115,
+        120, 125, 130, 135,  // middle 8
+        500, 600,  // outliers (late)
+    ];
+    const r = driftFromBuffer(buf, 16);
+    // Expected: mean of [90,95,100,105,110,115,120,125] = 107.5
+    assert.strictEqual(r, 107.5);
+});
+
+test('driftFromBuffer: at boundary (calMin samples) uses trimmed mean', () => {
+    const buf = [];
+    for (let i = 1; i <= 16; i++) buf.push(i);
+    const r = driftFromBuffer(buf, 16);
+    // Trim 4 from each end → middle is [5..12]. Mean = 8.5.
+    assert.strictEqual(r, 8.5);
+});
+
+test('driftFromBuffer: just below calMin uses median', () => {
+    const buf = [];
+    for (let i = 1; i <= 15; i++) buf.push(i);
+    const r = driftFromBuffer(buf, 16);
+    // Median of 1..15 is 8.
+    assert.strictEqual(r, 8);
+});
+
+// ── _ndAvOffsetSeed ───────────────────────────────────────────────────
+
+test('avOffsetSeed: typical 12ms output latency → -12ms avOffset', () => {
+    // outputLatency is in seconds. 0.012 = 12ms output delay. avOffset
+    // negative to compensate (chart fires earlier so player playing
+    // in time with audio reads as on-time).
+    const r = avOffsetSeed({ outputLatency: 0.012 });
+    assert.strictEqual(r, -12);
+});
+
+test('avOffsetSeed: 50ms latency → -50ms avOffset', () => {
+    assert.strictEqual(avOffsetSeed({ outputLatency: 0.050 }), -50);
+});
+
+test('avOffsetSeed: rounds to nearest int', () => {
+    // 0.0123s = 12.3ms, rounds to -12
+    assert.strictEqual(avOffsetSeed({ outputLatency: 0.0123 }), -12);
+    // 0.0156s = 15.6ms, rounds to -16
+    assert.strictEqual(avOffsetSeed({ outputLatency: 0.0156 }), -16);
+});
+
+test('avOffsetSeed: zero / negative / missing → null', () => {
+    // Don't seed if we don't have useful info — leave avOffset alone.
+    assert.strictEqual(avOffsetSeed({ outputLatency: 0 }), null);
+    assert.strictEqual(avOffsetSeed({ outputLatency: -0.05 }), null);
+    assert.strictEqual(avOffsetSeed({}), null);
+    assert.strictEqual(avOffsetSeed(null), null);
+    assert.strictEqual(avOffsetSeed({ outputLatency: NaN }), null);
 });

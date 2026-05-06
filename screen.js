@@ -193,6 +193,40 @@ const _ndInstances = _ndShared.instances;
 // module-level flag would be reset.)
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
+// Separate localStorage key for "have we ever seeded avOffset from
+// AudioContext.outputLatency for this user?" Once set, never seed
+// again — the user's avOffset is theirs to manage from that point on.
+// Reset by clearing localStorage or via the gear panel "Reset" button.
+const _ND_AVOFFSET_SEEDED_KEY = 'slopsmith_notedetect_avoffset_seeded';
+
+// Pure: compute the seed value for avOffset from AudioContext output
+// latency. Returns ms (negative — chart needs to fire earlier to
+// compensate for output delay reaching the user). Returns null when
+// the input is unusable (no context, missing prop, zero latency).
+function _ndAvOffsetSeed(audioCtxLike) {
+    if (!audioCtxLike) return null;
+    const outputLatency = audioCtxLike.outputLatency;
+    if (typeof outputLatency !== 'number' || !Number.isFinite(outputLatency)) return null;
+    if (outputLatency <= 0) return null;
+    // seconds → ms, negate for compensation
+    return -Math.round(outputLatency * 1000);
+}
+
+function _ndSeedAvOffsetIfFresh(audioCtxLike) {
+    let seeded = false;
+    try { seeded = localStorage.getItem(_ND_AVOFFSET_SEEDED_KEY) === '1'; } catch (e) {}
+    if (seeded) return null;
+    const seedMs = _ndAvOffsetSeed(audioCtxLike);
+    if (seedMs == null) return null;
+    if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+        window.setAvOffsetMs(seedMs);
+    } else {
+        return null;  // no slopsmith setter — bail (sandbox/tests)
+    }
+    try { localStorage.setItem(_ND_AVOFFSET_SEEDED_KEY, '1'); } catch (e) {}
+    console.log(`[note_detect] avOffset seeded from AudioContext.outputLatency: ${seedMs}ms`);
+    return seedMs;
+}
 
 // ── Two-axis scoring thresholds ────────────────────────────────────────────
 //
@@ -1149,6 +1183,45 @@ function _ndStepOnset(rms, nowSec, state, thresholds, opts) {
     return { fireOnset, state: out };
 }
 
+// Pure: trimmed mean of an array. trimFraction=0.25 drops the
+// bottom 25% AND top 25% of values, then averages the middle 50%.
+// Robust against outliers (sustain-bleed phantoms producing huge
+// timingError, warm-up hits before the player settles, brief
+// disturbances that pull the median off-center).
+//
+// Returns null when the input doesn't have enough samples to keep
+// at least one value after trimming. With trimFraction=0.25, that's
+// minimum 3 elements (drops 0 from each end with floor(0.25*3)=0,
+// keeps all 3). For 4+ elements, drops 1 from each end.
+function _ndTrimmedMean(arr, trimFraction) {
+    if (!arr || arr.length === 0) return null;
+    const trim = Math.floor(arr.length * (trimFraction || 0));
+    if (trim * 2 >= arr.length) return null;  // would trim everything
+    const sorted = [...arr].sort((a, b) => a - b);
+    const middle = sorted.slice(trim, sorted.length - trim);
+    if (middle.length === 0) return null;
+    const sum = middle.reduce((s, v) => s + v, 0);
+    return sum / middle.length;
+}
+
+// Pure: best single-number drift estimate. Uses trimmed mean (drops
+// outliers) when the buffer is big enough, falls back to median for
+// small samples. Used by both the calibration apply path AND the
+// rolling estimator that drives proactive coaching.
+function _ndDriftFromBuffer(buf, calMinSamples) {
+    if (!buf || buf.length === 0) return 0;
+    const calMin = calMinSamples || 16;
+    if (buf.length >= calMin) {
+        // Stable trimmed mean of middle 50%.
+        const t = _ndTrimmedMean(buf, 0.25);
+        return t == null ? 0 : t;
+    }
+    // Small-sample regime: median is more robust than mean against
+    // single outliers when n < 16.
+    const m = _ndMedian(buf);
+    return m == null ? 0 : m;
+}
+
 // Pure: median of an array of numbers. Returns null on empty.
 function _ndMedian(arr) {
     if (!arr || arr.length === 0) return null;
@@ -1214,8 +1287,16 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 // pause/resume, or per-song processing latency. Median is robust:
 // a single outlier doesn't move the estimate. Window of 8 picks up
 // tempo wobble within ~10 s without locking onto a single bad hit.
-const _ND_DRIFT_WINDOW = 8;
+const _ND_DRIFT_WINDOW = 32;
+// Smallest buffer size that yields a meaningful single-number drift
+// estimate. Used by the proactive coaching hint and the HUD's
+// drift-status line — surfaces "you've been ~80ms late" after 4+ hits.
 const _ND_DRIFT_MIN_SAMPLES = 4;
+// Calibration apply threshold. Larger than the coaching threshold so
+// "Calibrate from this play" reflects a stable, high-confidence
+// median across many hits — not 4 noisy initial reads. Trimmed mean
+// of middle 50% kicks in at this size for outlier rejection.
+const _ND_CAL_MIN_SAMPLES = 16;
 // Drift-significance threshold. Used by the HUD to color the live
 // drift line amber (above) vs green (within), and by the proactive
 // coaching hint (half-threshold) to decide when to surface "play X
@@ -3058,12 +3139,6 @@ function createNoteDetector(options = {}) {
     // buffer reset (needs 4 more hits to trigger again) plus the
     // 50ms threshold (small offsets don't oscillate). Removed
     // autoCalApplied entirely.
-    // Click-track calibration capture hook. processFrame's onset
-    // firing path calls this with audioCtx.currentTime when set.
-    // Null when no calibration is active so the production path has
-    // zero overhead.
-    let onsetCaptureCallback = null;
-
     // Onset state. inNote tracks the RMS-envelope hysteresis;
     // reattackRmsBuf is the rolling RMS history used by the re-attack
     // trigger to detect a fresh pluck during sustain.
@@ -3741,6 +3816,17 @@ function createNoteDetector(options = {}) {
                 latencyHint: 'interactive',
             });
 
+            // First-load avOffset seed from AudioContext.outputLatency.
+            // Browser-reported audio output delay (seconds) → avOffset
+            // in ms with negative sign for compensation. Only fires
+            // ONCE per browser session-key (localStorage flag) so
+            // subsequent enables / song switches don't re-seed over
+            // the user's manual tuning. Bypasses entirely if the user
+            // has explicitly touched avOffset before (avOffsetExplicit
+            // flag set by the cal Apply button or [/]+key handler if
+            // that becomes pluggable).
+            try { _ndSeedAvOffsetIfFresh(audioCtx); } catch (e) { /* non-fatal */ }
+
             sourceNode = audioCtx.createMediaStreamSource(stream);
             const streamChannels = sourceNode.channelCount;
 
@@ -3795,18 +3881,7 @@ function createNoteDetector(options = {}) {
                 // pluck rather than body-peak resonance from the
                 // ongoing note.
                 //
-                // Calibration override: when a click-track calibration
-                // is running, force reattackArmed=true on every frame.
-                // 60bpm plucks on bass don't always decay below the
-                // rearm threshold (0.008) between plucks — sustain
-                // keeps inNote=true and reattackArmed=false, so only
-                // the FIRST pluck fires and 7 subsequent plucks get
-                // dropped. During cal we ONLY care about each pluck's
-                // ratio-spike vs the recent baseline; the rearm gate
-                // is in-song noise protection that doesn't apply.
-                if (rms < _ND_REATTACK_REARM_LEVEL || onsetCaptureCallback) {
-                    reattackArmed = true;
-                }
+                if (rms < _ND_REATTACK_REARM_LEVEL) reattackArmed = true;
 
                 let fireOnset = false;
                 // Trigger 1: silence → playing (fresh note after rest).
@@ -3845,15 +3920,6 @@ function createNoteDetector(options = {}) {
                     lastOnsetPerfSec = nowSec;
                     reattackArmed = false;
                     onsetCount++;
-                    // Click-track calibration hook: when a calibration
-                    // run is active, snapshot the audioCtx time at the
-                    // moment the onset fires. Used to compute latency
-                    // = onset_ctx_time - expected_click_ctx_time.
-                    if (onsetCaptureCallback) {
-                        try {
-                            onsetCaptureCallback(audioCtx ? audioCtx.currentTime : nowSec);
-                        } catch (e) { /* swallow — capture is best-effort */ }
-                    }
                     // Stamp the onset's chart-time so processFrame
                     // can gate matchNotes on it (the post-port
                     // architectural fix). Compensate backwards by
@@ -4413,11 +4479,9 @@ function createNoteDetector(options = {}) {
         driftBuffer.push(timingErrorMs);
         if (driftBuffer.length > _ND_DRIFT_WINDOW) driftBuffer.shift();
         if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES) {
-            const sorted = driftBuffer.slice().sort((a, b) => a - b);
-            const mid = Math.floor(sorted.length / 2);
-            driftEstimateMs = sorted.length % 2 === 0
-                ? (sorted[mid - 1] + sorted[mid]) / 2
-                : sorted[mid];
+            // Trimmed mean of middle 50% when buffer ≥ _ND_CAL_MIN_SAMPLES;
+            // median for small samples (more robust at low n).
+            driftEstimateMs = _ndDriftFromBuffer(driftBuffer, _ND_CAL_MIN_SAMPLES);
         }
         // Auto-cal disabled — was running away to ±900ms in live play.
         //
@@ -5469,26 +5533,20 @@ function createNoteDetector(options = {}) {
             <div class="bg-dark-800 border border-blue-700/40 rounded p-2 mb-3 text-[11px]">
                 <div class="font-semibold text-blue-300 mb-1">A/V Calibration</div>
                 <div class="text-[10px] text-gray-500 mb-1.5 leading-snug">
-                    Measures audio-pipeline latency (output → ear → pluck → input).
-                    Visual highway alignment is separate.
+                    Trimmed mean of middle 50% across recent in-song hits.
+                    Visual alignment cal is separate (below).
                 </div>
                 <div id="nd-cal-status" class="text-gray-400 text-[10px] mb-1.5 leading-snug">
-                    Play 4+ notes through the chart, then click Apply to push the median timing offset into avOffset.
+                    Play through the chart — 16+ hits builds a stable bias estimate.
                 </div>
                 <div class="flex gap-1.5 mb-2">
                     <button class="nd-cal-apply flex-1 px-2 py-1 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed rounded text-[11px] text-white">
-                        Apply latency from recent hits
+                        Calibrate from this play
                     </button>
                     <button class="nd-cal-reset px-2 py-1 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300" title="Reset avOffset to 0">
                         Reset
                     </button>
                 </div>
-                <div class="flex gap-1.5">
-                    <button class="nd-cal-clicks flex-1 px-2 py-1 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 disabled:cursor-not-allowed rounded text-[11px] text-white" title="Plays 8 audible clicks at 60bpm; pluck along with each. Headphones recommended.">
-                        Calibrate with click track
-                    </button>
-                </div>
-                <div id="nd-cal-clicks-status" class="text-gray-500 text-[10px] mt-1.5 leading-snug"></div>
             </div>
 
             <div class="bg-dark-700 border border-gray-700 rounded p-2 mb-3 text-[11px] text-gray-300 leading-snug">
@@ -5688,7 +5746,7 @@ function createNoteDetector(options = {}) {
             const drift = Math.round(driftEstimateMs);
             const _hwLocal = resolveHw();
             const av = Math.round((_hwLocal && _hwLocal.getAvOffset ? _hwLocal.getAvOffset() : 0) || 0);
-            const msg = _ndCalRefreshMessage(samples, drift, av, _ND_DRIFT_MIN_SAMPLES);
+            const msg = _ndCalRefreshMessage(samples, drift, av, _ND_CAL_MIN_SAMPLES);
             calStatus.textContent = msg.text;
             calApply.disabled = !msg.applyEnabled;
         };
@@ -5696,7 +5754,7 @@ function createNoteDetector(options = {}) {
         refreshCalStatus();
 
         calApply.onclick = () => {
-            if (driftBuffer.length < _ND_DRIFT_MIN_SAMPLES) return;
+            if (driftBuffer.length < _ND_CAL_MIN_SAMPLES) return;
             const drift = driftEstimateMs;
             const _hw = resolveHw();
             const prev = (_hw && _hw.getAvOffset) ? (_hw.getAvOffset() || 0) : 0;
@@ -5718,31 +5776,15 @@ function createNoteDetector(options = {}) {
                 const _hw = resolveHw();
                 if (_hw && _hw.setAvOffset) _hw.setAvOffset(0);
             }
-            console.log('[note_detect] avOffset reset to 0');
+            // Clear the auto-seed flag so the next audio-context
+            // creation seeds avOffset fresh from the current
+            // outputLatency. Useful if the user wants to recalibrate
+            // a different audio device.
+            try { localStorage.removeItem(_ND_AVOFFSET_SEEDED_KEY); } catch (e) {}
+            console.log('[note_detect] avOffset reset to 0; auto-seed flag cleared');
             refreshCalStatus();
         };
 
-        // Click-track calibration: independent measurement, doesn't
-        // need a song loaded.
-        const calClicks = panel.querySelector('.nd-cal-clicks');
-        const calClicksStatus = panel.querySelector('#nd-cal-clicks-status');
-        calClicks.onclick = async () => {
-            if (calClicks.disabled) return;
-            if (!enabled) {
-                calClicksStatus.innerHTML = '<span class="text-orange-400">Enable Detect first.</span>';
-                return;
-            }
-            calClicks.disabled = true;
-            calClicksStatus.innerHTML = '<span class="text-blue-300">Get ready — 8 clicks at 60bpm. Pluck with each click.</span>';
-            const result = await calibrateLatencyWithClicks();
-            calClicks.disabled = false;
-            if (!result.ok) {
-                calClicksStatus.innerHTML = `<span class="text-orange-400">Failed: ${result.reason}</span>`;
-            } else {
-                calClicksStatus.innerHTML = `<span class="text-green-400">Set avOffset to ${result.avOffsetAfter}ms (latency ${result.latencyMs}ms across ${result.samples} plucks).</span>`;
-                refreshCalStatus();
-            }
-        };
         // Tolerance/hit-threshold sliders are gone — those four values
         // are now the fixed _ND_DETECTION_* / _ND_PRECISION_* constants
         // displayed read-only above. The strictness preset abstraction
@@ -6413,134 +6455,6 @@ function createNoteDetector(options = {}) {
                 if (skipBtn) skipBtn.classList.remove('bg-blue-700');
             }, 200);
         }
-    }
-
-    // ── Click-track calibration ────────────────────────────────────────
-    // User plays 8 plucks along with audible 60bpm clicks. Captures
-    // onset audioCtx.currentTime stamps, matches each to the nearest
-    // expected click time, computes median delta, applies as avOffset.
-    // Independent of song/chart — works as long as detect is on (so
-    // the onset detector is running).
-    //
-    // Headphones recommended: if the click track is heard by the
-    // bass-rig mic, the click itself triggers onsets and corrupts
-    // the measurement. Most users running through DI are fine since
-    // their input doesn't pick up speakers; explicit warning in the
-    // settings UI either way.
-    async function calibrateLatencyWithClicks(opts = {}) {
-        const N_CLICKS = opts.numClicks || 8;
-        const BPM = opts.bpm || 60;
-        const PREP_SEC = opts.prepSec || 1.5;
-        const beatSec = 60 / BPM;
-        if (!enabled) {
-            return { ok: false, reason: 'detect not enabled — click Detect first' };
-        }
-        if (!audioCtx) {
-            return { ok: false, reason: 'no audio context' };
-        }
-
-        const startCtxT = audioCtx.currentTime + PREP_SEC;
-        const expectedTimes = [];
-
-        // Schedule clicks: short square-wave bursts with envelope.
-        // 1 kHz frequency, 30 ms attack, 30 ms decay — short and
-        // bright so it doesn't bleed into the pluck window.
-        const clickGain = audioCtx.createGain();
-        clickGain.gain.value = 0;
-        clickGain.connect(audioCtx.destination);
-        for (let i = 0; i < N_CLICKS; i++) {
-            const t = startCtxT + i * beatSec;
-            expectedTimes.push(t);
-            const osc = audioCtx.createOscillator();
-            osc.type = 'square';
-            osc.frequency.value = 1000;
-            osc.connect(clickGain);
-            // Envelope: silence → 0.4 over 5ms, hold 20ms, decay over 25ms.
-            // Short enough that the click finishes well before the player's
-            // pluck window opens.
-            clickGain.gain.setValueAtTime(0, t);
-            clickGain.gain.linearRampToValueAtTime(0.4, t + 0.005);
-            clickGain.gain.setValueAtTime(0.4, t + 0.025);
-            clickGain.gain.linearRampToValueAtTime(0, t + 0.05);
-            osc.start(t);
-            osc.stop(t + 0.06);
-        }
-
-        // Capture onsets while clicks play (+ 0.5s tail for the last
-        // pluck to register).
-        const captures = [];
-        onsetCaptureCallback = (ctxT) => captures.push(ctxT);
-        const totalSec = PREP_SEC + N_CLICKS * beatSec + 0.5;
-        await new Promise(r => setTimeout(r, totalSec * 1000));
-        onsetCaptureCallback = null;
-        try { clickGain.disconnect(); } catch (e) {}
-
-        // Match captures to expected clicks via the pure helper
-        // (tested in test/cal-message.test.js). bleedThresholdSec=0
-        // disables the auto-filter — the previous 50ms bleed filter
-        // killed legitimately-timed plucks for users on headphones
-        // who nailed the click. We surface the count of near-zero
-        // deltas as a diagnostic for the speakers-in-room case but
-        // don't drop them.
-        const matchFraction = 0.6;  // ±600ms window at 60bpm
-        const { deltas, clickThroughDeltas } = _ndMatchCalCaptures(
-            captures, expectedTimes, beatSec, matchFraction, 0,
-        );
-
-        if (deltas.length < 3) {
-            // Diagnostic: if captures < N_CLICKS, the onset detector
-            // didn't fire on most plucks. Most likely cause: plucks
-            // were too quiet to clear the 1.5× ratio gate against
-            // sustain. Tell the user explicitly so they don't burn
-            // another retry guessing.
-            const undercount = captures.length < N_CLICKS;
-            const hint = undercount
-                ? ` Only ${captures.length} of ${N_CLICKS} clicks registered an onset — pluck more firmly so each attack rises ≥1.5× above the sustain RMS.`
-                : '';
-            return {
-                ok: false,
-                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total within match window). Need 3+.${hint}`,
-                captures: captures.length,
-                deltas: deltas.map(d => Math.round(d * 1000)),
-                clickThroughDeltas,
-            };
-        }
-        const medianSec = _ndMedian(deltas);
-        const latencyMs = Math.round(medianSec * 1000);
-
-        // Apply: avOffset = -latencyMs (click cal measures absolute
-        // pipeline latency in audio-context time, independent of any
-        // prior avOffset. To compensate, the chart needs to fire
-        // earlier in audio time so the player's onset (which arrives
-        // latencyMs late) matches the chart-time of the intended note.
-        // Sign trace:
-        //   click at ctx_time T → user plucks at T+L → onset cap = T+L
-        //   matcher: tRaw = song_time + avOffset
-        //   for player playing on the beat: song_time at onset = X+L
-        //   want timingError = (X+L) + avOffset - X = 0 → avOffset = -L
-        // SETs (not adds) since L is the absolute physical latency,
-        // not a delta on top of existing manual tuning.
-        const _hw = resolveHw();
-        const prev = (_hw && _hw.getAvOffset) ? (_hw.getAvOffset() || 0) : 0;
-        const next = -latencyMs;
-        if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
-            window.setAvOffsetMs(next);
-        } else if (_hw && typeof _hw.setAvOffset === 'function') {
-            _hw.setAvOffset(next);
-        }
-        // Wipe the drift estimator so subsequent in-song hits read
-        // post-cal alignment.
-        driftBuffer = [];
-        driftEstimateMs = 0;
-
-        return {
-            ok: true,
-            latencyMs,
-            samples: deltas.length,
-            captures: captures.length,
-            avOffsetBefore: Math.round(prev),
-            avOffsetAfter: Math.round(next),
-        };
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
@@ -9416,9 +9330,6 @@ function createNoteDetector(options = {}) {
         // Unit UX-skip-intro — same rationale; programmatic skip-to-
         // first-note for callers that bypass the button.
         skipToFirstNote,
-        // Click-track calibration — exposed so test scripts or other
-        // plugins can trigger calibration programmatically.
-        calibrateLatencyWithClicks,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
