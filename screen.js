@@ -1086,14 +1086,13 @@ const _ND_LOOP_RESTART_REFRACTORY_SEC = 1.5;
 // tempo wobble within ~10 s without locking onto a single bad hit.
 const _ND_DRIFT_WINDOW = 8;
 const _ND_DRIFT_MIN_SAMPLES = 4;
-// Auto-calibration: when the drift estimator stabilizes with the
-// full window AND the magnitude exceeds this threshold, push the
-// drift into avOffset so it's actually compensated (instead of just
-// shifting the matcher's search center). 50 ms is the precision-zone
-// boundary — below that the player perceives "good timing" and we
-// shouldn't move the goalposts. Above that they're systematically
-// off in a way the drift estimator confidently sees.
-const _ND_AUTO_CAL_THRESHOLD_MS = 50;
+// Drift-significance threshold. Used by the HUD to color the live
+// drift line amber (above) vs green (within), and by the proactive
+// coaching hint (half-threshold) to decide when to surface "play X
+// ms earlier" hints near upcoming notes. 50ms = the precision-zone
+// boundary; below that the player perceives "good timing" and we
+// don't pester them.
+const _ND_DRIFT_SIGNIFICANT_MS = 50;
 
 // Stability voting. YIN's first ~100ms after a fresh pluck is
 // transient-jittery — a bass D2 might bounce D1 → D2 → A1 → D2
@@ -4269,15 +4268,6 @@ function createNoteDetector(options = {}) {
     // aren't influenced by a tiny sample.
     function updateDriftEstimate(timingErrorMs) {
         if (typeof timingErrorMs !== 'number' || !Number.isFinite(timingErrorMs)) return;
-        // Outlier filter: a single hit with raw timingError > the
-        // wide threshold (300ms) is almost always a misattribution
-        // (sustain bleed phantom, wrong-note match) rather than the
-        // player's true bias. Feeding it to the rolling-median
-        // estimator can spiral the matcher's search center if the
-        // estimator and search are coupled. Reject anything outside
-        // ±400ms (a bit past the wide threshold to allow real-but-
-        // edge-of-zone hits through).
-        if (Math.abs(timingErrorMs) > 400) return;
         driftBuffer.push(timingErrorMs);
         if (driftBuffer.length > _ND_DRIFT_WINDOW) driftBuffer.shift();
         if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES) {
@@ -4286,15 +4276,6 @@ function createNoteDetector(options = {}) {
             driftEstimateMs = sorted.length % 2 === 0
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
-            // Defensive clamp: a +/- 300ms drift is the maximum that
-            // makes physical sense for input latency. Anything past
-            // this implies a bug elsewhere; clamping here prevents a
-            // future regression from spiraling the matcher's search
-            // center to absurd offsets like the -4500ms observed in
-            // an earlier drift-comp-scoring experiment.
-            const DRIFT_CLAMP_MS = 300;
-            if (driftEstimateMs > DRIFT_CLAMP_MS) driftEstimateMs = DRIFT_CLAMP_MS;
-            else if (driftEstimateMs < -DRIFT_CLAMP_MS) driftEstimateMs = -DRIFT_CLAMP_MS;
         }
         // Auto-cal disabled — was running away to ±900ms in live play.
         //
@@ -5824,7 +5805,7 @@ function createNoteDetector(options = {}) {
             } else {
                 const d = Math.round(driftEstimateMs);
                 const direction = d > 0 ? 'LATE' : d < 0 ? 'EARLY' : 'OK';
-                const aboveThreshold = Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS;
+                const aboveThreshold = Math.abs(d) > _ND_DRIFT_SIGNIFICANT_MS;
                 const color = aboveThreshold ? '#f59e0b' : '#10b981';
                 const cal = aboveThreshold ? ' · open ⚙ to calibrate' : '';
                 timingEl.innerHTML = `<span style="color:${color}">${direction} ${d > 0 ? '+' : ''}${d}ms${cal}</span>`;
@@ -6045,7 +6026,7 @@ function createNoteDetector(options = {}) {
         // the lookahead window (next ~2.5s) so the user has time
         // to read and act.
         const driftHintMs = (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
-                              && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS / 2)
+                              && Math.abs(driftEstimateMs) > _ND_DRIFT_SIGNIFICANT_MS / 2)
             ? driftEstimateMs : 0;
 
         if (notes) {
@@ -6361,8 +6342,21 @@ function createNoteDetector(options = {}) {
         // Match each capture to nearest expected click within
         // ±0.45*beatSec. Outside that window = capture from outside
         // the click sequence (warm-up pluck, ambient noise, etc).
+        //
+        // Filter out near-zero-delta captures (|delta| < 50ms): if
+        // the user's speakers play the click loud enough that the
+        // bass body resonates and the DI picks it up, the click
+        // itself fires an onset at delta ≈ 0. That's NOT the user's
+        // pluck — including it would pull the median to 0 and the
+        // calibration would silently set avOffset = 0.
         const deltas = [];
-        const halfBeat = beatSec * 0.45;
+        // 0.6 × beatSec match window (600ms at 60bpm). Was 0.45 —
+        // reaction time + pipeline latency can exceed 450ms on
+        // some setups; widening to 600ms keeps captures from
+        // adjacent clicks separate (clicks are 1s apart) while
+        // accepting the legitimate full range of pluck timing.
+        const halfBeat = beatSec * 0.6;
+        const clickThroughDeltas = [];  // tracked for diagnostic
         for (const cap of captures) {
             let nearest = null;
             for (const exp of expectedTimes) {
@@ -6371,14 +6365,26 @@ function createNoteDetector(options = {}) {
                     if (nearest == null || Math.abs(d) < Math.abs(nearest)) nearest = d;
                 }
             }
-            if (nearest != null) deltas.push(nearest);
+            if (nearest == null) continue;
+            if (Math.abs(nearest) < 0.050) {
+                // Likely the click-itself echoing through speakers
+                // → bass body → DI. Not a user pluck.
+                clickThroughDeltas.push(Math.round(nearest * 1000));
+                continue;
+            }
+            deltas.push(nearest);
         }
 
-        if (deltas.length < 4) {
+        if (deltas.length < 3) {
+            const bleed = clickThroughDeltas.length > 0
+                ? ` (also detected ${clickThroughDeltas.length} click-bleed events near 0ms — use headphones to eliminate)`
+                : '';
             return {
                 ok: false,
-                reason: `only ${deltas.length} usable plucks — need at least 4. Try again, plucking exactly with each click.`,
+                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total). Need 3+. Pluck firmly with each click${bleed}.`,
                 captures: captures.length,
+                deltas: deltas.map(d => Math.round(d * 1000)),
+                clickThroughDeltas,
             };
         }
         deltas.sort((a, b) => a - b);
