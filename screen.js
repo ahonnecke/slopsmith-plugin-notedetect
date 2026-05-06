@@ -1092,6 +1092,63 @@ function _ndMatchCalCaptures(captures, expectedTimes, beatSec, matchFraction, bl
     return { deltas, clickThroughDeltas };
 }
 
+// Pure onset-detector state machine. Same logic as inside
+// processFrame but extractable so the click-track-specific override
+// (reattackArmed forced true during calibration) can be tested
+// without booting the audio pipeline. The live processFrame remains
+// the canonical caller; this function exists so test suites can
+// assert that calibration-mode behavior actually fires for
+// realistic bass-sustain RMS patterns.
+//
+// state: {
+//   inNote, lastOnsetPerfSec, reattackArmed, rmsBuf, onsetCount
+// }
+// thresholds: {
+//   onsetLevel, exitLevel, rearmLevel,
+//   reattackMinLevel, reattackRatio, refractorySec, rmsBufWindow
+// }
+// opts: { isCalibrating: bool }
+//
+// Returns: { fireOnset: bool, state: {...new state...} }
+function _ndStepOnset(rms, nowSec, state, thresholds, opts) {
+    const t = thresholds;
+    const isCal = !!(opts && opts.isCalibrating);
+    // Copy state so callers see immutable transition.
+    const out = {
+        inNote: state.inNote,
+        lastOnsetPerfSec: state.lastOnsetPerfSec,
+        reattackArmed: state.reattackArmed,
+        rmsBuf: state.rmsBuf.slice(),
+        onsetCount: state.onsetCount || 0,
+    };
+    out.rmsBuf.push(rms);
+    if (out.rmsBuf.length > t.rmsBufWindow) out.rmsBuf.shift();
+
+    const refractoryOk = (nowSec - out.lastOnsetPerfSec) > t.refractorySec;
+    if (rms < t.rearmLevel || isCal) out.reattackArmed = true;
+
+    let fireOnset = false;
+    if (rms > t.onsetLevel && !out.inNote && refractoryOk) {
+        out.inNote = true;
+        fireOnset = true;
+    } else if (out.inNote && refractoryOk && out.reattackArmed
+               && rms > t.reattackMinLevel
+               && out.rmsBuf.length >= 3) {
+        const recentMin = Math.min(...out.rmsBuf.slice(0, -1));
+        if (rms > recentMin * t.reattackRatio) fireOnset = true;
+    } else if (rms < t.exitLevel) {
+        out.inNote = false;
+    }
+
+    if (fireOnset) {
+        out.lastOnsetPerfSec = nowSec;
+        out.reattackArmed = false;
+        out.onsetCount += 1;
+    }
+
+    return { fireOnset, state: out };
+}
+
 // Pure: median of an array of numbers. Returns null on empty.
 function _ndMedian(arr) {
     if (!arr || arr.length === 0) return null;
@@ -6431,9 +6488,18 @@ function createNoteDetector(options = {}) {
         );
 
         if (deltas.length < 3) {
+            // Diagnostic: if captures < N_CLICKS, the onset detector
+            // didn't fire on most plucks. Most likely cause: plucks
+            // were too quiet to clear the 1.5× ratio gate against
+            // sustain. Tell the user explicitly so they don't burn
+            // another retry guessing.
+            const undercount = captures.length < N_CLICKS;
+            const hint = undercount
+                ? ` Only ${captures.length} of ${N_CLICKS} clicks registered an onset — pluck more firmly so each attack rises ≥1.5× above the sustain RMS.`
+                : '';
             return {
                 ok: false,
-                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total within match window). Need 3+. Pluck firmly with each click.`,
+                reason: `only ${deltas.length} usable plucks (captured ${captures.length} onsets total within match window). Need 3+.${hint}`,
                 captures: captures.length,
                 deltas: deltas.map(d => Math.round(d * 1000)),
                 clickThroughDeltas,

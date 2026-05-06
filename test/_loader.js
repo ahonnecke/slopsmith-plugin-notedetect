@@ -309,6 +309,12 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         calRefreshMessage: sandbox._ndCalRefreshMessage,
         matchCalCaptures: sandbox._ndMatchCalCaptures,
         median: sandbox._ndMedian,
+        // Onset-detector state machine — same logic as processFrame
+        // but pure for testability. The live processFrame remains the
+        // canonical caller; this exists so test suites can drive
+        // the click-track scenario (8 plucks at 60bpm with sustain
+        // above the rearm threshold) without an AudioContext.
+        stepOnset: sandbox._ndStepOnset,
         scoresFromNotes: sandbox._ndScoresFromNotes,
         computeScoreDeltas: sandbox._ndComputeScoreDeltas,
         findMissClusters: sandbox._ndFindMissClusters,
