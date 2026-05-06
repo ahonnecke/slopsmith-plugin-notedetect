@@ -5534,7 +5534,7 @@ function createNoteDetector(options = {}) {
                 <div class="font-semibold text-blue-300 mb-1">A/V Calibration</div>
                 <div class="text-[10px] text-gray-500 mb-1.5 leading-snug">
                     Trimmed mean of middle 50% across recent in-song hits.
-                    Visual alignment cal is separate (below).
+                    Visual sync cal is separate (below).
                 </div>
                 <div id="nd-cal-status" class="text-gray-400 text-[10px] mb-1.5 leading-snug">
                     Play through the chart — 16+ hits builds a stable bias estimate.
@@ -5546,6 +5546,19 @@ function createNoteDetector(options = {}) {
                     <button class="nd-cal-reset px-2 py-1 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300" title="Reset avOffset to 0">
                         Reset
                     </button>
+                </div>
+                <div class="border-t border-gray-700 pt-2 mt-1">
+                    <div class="text-[10px] text-gray-500 mb-1.5 leading-snug">
+                        Visual sync: align the audible click with the visual flash.
+                        Use ± buttons until they feel simultaneous.
+                    </div>
+                    <button class="nd-visual-cal w-full px-2 py-1 bg-purple-700 hover:bg-purple-600 rounded text-[11px] text-white">
+                        Open visual sync calibration
+                    </button>
+                </div>
+                <div class="border-t border-gray-700 pt-2 mt-2 text-[10px] font-mono text-gray-500">
+                    <div class="text-gray-400 text-[10px] font-sans mb-1">Diagnostics</div>
+                    <div id="nd-cal-diag" class="leading-relaxed"></div>
                 </div>
             </div>
 
@@ -5749,6 +5762,22 @@ function createNoteDetector(options = {}) {
             const msg = _ndCalRefreshMessage(samples, drift, av, _ND_CAL_MIN_SAMPLES);
             calStatus.textContent = msg.text;
             calApply.disabled = !msg.applyEnabled;
+
+            // Diagnostic readout: browser-reported audio latency,
+            // current drift, calibration source-of-truth values.
+            const diagEl = panel.querySelector('#nd-cal-diag');
+            if (diagEl) {
+                const baseLat = audioCtx && Number.isFinite(audioCtx.baseLatency)
+                    ? Math.round(audioCtx.baseLatency * 1000) : '—';
+                const outLat = audioCtx && Number.isFinite(audioCtx.outputLatency)
+                    ? Math.round(audioCtx.outputLatency * 1000) : '—';
+                const sr = audioCtx && Number.isFinite(audioCtx.sampleRate)
+                    ? audioCtx.sampleRate : '—';
+                diagEl.innerHTML =
+                    `audioCtx.baseLatency: ${baseLat}ms · outputLatency: ${outLat}ms<br>` +
+                    `sampleRate: ${sr}Hz · drift samples: ${samples} / ${_ND_DRIFT_WINDOW}<br>` +
+                    `current drift: ${drift > 0 ? '+' : ''}${drift}ms · avOffset: ${av}ms · method: ${detectionMethod}`;
+            }
         };
         const calStatusTimer = setInterval(refreshCalStatus, 500);
         refreshCalStatus();
@@ -5769,6 +5798,9 @@ function createNoteDetector(options = {}) {
             console.log(`[note_detect] manual cal: drift=${Math.round(drift)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms`);
             refreshCalStatus();
         };
+        const visualCalBtn = panel.querySelector('.nd-visual-cal');
+        if (visualCalBtn) visualCalBtn.onclick = () => openVisualCalModal();
+
         calReset.onclick = () => {
             if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
                 window.setAvOffsetMs(0);
@@ -6455,6 +6487,147 @@ function createNoteDetector(options = {}) {
                 if (skipBtn) skipBtn.classList.remove('bg-blue-700');
             }, 200);
         }
+    }
+
+    // ── Visual sync calibration modal ─────────────────────────────────
+    // User adjusts avOffset until they perceive an audible click and
+    // a visual flash as simultaneous on their setup. avOffset shifts
+    // the visual flash relative to the click; the user dials it in.
+    //
+    // Discrete buttons (-50/-5/+5/+50) instead of slider per user
+    // request — keystroke / +1ms granularity is too fine to feel a
+    // difference, slider drag overshoots.
+    //
+    // Loop: every 2 seconds, schedule a click at ctxT and a flash at
+    // (ctxT + avOffsetSec) on the wall clock. User adjusts avOffset
+    // → flash timing shifts relative to click → they tune to taste.
+    function openVisualCalModal() {
+        if (!audioCtx) {
+            console.warn('[note_detect] visual cal: no AudioContext yet — enable Detect first');
+            return;
+        }
+        const overlay = document.createElement('div');
+        overlay.id = 'nd-vcal-modal';
+        overlay.className = 'fixed inset-0 z-[300] bg-black/85 flex items-center justify-center';
+        overlay.innerHTML = `
+            <div class="bg-dark-800 border border-purple-700 rounded-2xl p-6 w-[400px] max-w-[90vw]">
+                <div class="text-purple-300 font-semibold text-lg mb-2">Visual Sync Calibration</div>
+                <div class="text-gray-400 text-xs mb-4 leading-snug">
+                    A click plays with a flash every 2 seconds. Adjust avOffset
+                    until the click and flash feel simultaneous. The same
+                    avOffset is used for chart-time matching during play.
+                </div>
+                <div class="flex justify-center mb-5 h-32 items-center">
+                    <div class="nd-vcal-flash w-28 h-28 rounded-full bg-gray-700 transition-colors duration-75"
+                         style="box-shadow: 0 0 20px rgba(168, 85, 247, 0.0);"></div>
+                </div>
+                <div class="text-center mb-3">
+                    <div class="text-gray-300 text-xs">avOffset</div>
+                    <div class="nd-vcal-value font-mono text-2xl text-purple-300">0ms</div>
+                    <div class="text-gray-600 text-[10px] mt-1">
+                        negative = chart visual leads audio (compensates output delay)
+                    </div>
+                </div>
+                <div class="grid grid-cols-4 gap-2 mb-3">
+                    <button class="nd-vcal-btn px-2 py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs font-mono" data-delta="-50">−50ms</button>
+                    <button class="nd-vcal-btn px-2 py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs font-mono" data-delta="-5">−5ms</button>
+                    <button class="nd-vcal-btn px-2 py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs font-mono" data-delta="5">+5ms</button>
+                    <button class="nd-vcal-btn px-2 py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs font-mono" data-delta="50">+50ms</button>
+                </div>
+                <button class="nd-vcal-close w-full px-2 py-2 bg-purple-700 hover:bg-purple-600 rounded text-sm text-white">
+                    Done
+                </button>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const flashEl = overlay.querySelector('.nd-vcal-flash');
+        const valueEl = overlay.querySelector('.nd-vcal-value');
+
+        const readAv = () => {
+            const _hw = resolveHw();
+            return (_hw && _hw.getAvOffset) ? Math.round(_hw.getAvOffset() || 0) : 0;
+        };
+        const refreshValue = () => {
+            const av = readAv();
+            valueEl.textContent = (av > 0 ? '+' : '') + av + 'ms';
+        };
+        refreshValue();
+
+        overlay.querySelectorAll('.nd-vcal-btn').forEach(btn => {
+            btn.onclick = () => {
+                const delta = parseInt(btn.dataset.delta, 10);
+                const next = readAv() + delta;
+                if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+                    window.setAvOffsetMs(next);
+                } else {
+                    const _hw = resolveHw();
+                    if (_hw && _hw.setAvOffset) _hw.setAvOffset(next);
+                }
+                refreshValue();
+            };
+        });
+
+        let stopped = false;
+        const stop = () => {
+            stopped = true;
+            overlay.remove();
+        };
+        overlay.querySelector('.nd-vcal-close').onclick = stop;
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) stop(); });
+
+        // The loop: schedule click + flash. Reschedule every 2s.
+        const beatSec = 2.0;
+        const fireOne = (ctxT) => {
+            if (stopped) return;
+            // Schedule click via Web Audio.
+            const clickGain = audioCtx.createGain();
+            clickGain.gain.value = 0;
+            clickGain.connect(audioCtx.destination);
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sine';
+            osc.frequency.value = 880;
+            osc.connect(clickGain);
+            clickGain.gain.setValueAtTime(0, ctxT);
+            clickGain.gain.linearRampToValueAtTime(0.3, ctxT + 0.005);
+            clickGain.gain.linearRampToValueAtTime(0, ctxT + 0.06);
+            osc.start(ctxT);
+            osc.stop(ctxT + 0.07);
+
+            // Schedule visual flash. Click is scheduled at ctxT.
+            // avOffset shifts visual relative to audio: negative means
+            // chart visual leads audio by |avOffset|, so flash appears
+            // |avOffset|ms BEFORE click. Positive means flash appears
+            // AFTER click (chart visual lags audio).
+            //
+            // Click-audible-at-wall-clock = ctxT (approximately —
+            // outputLatency adds delay but we ignore it here since
+            // it's the same for the user's chart playback too).
+            // Flash-perceived-at-wall-clock = clickAudible + avOffset
+            //
+            // Schedule via setTimeout from now:
+            //   delay = (ctxT - audioCtx.currentTime) * 1000 + avOffsetMs
+            const avOffsetMs = readAv();
+            const delayMs = (ctxT - audioCtx.currentTime) * 1000 + avOffsetMs;
+            setTimeout(() => {
+                if (stopped) return;
+                flashEl.classList.add('bg-purple-400');
+                flashEl.style.boxShadow = '0 0 30px rgba(168, 85, 247, 0.9)';
+                setTimeout(() => {
+                    if (!stopped) {
+                        flashEl.classList.remove('bg-purple-400');
+                        flashEl.style.boxShadow = '0 0 20px rgba(168, 85, 247, 0.0)';
+                    }
+                }, 80);
+            }, Math.max(0, delayMs));
+
+            // Schedule next iteration ~100ms before the next click time
+            // (so we have headroom to schedule the click).
+            const nextCtxT = ctxT + beatSec;
+            const nextDelayMs = (nextCtxT - audioCtx.currentTime) * 1000 - 200;
+            setTimeout(() => fireOne(nextCtxT), Math.max(50, nextDelayMs));
+        };
+        fireOne(audioCtx.currentTime + 0.5);
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
