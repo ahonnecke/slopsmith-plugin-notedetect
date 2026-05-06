@@ -7597,6 +7597,13 @@ function createNoteDetector(options = {}) {
             : requestedStart;
 
         drillActive = true;
+        // Window-level flag so slopsmith's loop-wrap handler can skip
+        // its 4-beat count-in during drill iterations. Drill has its
+        // own audible 5s lead-in; the count-in adds silent click-only
+        // time on top (user-reported "10 seconds of silence between
+        // iterations" at low BPMs). Bypassed in slopsmith app.js's
+        // loop-trigger if this flag is set.
+        window._ndAnyDrillActive = true;
         drillJudgeStart = start;
         drillJudgeEnd = end;
         drillLabel = label || `${start.toFixed(1)}-${end.toFixed(1)}s`;
@@ -7653,6 +7660,9 @@ function createNoteDetector(options = {}) {
         }
         hideDrillHud();
         drillActive = false;
+        // Clear the window-level flag so slopsmith's count-in resumes
+        // for non-drill A-B loops the user sets manually.
+        window._ndAnyDrillActive = false;
         drillJudgeStart = null;
         drillJudgeEnd = null;
         drillLabel = null;
