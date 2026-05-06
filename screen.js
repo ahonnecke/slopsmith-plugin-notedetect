@@ -6576,58 +6576,74 @@ function createNoteDetector(options = {}) {
         overlay.querySelector('.nd-vcal-close').onclick = stop;
         overlay.addEventListener('click', (e) => { if (e.target === overlay) stop(); });
 
-        // The loop: schedule click + flash. Reschedule every 2s.
+        // Tight click/flash sync. Clicks scheduled in audioCtx time
+        // (sample-accurate). Flashes driven by requestAnimationFrame +
+        // audioCtx.getOutputTimestamp() so flash render is within one
+        // frame (~16ms) of click playback regardless of JS event loop
+        // jitter. Was using setTimeout — produced 5-20ms variance per
+        // iteration and the user noticed iteration drift.
+        //
+        // Pre-schedule N click events into the audio graph; track an
+        // array of upcoming flash ctxTimes for the rAF loop to fire
+        // visually. avOffset can change mid-loop without scheduling
+        // damage — we compute "should I flash now?" against the
+        // current avOffset on each frame.
         const beatSec = 2.0;
-        const fireOne = (ctxT) => {
-            if (stopped) return;
-            // Schedule click via Web Audio.
-            const clickGain = audioCtx.createGain();
-            clickGain.gain.value = 0;
-            clickGain.connect(audioCtx.destination);
+        const N_CLICKS = 60;  // ~120s of cal time before user has to reopen
+        const startCtxT = audioCtx.currentTime + 0.5;
+        const upcomingFlashes = [];  // array of click ctxTimes
+        const clickGainShared = audioCtx.createGain();
+        clickGainShared.gain.value = 0;
+        clickGainShared.connect(audioCtx.destination);
+        for (let i = 0; i < N_CLICKS; i++) {
+            const ctxT = startCtxT + i * beatSec;
+            // Schedule click via Web Audio (each gets its own
+            // oscillator since AudioBufferSource/Oscillator are
+            // one-shot in Web Audio).
             const osc = audioCtx.createOscillator();
             osc.type = 'sine';
             osc.frequency.value = 880;
-            osc.connect(clickGain);
-            clickGain.gain.setValueAtTime(0, ctxT);
-            clickGain.gain.linearRampToValueAtTime(0.3, ctxT + 0.005);
-            clickGain.gain.linearRampToValueAtTime(0, ctxT + 0.06);
+            osc.connect(clickGainShared);
+            clickGainShared.gain.setValueAtTime(0, ctxT);
+            clickGainShared.gain.linearRampToValueAtTime(0.3, ctxT + 0.005);
+            clickGainShared.gain.linearRampToValueAtTime(0, ctxT + 0.06);
             osc.start(ctxT);
             osc.stop(ctxT + 0.07);
+            upcomingFlashes.push(ctxT);
+        }
 
-            // Schedule visual flash. Click is scheduled at ctxT.
-            // avOffset shifts visual relative to audio: negative means
-            // chart visual leads audio by |avOffset|, so flash appears
-            // |avOffset|ms BEFORE click. Positive means flash appears
-            // AFTER click (chart visual lags audio).
-            //
-            // Click-audible-at-wall-clock = ctxT (approximately —
-            // outputLatency adds delay but we ignore it here since
-            // it's the same for the user's chart playback too).
-            // Flash-perceived-at-wall-clock = clickAudible + avOffset
-            //
-            // Schedule via setTimeout from now:
-            //   delay = (ctxT - audioCtx.currentTime) * 1000 + avOffsetMs
-            const avOffsetMs = readAv();
-            const delayMs = (ctxT - audioCtx.currentTime) * 1000 + avOffsetMs;
+        // rAF loop: on each animation frame, check if any upcoming
+        // click ctxTime + avOffset has been reached relative to NOW
+        // in audioCtx time. If so, fire flash and pop from queue.
+        const doFlash = () => {
+            flashEl.classList.add('bg-purple-400');
+            flashEl.style.boxShadow = '0 0 30px rgba(168, 85, 247, 0.9)';
             setTimeout(() => {
-                if (stopped) return;
-                flashEl.classList.add('bg-purple-400');
-                flashEl.style.boxShadow = '0 0 30px rgba(168, 85, 247, 0.9)';
-                setTimeout(() => {
-                    if (!stopped) {
-                        flashEl.classList.remove('bg-purple-400');
-                        flashEl.style.boxShadow = '0 0 20px rgba(168, 85, 247, 0.0)';
-                    }
-                }, 80);
-            }, Math.max(0, delayMs));
-
-            // Schedule next iteration ~100ms before the next click time
-            // (so we have headroom to schedule the click).
-            const nextCtxT = ctxT + beatSec;
-            const nextDelayMs = (nextCtxT - audioCtx.currentTime) * 1000 - 200;
-            setTimeout(() => fireOne(nextCtxT), Math.max(50, nextDelayMs));
+                flashEl.classList.remove('bg-purple-400');
+                flashEl.style.boxShadow = '0 0 20px rgba(168, 85, 247, 0.0)';
+            }, 80);
         };
-        fireOne(audioCtx.currentTime + 0.5);
+        const tick = () => {
+            if (stopped) {
+                // Stop scheduled clicks too — disconnect the shared
+                // gain so nothing further plays. Already-scheduled
+                // start()s before disconnect WILL still play; modal
+                // close + audio stop is approximate, not surgical.
+                try { clickGainShared.disconnect(); } catch (e) {}
+                return;
+            }
+            const nowCtx = audioCtx.currentTime;
+            const avOffsetSec = readAv() / 1000;
+            // Flash should fire when click is audible (ctxT) + offset.
+            // Pop all flashes whose target time has passed.
+            while (upcomingFlashes.length > 0
+                   && (upcomingFlashes[0] + avOffsetSec) <= nowCtx) {
+                upcomingFlashes.shift();
+                doFlash();
+            }
+            requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
