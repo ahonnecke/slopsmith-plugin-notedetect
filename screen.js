@@ -4247,6 +4247,15 @@ function createNoteDetector(options = {}) {
     // aren't influenced by a tiny sample.
     function updateDriftEstimate(timingErrorMs) {
         if (typeof timingErrorMs !== 'number' || !Number.isFinite(timingErrorMs)) return;
+        // Outlier filter: a single hit with raw timingError > the
+        // wide threshold (300ms) is almost always a misattribution
+        // (sustain bleed phantom, wrong-note match) rather than the
+        // player's true bias. Feeding it to the rolling-median
+        // estimator can spiral the matcher's search center if the
+        // estimator and search are coupled. Reject anything outside
+        // ±400ms (a bit past the wide threshold to allow real-but-
+        // edge-of-zone hits through).
+        if (Math.abs(timingErrorMs) > 400) return;
         driftBuffer.push(timingErrorMs);
         if (driftBuffer.length > _ND_DRIFT_WINDOW) driftBuffer.shift();
         if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES) {
@@ -4255,6 +4264,15 @@ function createNoteDetector(options = {}) {
             driftEstimateMs = sorted.length % 2 === 0
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
+            // Defensive clamp: a +/- 300ms drift is the maximum that
+            // makes physical sense for input latency. Anything past
+            // this implies a bug elsewhere; clamping here prevents a
+            // future regression from spiraling the matcher's search
+            // center to absurd offsets like the -4500ms observed in
+            // an earlier drift-comp-scoring experiment.
+            const DRIFT_CLAMP_MS = 300;
+            if (driftEstimateMs > DRIFT_CLAMP_MS) driftEstimateMs = DRIFT_CLAMP_MS;
+            else if (driftEstimateMs < -DRIFT_CLAMP_MS) driftEstimateMs = -DRIFT_CLAMP_MS;
         }
         // Auto-cal disabled — was running away to ±900ms in live play.
         //
