@@ -4256,49 +4256,43 @@ function createNoteDetector(options = {}) {
                 ? (sorted[mid - 1] + sorted[mid]) / 2
                 : sorted[mid];
         }
-        // Auto-calibration: fires whenever the drift buffer is full
-        // (4+ samples) AND the median exceeds the precision-zone
-        // threshold (50ms). Used to be a one-shot latch — that
-        // produced this exact failure mode: player at hit #4 had
-        // drift +60ms, latch fired, avOffset shifted +60ms; player
-        // continued accumulating drift to +234ms, latch already
-        // burned, no further correction. Now: each firing resets
-        // the buffer (so re-arm requires 4 more hits) AND the 50ms
-        // threshold prevents oscillation around small offsets. Net
-        // effect: convergence in 8-12 hits even when initial drift
-        // is mis-estimated, and adaptive to mid-song drift changes.
+        // Auto-cal disabled — was running away to ±900ms in live play.
         //
-        // Persistence: routes through window.setAvOffsetMs so the
-        // value persists to /api/settings; subsequent songs + future
-        // browser sessions start with the calibrated value.
-        if (driftBuffer.length >= _ND_DRIFT_MIN_SAMPLES
-                && Math.abs(driftEstimateMs) > _ND_AUTO_CAL_THRESHOLD_MS) {
-            // Read current value from slopsmith's persisted state if
-            // available (window.setAvOffsetMs reads/writes _avOffsetMs);
-            // fall back to the highway getter for sandbox/test contexts.
-            let prev = 0;
-            const _hw = resolveHw();
-            if (_hw && typeof _hw.getAvOffset === 'function') {
-                prev = _hw.getAvOffset() || 0;
-            }
-            const next = prev + driftEstimateMs;
-            // Prefer the slopsmith persistent path; fall back to the
-            // highway-only update if slopsmith isn't around (unit
-            // tests, headless harness without app.js, etc.).
-            if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
-                window.setAvOffsetMs(next);
-                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms (persisted)`);
-            } else if (_hw && typeof _hw.setAvOffset === 'function') {
-                _hw.setAvOffset(next);
-                console.log(`[note_detect] auto-cal: drift=${Math.round(driftEstimateMs)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms (session-only — slopsmith setter unavailable)`);
-            } else {
-                return;
-            }
-            // Reset drift buffer so post-cal hits measure new alignment.
-            // Re-fire is gated by buffer-fill (4 hits) + threshold (50ms).
-            driftBuffer = [];
-            driftEstimateMs = 0;
-        }
+        // Root cause: the matcher already has drift compensation in its
+        // search (tForSearch = tRaw - driftSec). That correctly finds
+        // the chart note the player is aiming at, even when raw timing
+        // is +200ms off. The recorded timingError is RAW (tRaw - cn.t),
+        // which is what the wide-threshold check sees.
+        //
+        // My auto-cal pushed driftEstimate INTO avOffset, intending to
+        // make the raw timingError read as ~0 going forward. Math:
+        //   pre:  tRaw = audio + avOffset - latency
+        //         search = tRaw - drift   ← player's intended note
+        //   post: avOffset += drift; drift reset to 0
+        //         tRaw' = audio + (avOffset+drift) - latency = tRaw + drift
+        //         search = tRaw' - 0 = tRaw + drift   ← 2×drift past
+        //                                                 player's intent
+        //
+        // Search center moves AWAY from where the player aims. New hits
+        // look more late, drift re-fires in same direction, runaway.
+        //
+        // Confirmed live: user reached avOffset = -900ms by song end,
+        // hitting the slopsmith ±1000 clamp.
+        //
+        // Harness sweep showed +23pp improvement (58.2 → 81.2%) only
+        // because fixtures are short — 1-2 cal fires landed before
+        // accumulation turned vicious. In a full song the math goes
+        // wrong fast.
+        //
+        // The proper fix is drift-compensating the recorded timingError
+        // (subtract drift from raw error so the wide-threshold check
+        // sees the centered value). That keeps the matcher's search
+        // working AND lets calibrated hits land within threshold.
+        // Tracked separately; reverted here for safety.
+        //
+        // Effect: live play falls back to per-session drift compensation
+        // only. The harness baseline post-Fix-C (58.2%) is what we
+        // ship. User's manual [/] tuning still works.
     }
 
     // Fix C — slot-claim leak prevention. A chart slot is "claimed
