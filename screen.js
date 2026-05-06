@@ -5308,8 +5308,23 @@ function createNoteDetector(options = {}) {
             <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
             <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
                    class="nd-latency-slider w-full accent-green-400 mb-2">
-            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+            <div class="text-[10px] text-gray-600 mb-2 leading-tight">
                 Compensates for USB/audio interface delay. Increase if notes register late.
+            </div>
+
+            <div class="bg-dark-800 border border-blue-700/40 rounded p-2 mb-3 text-[11px]">
+                <div class="font-semibold text-blue-300 mb-1">A/V Calibration</div>
+                <div id="nd-cal-status" class="text-gray-400 text-[10px] mb-1.5 leading-snug">
+                    Play 4+ notes through the chart, then click Apply to push the median timing offset into avOffset.
+                </div>
+                <div class="flex gap-1.5">
+                    <button class="nd-cal-apply flex-1 px-2 py-1 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed rounded text-[11px] text-white">
+                        Apply latency from recent hits
+                    </button>
+                    <button class="nd-cal-reset px-2 py-1 bg-dark-600 hover:bg-dark-500 rounded text-[11px] text-gray-300" title="Reset avOffset to 0">
+                        Reset
+                    </button>
+                </div>
             </div>
 
             <div class="bg-dark-700 border border-gray-700 rounded p-2 mb-3 text-[11px] text-gray-300 leading-snug">
@@ -5482,6 +5497,71 @@ function createNoteDetector(options = {}) {
             latencyOffset = e.target.value / 1000;
             panel.querySelector('.nd-latency-val').textContent = e.target.value;
             saveSettings();
+        };
+
+        // A/V Calibration: read driftEstimateMs from recent hits and
+        // apply it to avOffset as a one-shot calibration. Drift
+        // estimator is the rolling-median timingError across the
+        // last 4-8 non-ignored hits — i.e. the player's actual bias
+        // relative to the chart. Subtract from avOffset (correct
+        // sign: chart-time bigger means tRaw bigger means timingError
+        // bigger; if player is +200ms late, tRaw needs to read 200ms
+        // smaller for the same audio time → avOffset -= 200).
+        // Persists via window.setAvOffsetMs (slopsmith POSTs to
+        // /api/settings); also clears the drift buffer so subsequent
+        // hits measure post-cal alignment.
+        const calStatus = panel.querySelector('#nd-cal-status');
+        const calApply = panel.querySelector('.nd-cal-apply');
+        const calReset = panel.querySelector('.nd-cal-reset');
+        // Refresh status text every 500ms so the user sees the live
+        // drift estimate change as they play.
+        const refreshCalStatus = () => {
+            if (!panel.isConnected) {
+                clearInterval(calStatusTimer);
+                return;
+            }
+            const samples = driftBuffer.length;
+            const drift = Math.round(driftEstimateMs);
+            const av = (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function')
+                ? (resolveHw() && resolveHw().getAvOffset ? resolveHw().getAvOffset() : 0)
+                : 0;
+            if (samples < _ND_DRIFT_MIN_SAMPLES) {
+                calStatus.textContent = `Need ${_ND_DRIFT_MIN_SAMPLES - samples} more hit(s) before calibration. Current avOffset: ${Math.round(av)}ms.`;
+                calApply.disabled = true;
+            } else {
+                const direction = drift > 0 ? 'late' : drift < 0 ? 'early' : 'on';
+                calStatus.textContent = `Median bias across ${samples} hit(s): ${drift > 0 ? '+' : ''}${drift}ms (${direction}). Current avOffset: ${Math.round(av)}ms. Click Apply to set avOffset → ${Math.round(av) - drift}ms.`;
+                calApply.disabled = false;
+            }
+        };
+        const calStatusTimer = setInterval(refreshCalStatus, 500);
+        refreshCalStatus();
+
+        calApply.onclick = () => {
+            if (driftBuffer.length < _ND_DRIFT_MIN_SAMPLES) return;
+            const drift = driftEstimateMs;
+            const _hw = resolveHw();
+            const prev = (_hw && _hw.getAvOffset) ? (_hw.getAvOffset() || 0) : 0;
+            const next = prev - drift;
+            if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+                window.setAvOffsetMs(next);
+            } else if (_hw && typeof _hw.setAvOffset === 'function') {
+                _hw.setAvOffset(next);
+            }
+            driftBuffer = [];
+            driftEstimateMs = 0;
+            console.log(`[note_detect] manual cal: drift=${Math.round(drift)}ms; avOffset ${Math.round(prev)}→${Math.round(next)}ms`);
+            refreshCalStatus();
+        };
+        calReset.onclick = () => {
+            if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+                window.setAvOffsetMs(0);
+            } else {
+                const _hw = resolveHw();
+                if (_hw && _hw.setAvOffset) _hw.setAvOffset(0);
+            }
+            console.log('[note_detect] avOffset reset to 0');
+            refreshCalStatus();
         };
         // Tolerance/hit-threshold sliders are gone — those four values
         // are now the fixed _ND_DETECTION_* / _ND_PRECISION_* constants
