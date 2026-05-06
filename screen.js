@@ -1244,7 +1244,7 @@ function _ndCurrentSongId(songInfo) {
 // within `tolSec` on both endpoints? Used by drill auto-save to avoid
 // piling identical loops into the user's saved-loops list each time
 // they re-drill the same trouble spot.
-function _ndIsDuplicateLoop(start, end, existingLoops, tolSec = 0.5) {
+function _ndIsDuplicateLoop(start, end, existingLoops, tolSec = 2.0) {
     if (!existingLoops || !existingLoops.length) return false;
     return existingLoops.some(l =>
         typeof l.start === 'number' && typeof l.end === 'number'
@@ -6110,6 +6110,31 @@ function createNoteDetector(options = {}) {
 
     // ── Draw hook overlay on the highway canvas ───────────────────────
     function drawOverlay(ctx, W, H) {
+        // Drill judgment-window floor highlight runs BEFORE the !enabled
+        // gate so the user sees the score-on transition reliably during
+        // a drill, even on the first iteration (when enabled may have
+        // briefly been false during getUserMedia setup). Visible band
+        // (~40% of the highway height) with a sharp top border so the
+        // user can't miss the visual cue at exactly judgeStart.
+        if (drillActive && drillJudgeStart != null && drillJudgeEnd != null) {
+            const t = hw.getTime ? hw.getTime() : 0;
+            if (t >= drillJudgeStart && t < drillJudgeEnd) {
+                const top = H * 0.6;
+                ctx.save();
+                const grad = ctx.createLinearGradient(0, top, 0, H);
+                grad.addColorStop(0, 'rgba(96, 165, 250, 0)');
+                grad.addColorStop(0.5, 'rgba(96, 165, 250, 0.18)');
+                grad.addColorStop(1, 'rgba(96, 165, 250, 0.50)');
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, top, W, H - top);
+                // Bright top border so the start of the judgment window
+                // is unmistakable when the audio crosses judgeStart.
+                ctx.fillStyle = 'rgba(96, 165, 250, 0.85)';
+                ctx.fillRect(0, top, W, 2);
+                ctx.restore();
+            }
+        }
+
         if (!enabled) return;
         if (!hw.project || !hw.fretX) return;
         // This overlay positions everything with the 2D highway's
@@ -9792,3 +9817,59 @@ _ndInstallPlaySongHook();
 // Only inject on first evaluation — re-injecting on a subsequent load
 // would duplicate the button, since the old one is still in the DOM.
 if (!_ndExistingDefault) _ndDefaultInstance.injectButton();
+
+// ── Global audio-element hooks ────────────────────────────────────────────
+// 1. song-end → disable the default detector so the post-play summary
+//    modal pops automatically. User reported "the post play coaching
+//    report does not ever appear" — that was because nothing fired
+//    disable() at song-end; the summary only ran on explicit Detect-off.
+// 2. pause/play → reflect playback state in the drill HUD so the user
+//    can see at a glance that they're paused mid-drill (no Iter score
+//    is going to advance until they resume).
+// All hooks are dataset-guarded so duplicate <script> evaluations don't
+// double-register listeners.
+function _ndInstallAudioElementHooks() {
+    const audio = document.getElementById('audio');
+    if (!audio) {
+        // Audio element may not exist yet at module-init time. Retry
+        // briefly via the same retry budget the playSong hook uses.
+        if (_ndShared.playSongRetries < _ND_PLAY_SONG_MAX_RETRIES) {
+            setTimeout(_ndInstallAudioElementHooks, 100);
+        }
+        return;
+    }
+    if (audio.dataset._ndAudioHooked === '1') return;
+    audio.dataset._ndAudioHooked = '1';
+    audio.addEventListener('ended', () => {
+        const det = window.noteDetect;
+        if (det && typeof det.isEnabled === 'function' && det.isEnabled()) {
+            // disable() snapshots the play and pops the summary modal,
+            // which itself wires the "Coaching review →" button.
+            det.disable();
+        }
+    });
+    audio.addEventListener('pause', () => {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        hud.dataset.paused = '1';
+        // Tint the HUD border yellow + add a "PAUSED" tag in place of
+        // the focus line so the visual change is unmistakable.
+        hud.style.borderColor = '#eab308';
+        let tag = hud.querySelector('.nd-drill-paused-tag');
+        if (!tag) {
+            tag = document.createElement('div');
+            tag.className = 'nd-drill-paused-tag text-yellow-300 font-bold text-xs mt-1';
+            tag.textContent = '⏸ Paused — press play to resume';
+            hud.firstElementChild?.firstElementChild?.appendChild(tag);
+        }
+    });
+    audio.addEventListener('play', () => {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        delete hud.dataset.paused;
+        hud.style.borderColor = '';  // back to default (CSS class blue)
+        const tag = hud.querySelector('.nd-drill-paused-tag');
+        if (tag) tag.remove();
+    });
+}
+_ndInstallAudioElementHooks();
