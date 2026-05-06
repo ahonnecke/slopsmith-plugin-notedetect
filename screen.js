@@ -2923,6 +2923,12 @@ function createNoteDetector(options = {}) {
     // buffer reset (needs 4 more hits to trigger again) plus the
     // 50ms threshold (small offsets don't oscillate). Removed
     // autoCalApplied entirely.
+    // Click-track calibration capture hook. processFrame's onset
+    // firing path calls this with audioCtx.currentTime when set.
+    // Null when no calibration is active so the production path has
+    // zero overhead.
+    let onsetCaptureCallback = null;
+
     // Onset state. inNote tracks the RMS-envelope hysteresis;
     // reattackRmsBuf is the rolling RMS history used by the re-attack
     // trigger to detect a fresh pluck during sustain.
@@ -3691,6 +3697,15 @@ function createNoteDetector(options = {}) {
                     lastOnsetPerfSec = nowSec;
                     reattackArmed = false;
                     onsetCount++;
+                    // Click-track calibration hook: when a calibration
+                    // run is active, snapshot the audioCtx time at the
+                    // moment the onset fires. Used to compute latency
+                    // = onset_ctx_time - expected_click_ctx_time.
+                    if (onsetCaptureCallback) {
+                        try {
+                            onsetCaptureCallback(audioCtx ? audioCtx.currentTime : nowSec);
+                        } catch (e) { /* swallow — capture is best-effort */ }
+                    }
                     // Stamp the onset's chart-time so processFrame
                     // can gate matchNotes on it (the post-port
                     // architectural fix). Compensate backwards by
@@ -5314,10 +5329,14 @@ function createNoteDetector(options = {}) {
 
             <div class="bg-dark-800 border border-blue-700/40 rounded p-2 mb-3 text-[11px]">
                 <div class="font-semibold text-blue-300 mb-1">A/V Calibration</div>
+                <div class="text-[10px] text-gray-500 mb-1.5 leading-snug">
+                    Measures audio-pipeline latency (output → ear → pluck → input).
+                    Visual highway alignment is separate.
+                </div>
                 <div id="nd-cal-status" class="text-gray-400 text-[10px] mb-1.5 leading-snug">
                     Play 4+ notes through the chart, then click Apply to push the median timing offset into avOffset.
                 </div>
-                <div class="flex gap-1.5">
+                <div class="flex gap-1.5 mb-2">
                     <button class="nd-cal-apply flex-1 px-2 py-1 bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed rounded text-[11px] text-white">
                         Apply latency from recent hits
                     </button>
@@ -5325,6 +5344,12 @@ function createNoteDetector(options = {}) {
                         Reset
                     </button>
                 </div>
+                <div class="flex gap-1.5">
+                    <button class="nd-cal-clicks flex-1 px-2 py-1 bg-purple-700 hover:bg-purple-600 disabled:opacity-40 disabled:cursor-not-allowed rounded text-[11px] text-white" title="Plays 8 audible clicks at 60bpm; pluck along with each. Headphones recommended.">
+                        Calibrate with click track
+                    </button>
+                </div>
+                <div id="nd-cal-clicks-status" class="text-gray-500 text-[10px] mt-1.5 leading-snug"></div>
             </div>
 
             <div class="bg-dark-700 border border-gray-700 rounded p-2 mb-3 text-[11px] text-gray-300 leading-snug">
@@ -5562,6 +5587,28 @@ function createNoteDetector(options = {}) {
             }
             console.log('[note_detect] avOffset reset to 0');
             refreshCalStatus();
+        };
+
+        // Click-track calibration: independent measurement, doesn't
+        // need a song loaded.
+        const calClicks = panel.querySelector('.nd-cal-clicks');
+        const calClicksStatus = panel.querySelector('#nd-cal-clicks-status');
+        calClicks.onclick = async () => {
+            if (calClicks.disabled) return;
+            if (!enabled) {
+                calClicksStatus.innerHTML = '<span class="text-orange-400">Enable Detect first.</span>';
+                return;
+            }
+            calClicks.disabled = true;
+            calClicksStatus.innerHTML = '<span class="text-blue-300">Get ready — 8 clicks at 60bpm. Pluck with each click.</span>';
+            const result = await calibrateLatencyWithClicks();
+            calClicks.disabled = false;
+            if (!result.ok) {
+                calClicksStatus.innerHTML = `<span class="text-orange-400">Failed: ${result.reason}</span>`;
+            } else {
+                calClicksStatus.innerHTML = `<span class="text-green-400">Set avOffset to ${result.avOffsetAfter}ms (latency ${result.latencyMs}ms across ${result.samples} plucks).</span>`;
+                refreshCalStatus();
+            }
         };
         // Tolerance/hit-threshold sliders are gone — those four values
         // are now the fixed _ND_DETECTION_* / _ND_PRECISION_* constants
@@ -6231,6 +6278,128 @@ function createNoteDetector(options = {}) {
                 if (skipBtn) skipBtn.classList.remove('bg-blue-700');
             }, 200);
         }
+    }
+
+    // ── Click-track calibration ────────────────────────────────────────
+    // User plays 8 plucks along with audible 60bpm clicks. Captures
+    // onset audioCtx.currentTime stamps, matches each to the nearest
+    // expected click time, computes median delta, applies as avOffset.
+    // Independent of song/chart — works as long as detect is on (so
+    // the onset detector is running).
+    //
+    // Headphones recommended: if the click track is heard by the
+    // bass-rig mic, the click itself triggers onsets and corrupts
+    // the measurement. Most users running through DI are fine since
+    // their input doesn't pick up speakers; explicit warning in the
+    // settings UI either way.
+    async function calibrateLatencyWithClicks(opts = {}) {
+        const N_CLICKS = opts.numClicks || 8;
+        const BPM = opts.bpm || 60;
+        const PREP_SEC = opts.prepSec || 1.5;
+        const beatSec = 60 / BPM;
+        if (!enabled) {
+            return { ok: false, reason: 'detect not enabled — click Detect first' };
+        }
+        if (!audioCtx) {
+            return { ok: false, reason: 'no audio context' };
+        }
+
+        const startCtxT = audioCtx.currentTime + PREP_SEC;
+        const expectedTimes = [];
+
+        // Schedule clicks: short square-wave bursts with envelope.
+        // 1 kHz frequency, 30 ms attack, 30 ms decay — short and
+        // bright so it doesn't bleed into the pluck window.
+        const clickGain = audioCtx.createGain();
+        clickGain.gain.value = 0;
+        clickGain.connect(audioCtx.destination);
+        for (let i = 0; i < N_CLICKS; i++) {
+            const t = startCtxT + i * beatSec;
+            expectedTimes.push(t);
+            const osc = audioCtx.createOscillator();
+            osc.type = 'square';
+            osc.frequency.value = 1000;
+            osc.connect(clickGain);
+            // Envelope: silence → 0.4 over 5ms, hold 20ms, decay over 25ms.
+            // Short enough that the click finishes well before the player's
+            // pluck window opens.
+            clickGain.gain.setValueAtTime(0, t);
+            clickGain.gain.linearRampToValueAtTime(0.4, t + 0.005);
+            clickGain.gain.setValueAtTime(0.4, t + 0.025);
+            clickGain.gain.linearRampToValueAtTime(0, t + 0.05);
+            osc.start(t);
+            osc.stop(t + 0.06);
+        }
+
+        // Capture onsets while clicks play (+ 0.5s tail for the last
+        // pluck to register).
+        const captures = [];
+        onsetCaptureCallback = (ctxT) => captures.push(ctxT);
+        const totalSec = PREP_SEC + N_CLICKS * beatSec + 0.5;
+        await new Promise(r => setTimeout(r, totalSec * 1000));
+        onsetCaptureCallback = null;
+        try { clickGain.disconnect(); } catch (e) {}
+
+        // Match each capture to nearest expected click within
+        // ±0.45*beatSec. Outside that window = capture from outside
+        // the click sequence (warm-up pluck, ambient noise, etc).
+        const deltas = [];
+        const halfBeat = beatSec * 0.45;
+        for (const cap of captures) {
+            let nearest = null;
+            for (const exp of expectedTimes) {
+                const d = cap - exp;
+                if (Math.abs(d) < halfBeat) {
+                    if (nearest == null || Math.abs(d) < Math.abs(nearest)) nearest = d;
+                }
+            }
+            if (nearest != null) deltas.push(nearest);
+        }
+
+        if (deltas.length < 4) {
+            return {
+                ok: false,
+                reason: `only ${deltas.length} usable plucks — need at least 4. Try again, plucking exactly with each click.`,
+                captures: captures.length,
+            };
+        }
+        deltas.sort((a, b) => a - b);
+        const medianSec = deltas[Math.floor(deltas.length / 2)];
+        const latencyMs = Math.round(medianSec * 1000);
+
+        // Apply: avOffset = -latencyMs (click cal measures absolute
+        // pipeline latency in audio-context time, independent of any
+        // prior avOffset. To compensate, the chart needs to fire
+        // earlier in audio time so the player's onset (which arrives
+        // latencyMs late) matches the chart-time of the intended note.
+        // Sign trace:
+        //   click at ctx_time T → user plucks at T+L → onset cap = T+L
+        //   matcher: tRaw = song_time + avOffset
+        //   for player playing on the beat: song_time at onset = X+L
+        //   want timingError = (X+L) + avOffset - X = 0 → avOffset = -L
+        // SETs (not adds) since L is the absolute physical latency,
+        // not a delta on top of existing manual tuning.
+        const _hw = resolveHw();
+        const prev = (_hw && _hw.getAvOffset) ? (_hw.getAvOffset() || 0) : 0;
+        const next = -latencyMs;
+        if (typeof window !== 'undefined' && typeof window.setAvOffsetMs === 'function') {
+            window.setAvOffsetMs(next);
+        } else if (_hw && typeof _hw.setAvOffset === 'function') {
+            _hw.setAvOffset(next);
+        }
+        // Wipe the drift estimator so subsequent in-song hits read
+        // post-cal alignment.
+        driftBuffer = [];
+        driftEstimateMs = 0;
+
+        return {
+            ok: true,
+            latencyMs,
+            samples: deltas.length,
+            captures: captures.length,
+            avOffsetBefore: Math.round(prev),
+            avOffsetAfter: Math.round(next),
+        };
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
@@ -9080,6 +9249,9 @@ function createNoteDetector(options = {}) {
         // Unit UX-skip-intro — same rationale; programmatic skip-to-
         // first-note for callers that bypass the button.
         skipToFirstNote,
+        // Click-track calibration — exposed so test scripts or other
+        // plugins can trigger calibration programmatically.
+        calibrateLatencyWithClicks,
         // Internal — clear hits / misses / streak / noteResults /
         // sectionStats / detection state back to zeros. Used by the
         // playSong hook so both ENABLED and DISABLED instances drop
