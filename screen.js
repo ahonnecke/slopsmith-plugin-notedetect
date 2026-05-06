@@ -5748,17 +5748,20 @@ function createNoteDetector(options = {}) {
                 .join('');
         }
 
-        // Timing/drift status: live drift estimate + auto-cal latch.
-        // Tells the user whether the system thinks they're consistently
-        // off and whether avOffset has been auto-corrected yet.
+        // Timing/drift status: live drift estimate, color-coded.
+        // Above threshold = amber + 'open ⚙ to calibrate'; within
+        // threshold = green. Auto-cal was reverted (runaway path);
+        // the gear panel's "Apply latency from recent hits" button
+        // is the manual calibration replacement.
         if (timingEl) {
             if (driftBuffer.length < _ND_DRIFT_MIN_SAMPLES) {
                 timingEl.textContent = '';
             } else {
                 const d = Math.round(driftEstimateMs);
                 const direction = d > 0 ? 'LATE' : d < 0 ? 'EARLY' : 'OK';
-                const color = Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS ? '#f59e0b' : '#10b981';
-                const cal = autoCalApplied ? ' · cal ✓' : (Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS ? ' · cal pending' : '');
+                const aboveThreshold = Math.abs(d) > _ND_AUTO_CAL_THRESHOLD_MS;
+                const color = aboveThreshold ? '#f59e0b' : '#10b981';
+                const cal = aboveThreshold ? ' · open ⚙ to calibrate' : '';
                 timingEl.innerHTML = `<span style="color:${color}">${direction} ${d > 0 ? '+' : ''}${d}ms${cal}</span>`;
             }
         }
