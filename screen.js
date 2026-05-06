@@ -5314,11 +5314,20 @@ function createNoteDetector(options = {}) {
             </div>
 
             <label class="block text-gray-400 text-xs mb-1">Detection Method</label>
-            <select class="nd-method-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-3">
+            <select class="nd-method-select w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 mb-1">
                 <option value="yin" ${detectionMethod === 'yin' ? 'selected' : ''}>YIN (lightweight, clean signals)</option>
                 <option value="hps" ${detectionMethod === 'hps' ? 'selected' : ''}>HPS (bass with weak fundamental, no model)</option>
                 <option value="crepe" ${detectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
             </select>
+            ${(() => {
+                const _hw = resolveHw();
+                const arrangement = (_hw && _hw.getSongInfo && _hw.getSongInfo() || {}).arrangement;
+                const isBass = arrangement && String(arrangement).toLowerCase().includes('bass');
+                if (isBass && detectionMethod === 'yin') {
+                    return '<div class="text-amber-400 text-[10px] mb-3 leading-snug">⚠ This song is bass — HPS handles low-string fundamental loss better than YIN.</div>';
+                }
+                return '<div class="mb-3"></div>';
+            })()}
 
             <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
             <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
@@ -7076,6 +7085,12 @@ function createNoteDetector(options = {}) {
             avOffsetMs: _hw && _hw.getAvOffset ? _hw.getAvOffset() : null,
             inputGain,
             latencyOffset,
+            // Detection method: tells me whether the user is on YIN
+            // (lightweight, default) vs HPS (bass-friendly,
+            // suppressed-fundamental recovery) vs CREPE (heavy, ML).
+            // Without this I can't tell if a low-detection report is
+            // because of the wrong method choice.
+            detectionMethod,
         };
         try {
             await fetch('/api/plugins/note_detect/diagnostics', {
