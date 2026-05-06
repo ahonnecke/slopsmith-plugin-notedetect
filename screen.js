@@ -3664,7 +3664,19 @@ function createNoteDetector(options = {}) {
                 // genuinely released so a subsequent spike is a fresh
                 // pluck rather than body-peak resonance from the
                 // ongoing note.
-                if (rms < _ND_REATTACK_REARM_LEVEL) reattackArmed = true;
+                //
+                // Calibration override: when a click-track calibration
+                // is running, force reattackArmed=true on every frame.
+                // 60bpm plucks on bass don't always decay below the
+                // rearm threshold (0.008) between plucks — sustain
+                // keeps inNote=true and reattackArmed=false, so only
+                // the FIRST pluck fires and 7 subsequent plucks get
+                // dropped. During cal we ONLY care about each pluck's
+                // ratio-spike vs the recent baseline; the rearm gate
+                // is in-song noise protection that doesn't apply.
+                if (rms < _ND_REATTACK_REARM_LEVEL || onsetCaptureCallback) {
+                    reattackArmed = true;
+                }
 
                 let fireOnset = false;
                 // Trigger 1: silence → playing (fresh note after rest).
