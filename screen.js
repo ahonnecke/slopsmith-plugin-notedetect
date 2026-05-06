@@ -2760,6 +2760,11 @@ function createNoteDetector(options = {}) {
     // singleton writes back to localStorage; non-default instances keep
     // mutations local.
     let detectionMethod = 'yin';
+    // Whether the user has explicitly picked a method via the gear
+    // panel. False means we're on the default and free to auto-switch
+    // based on arrangement (bass → HPS for suppressed-fundamental
+    // recovery). True means respect the user's choice.
+    let methodExplicit = false;
     // Detection (wide) and Precision (tight) thresholds are now fixed
     // module constants — see _ND_DETECTION_* / _ND_PRECISION_*. Kept as
     // const aliases here so the matcher / labeler code below reads
@@ -2835,6 +2840,7 @@ function createNoteDetector(options = {}) {
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
             if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
+            if (s.methodExplicit !== undefined) methodExplicit = !!s.methodExplicit;
             // Tolerance/hit-threshold settings used to be persisted from
             // the strictness UI. Now they're fixed two-axis constants
             // (see _ND_DETECTION_* / _ND_PRECISION_* at module scope).
@@ -3346,6 +3352,7 @@ function createNoteDetector(options = {}) {
                 deviceId: selectedDeviceId,
                 channel: selectedChannel,
                 method: detectionMethod,
+                methodExplicit,
                 showTimingErrors,
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
@@ -5697,6 +5704,8 @@ function createNoteDetector(options = {}) {
 
     function setMethod(method) {
         detectionMethod = method;
+        // User explicitly chose — disable auto-switch on bass.
+        methodExplicit = true;
         saveSettings();
         if (method === 'crepe') _ndLoadCrepe();
     }
@@ -6965,6 +6974,26 @@ function createNoteDetector(options = {}) {
 
         _syncChartStateFromHw();
         _chartStateBindEvents();
+
+        // Auto-switch detection method based on arrangement IF the
+        // user hasn't explicitly chosen one. HPS is the bass-friendly
+        // default (handles low-string suppressed-fundamental cases
+        // that YIN locks the wrong octave on); YIN is the lightweight
+        // default for guitar. Only fires on the default singleton —
+        // non-default instances keep whatever they were constructed
+        // with. Triggers a saveSettings so the auto-pick persists
+        // (without setting methodExplicit, so a future arrangement
+        // switch can re-evaluate).
+        if (isDefault && !methodExplicit) {
+            const isBass = currentArrangement === 'bass';
+            const wantMethod = isBass ? 'hps' : 'yin';
+            if (detectionMethod !== wantMethod) {
+                console.log(`[note_detect] auto-switch detection method: ${detectionMethod} → ${wantMethod} (arrangement=${currentArrangement})`);
+                detectionMethod = wantMethod;
+                saveSettings();
+                if (wantMethod === 'crepe') _ndLoadCrepe();
+            }
+        }
 
         resetScoring();
 
