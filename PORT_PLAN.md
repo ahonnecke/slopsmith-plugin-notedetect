@@ -51,7 +51,7 @@ shape during porting.
             (DEFERRED — analysis showed user's case is open-string
              contamination, not the harmonic-pick error 6j fixes;
              validate via fixtures with cleaner muting first)
-☐ Unit 4a  WAV recording during play
+✓ Unit 4a  WAV recording during play
 ☐ Unit 4b  Auto-dump to server
 ☐ Unit 4d  Recording UI in settings panel
 ```

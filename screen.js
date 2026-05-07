@@ -1052,6 +1052,34 @@ function _ndScoreColor(pct) {
     return '#dc2626';                    // red
 }
 
+// Encode Float32 PCM as 16-bit mono WAV. Pure — no DOM, no fetch.
+// Used by the recording path to materialize captured samples for
+// server upload or local download.
+function _ndRecordToWavBlob(pcm, sampleRate) {
+    const numSamples = pcm.length;
+    const buffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(buffer);
+    const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+    for (let i = 0; i < numSamples; i++) {
+        const s = Math.max(-1, Math.min(1, pcm[i]));
+        view.setInt16(44 + i * 2, s * 0x7FFF, true);
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+
 // "M:SS" formatter for chart-time labels. Used by drill HUD and
 // loop-naming so saved drills are scannable in the saved-loops dropdown.
 function _ndFmtMmSs(t) {
@@ -3439,54 +3467,21 @@ function createNoteDetector(options = {}) {
     let diagnosticsInterval = null;
     let flashTimeouts = [];
 
-    // Set to true when startAudio() routed through the slopsmith-desktop
-    // (Electron) audio bridge instead of opening its own getUserMedia
-    // stream. Used by the bridge poll/level-meter timers to bail out
-    // after their `await` resolves on a since-disabled instance — the
-    // existing Web-Audio teardown in stopAudio() is null-checked, so it
-    // doesn't need its own branch on this flag.
-    let usingDesktopBridge = false;
-    // Cached engine sample rate for the bridge path. There's no
-    // audioCtx on this branch so any code that needs a sampleRate
-    // reads it from here instead. Note that chord scoring on the
-    // bridge does NOT consult this value — audio.scoreChord runs
-    // inside the engine and reads the rate natively. The cache is
-    // kept around for the monophonic detection helpers and any
-    // future bridge-side consumer that still needs the renderer
-    // view of the rate. Browser path uses audioCtx.sampleRate
-    // directly. The engine rate is fixed for a session; if the user
-    // changes audio device the detector restarts via the
-    // restartAudio chain and refreshes this value.
-    let bridgeSampleRate = 48000;
-    // Cached `window.slopsmithDesktop` reference captured at
-    // startAudio() when the bridge path is active, so matchNotes()'s
-    // chord branch can dispatch `audio.scoreChord(ctx)` without
-    // re-resolving from window on every tick. Cleared by stopAudio().
-    let bridgeDesktop = null;
-    // Whether the desktop engine's polyphonic ML detector (Basic Pitch) is
-    // actually active this session — queried once at bridge startup via
-    // `audio.isMlNoteDetection()`. false on a downlevel addon or when the ML
-    // model failed to load (the engine then runs the YIN fallback). Stamped
-    // into the diagnostic export so a session can be tied to its detector.
-    let bridgeMlActive = false;
-    // Detector identity captured DURING detection (not read at diagnostic-
-    // export time, when usingDesktopBridge has already been reset by a Detect
-    // toggle — that mislabelled bridge sessions as web). Set each tick by
-    // whichever path actually ran.
-    let _diagDetector = null;
-    // Onset-event state for the desktop ML bridge — used to gate CHORD timing.
-    // Each detectNotes note carries a per-pitch `onsetSeq` counter; when it
-    // increases, that pitch was struck anew. A chord commits a hit only on a
-    // poll where one of its pitches has a fresh onset, so the chord's pitches
-    // ringing on through the riff don't drag the match early.
-    //   bridgeOnsetSeqSeen — last consumed onsetSeq per MIDI pitch
-    //   bridgeNewOnsets    — onsets first seen on the current poll:
-    //                        midi -> { ageMs, conf }
-    //   bridgeOnsetPrimed  — false until the first poll has recorded a seq
-    //                        baseline (so pre-existing onsets aren't replayed)
-    let bridgeOnsetSeqSeen = new Map();
-    let bridgeNewOnsets = new Map();
-    let bridgeOnsetPrimed = false;
+    // ── Recording (Unit 4a) ─────────────────────────────────────────
+    // Raw audio capture into a Float32 buffer, time-anchored to chart
+    // time. WAV t=0 is captured inside the SP callback on the first
+    // sample observed AFTER the chart clock advances past
+    // recordArmedChartTime — anchoring at recordStart() time would peg
+    // t=0 to a paused-chart position and break offline replay alignment.
+    let recording = false;
+    let recordChunks = [];
+    let recordTotalSamples = 0;
+    let recordMaxSamples = 0;
+    let recordSampleRate = 48000;
+    let recordChartStartTime = 0;
+    let recordAnchored = false;
+    let recordArmedChartTime = 0;
+    let recordFilename = 'auto-recording.wav';
 
     // Visual-feedback tracking
     let lastHitCount = 0;
@@ -3858,6 +3853,31 @@ function createNoteDetector(options = {}) {
                 if (!enabled) return;
                 const input = e.inputBuffer.getChannelData(0);
 
+                // Recording (Unit 4a): copy raw input into recordChunks.
+                // Anchor chart-time on the first sample where the chart
+                // has advanced past the armed value — anchoring at
+                // recordStart() time would peg WAV t=0 to a paused chart.
+                if (recording && recordTotalSamples < recordMaxSamples) {
+                    if (!recordAnchored) {
+                        const _hwRec = resolveHw();
+                        const chartNow = _hwRec && _hwRec.getTime ? _hwRec.getTime() : 0;
+                        if (chartNow > recordArmedChartTime + 0.001) {
+                            recordChartStartTime = chartNow;
+                            recordAnchored = true;
+                            console.log(`[note_detect] Recording anchor set: WAV t=0 = chart ${chartNow.toFixed(3)}s`);
+                            recordChunks.push(new Float32Array(input));
+                            recordTotalSamples += input.length;
+                        }
+                    } else {
+                        recordChunks.push(new Float32Array(input));
+                        recordTotalSamples += input.length;
+                        if (recordTotalSamples >= recordMaxSamples) {
+                            console.log('[note_detect] Recording max duration reached, auto-stopping');
+                            recordSave(recordFilename);
+                        }
+                    }
+                }
+
                 // RMS for onset detection.
                 let sumSq = 0;
                 for (let j = 0; j < input.length; j++) sumSq += input[j] * input[j];
@@ -3928,7 +3948,6 @@ function createNoteDetector(options = {}) {
                     // actual attack landed ~halfway through the chunk.
                     if (hw && hw.getTime) {
                         pendingOnsetChartT = hw.getTime() - _ND_ONSET_BUFFER_COMP_SEC;
-                        _dbgPendingSetCount++;
                     }
                     // Flush stability history too — voted MIDI from
                     // the previous note's sustain shouldn't survive
@@ -9482,6 +9501,105 @@ function createNoteDetector(options = {}) {
         };
     }
 
+    // ── Recording control (Unit 4a) ─────────────────────────────────
+    function recordStart(maxSeconds = 60, filename) {
+        recordChunks = [];
+        recordTotalSamples = 0;
+        recordSampleRate = audioCtx ? audioCtx.sampleRate : 48000;
+        recordMaxSamples = Math.floor(maxSeconds * recordSampleRate);
+        recordAnchored = false;
+        recordChartStartTime = 0;
+        const _hwArm = resolveHw();
+        recordArmedChartTime = _hwArm && _hwArm.getTime ? _hwArm.getTime() : 0;
+        recordFilename = filename || 'auto-recording.wav';
+        recording = true;
+        console.log(`[note_detect] Recording armed (max ${maxSeconds}s at ${recordSampleRate}Hz, chart ${recordArmedChartTime.toFixed(3)}s — waiting for playback to advance)`);
+    }
+
+    // Anchors immediately; for diagnostic captures (open strings, scales)
+    // where no song is playing and the chart-advance gate would never trip.
+    function recordStartRaw(maxSeconds = 30, filename) {
+        recordChunks = [];
+        recordTotalSamples = 0;
+        recordSampleRate = audioCtx ? audioCtx.sampleRate : 48000;
+        recordMaxSamples = Math.floor(maxSeconds * recordSampleRate);
+        recordChartStartTime = 0;
+        recordArmedChartTime = 0;
+        recordAnchored = true;
+        recordFilename = filename || 'raw-recording.wav';
+        recording = true;
+        if (!enabled) {
+            console.warn('[note_detect] enabled is false — click Detect first or nothing will record.');
+        }
+        console.log(`[note_detect] Raw recording armed (max ${maxSeconds}s at ${recordSampleRate}Hz, no chart gate, file=${recordFilename})`);
+    }
+
+    function recordStatus() {
+        return {
+            active: recording,
+            anchored: recordAnchored,
+            armedChartTime: recordArmedChartTime,
+            anchorChartTime: recordChartStartTime,
+            capturedSec: recordTotalSamples / (recordSampleRate || 48000),
+            maxSec: recordMaxSamples / (recordSampleRate || 48000),
+            filename: recordFilename,
+        };
+    }
+
+    function recordFlushPcm() {
+        recording = false;
+        if (recordChunks.length === 0) {
+            console.log('[note_detect] No audio recorded');
+            return null;
+        }
+        const totalLen = recordChunks.reduce((s, c) => s + c.length, 0);
+        const pcm = new Float32Array(totalLen);
+        let offset = 0;
+        for (const chunk of recordChunks) {
+            pcm.set(chunk, offset);
+            offset += chunk.length;
+        }
+        console.log(`[note_detect] Recording stopped: ${(totalLen / recordSampleRate).toFixed(1)}s, ${totalLen} samples`);
+        recordChunks = [];
+        return pcm;
+    }
+
+    async function persistRecording(pcm, filename) {
+        const blob = _ndRecordToWavBlob(pcm, recordSampleRate);
+        const formData = new FormData();
+        formData.append('file', blob, filename);
+        try {
+            const resp = await fetch(`/api/plugins/note_detect/recording?chartStartTime=${recordChartStartTime.toFixed(3)}`, {
+                method: 'POST',
+                body: formData,
+            });
+            const result = await resp.json();
+            console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB, chart start ${recordChartStartTime.toFixed(3)}s)`);
+        } catch (e) {
+            console.warn('[note_detect] Server save failed, downloading locally:', e);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = filename; a.click();
+            URL.revokeObjectURL(url);
+        }
+    }
+
+    // User-facing stop. Always saves to the filename set at arming time
+    // — avoids the footgun of "stop returned PCM but didn't persist".
+    function recordStop() {
+        const pcm = recordFlushPcm();
+        if (!pcm) return null;
+        persistRecording(pcm, recordFilename || 'recording.wav');
+        return pcm;
+    }
+
+    // Internal — used by the SP-callback auto-stop on max-samples.
+    async function recordSave(filename) {
+        const pcm = recordFlushPcm();
+        if (!pcm) return;
+        await persistRecording(pcm, filename || recordFilename || 'recording.wav');
+    }
+
     const api = {
         enable,
         disable,
@@ -9543,6 +9661,14 @@ function createNoteDetector(options = {}) {
         // pipeline. Used by test/replay-baseline.js (Unit H2) to run
         // the user's recorded fixtures offline.
         testInjectWav,
+        // Unit 4a — raw audio recording. recordStart gates anchor on
+        // chart-advance (song mode); recordStartRaw anchors immediately
+        // (diagnostic captures). recordStop persists via POST with
+        // local-download fallback. recordStatus snapshots state for UI.
+        recordStart,
+        recordStartRaw,
+        recordStop,
+        recordStatus,
         // Unit S.2 — manual snapshot trigger. Useful for callers that
         // want to persist the current session at a point other than
         // disable() (e.g. mid-song save). Returns the new play_id or null.
