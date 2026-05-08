@@ -5619,7 +5619,27 @@ function createNoteDetector(options = {}) {
                 Chord detection uses per-string band analysis. This sets how many strings must ring to count as a hit (e.g. 60% = 4 of 6). Lower for beginners or dense voicings.
             </div>
 
-            <div class="text-[10px] text-gray-600 mt-1 leading-tight">
+            <div class="border-t border-gray-700 mt-3 pt-3">
+                <label class="block text-gray-400 text-xs mb-1">Diagnostic Recording</label>
+                <div class="flex items-center gap-2 mb-1">
+                    <select class="nd-record-secs bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200">
+                        <option value="15">15s</option>
+                        <option value="30">30s</option>
+                        <option value="60">60s</option>
+                        <option value="120">120s</option>
+                        <option value="300" selected>5 min</option>
+                        <option value="600">10 min</option>
+                    </select>
+                    <button class="nd-record-btn px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs text-red-200 font-semibold">
+                        ● Record
+                    </button>
+                </div>
+                <div class="nd-record-status text-[10px] text-gray-600 leading-tight">
+                    Click once — the song starts playing and recording arms atomically. WAV t=0 anchors to the first sample after the chart advances. Stop saves a WAV + judgment sidecar under <code>/config/note_detect/recordings/</code>; <code>make pull-recording</code> stages it for the replay harness.
+                </div>
+            </div>
+
+            <div class="text-[10px] text-gray-600 mt-3 leading-tight">
                 Tip: For multi-effects pedals with USB audio (e.g. Valeton GP-5), select <b>Left (Ch 1)</b> for the dry/DI signal — it gives the most accurate pitch detection.
                 See the <b>Pitch Detection Methods</b> section of the plugin README for guidance on choosing between YIN, HPS, and CREPE.
             </div>
@@ -5878,6 +5898,60 @@ function createNoteDetector(options = {}) {
             chordHitRatio = e.target.value / 100;
             panel.querySelector('.nd-chord-ratio-val').textContent = e.target.value;
             saveSettings();
+        };
+
+        // Unit 4d — Diagnostic Recording. Click toggles arm/stop; while
+        // armed, a 200ms tick polls recordStatus to surface anchor +
+        // captured-seconds progress without flooding the console.
+        const recordBtn = panel.querySelector('.nd-record-btn');
+        const recordStatusEl = panel.querySelector('.nd-record-status');
+        const recordSecsSel = panel.querySelector('.nd-record-secs');
+        const renderRecordIdle = () => {
+            recordBtn.textContent = '● Record';
+            recordBtn.className = 'nd-record-btn px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs text-red-200 font-semibold';
+        };
+        const renderRecordActive = () => {
+            recordBtn.textContent = '■ Stop';
+            recordBtn.className = 'nd-record-btn px-3 py-1 bg-yellow-900 hover:bg-yellow-800 rounded text-xs text-yellow-200 font-semibold';
+        };
+        // Reflect existing recording state when re-opening the panel
+        // (e.g. user closed gear mid-recording, then re-opened).
+        if (recording) renderRecordActive();
+        const recordPollT0 = { value: 0 };
+        const tickRecordStatus = () => {
+            if (!panel.isConnected) return;
+            const s = recordStatus();
+            if (!s.active) {
+                recordStatusEl.textContent = `Saved ${s.filename || 'recording.wav'} (anchor chart ${s.anchorChartTime.toFixed(3)}s, ${s.capturedSec.toFixed(1)}s captured).`;
+                renderRecordIdle();
+                return;
+            }
+            if (!s.anchored) {
+                const waited = ((performance.now() - recordPollT0.value) / 1000).toFixed(1);
+                recordStatusEl.textContent = `Armed (chart ${s.armedChartTime.toFixed(3)}s). Waiting ${waited}s for chart to advance — if this persists, playback didn't start.`;
+            } else {
+                const remaining = Math.max(0, s.maxSec - s.capturedSec);
+                recordStatusEl.textContent = `Recording — anchor chart ${s.anchorChartTime.toFixed(3)}s, ${s.capturedSec.toFixed(1)}/${s.maxSec.toFixed(0)}s (${remaining.toFixed(1)}s left).`;
+            }
+            setTimeout(tickRecordStatus, 200);
+        };
+        recordBtn.onclick = async () => {
+            if (recording) {
+                // User-driven stop: write WAV + dump sidecar (same shape
+                // as the auto-finalize at session boundaries) so the
+                // recording is fixture-promotable without a separate path.
+                await recordAutoFinalize('manual');
+                renderRecordIdle();
+                return;
+            }
+            const secs = parseInt(recordSecsSel.value || '60', 10);
+            recordBtn.disabled = true;
+            const filename = await recordSessionStart(secs);
+            recordBtn.disabled = false;
+            if (!filename) return;
+            renderRecordActive();
+            recordPollT0.value = performance.now();
+            tickRecordStatus();
         };
 
         populateDevices();
@@ -9646,6 +9720,29 @@ function createNoteDetector(options = {}) {
                 precision: scores.precision,
             },
         };
+    }
+
+    // Unit 4d — UI-driven aligned start. Derives a songSlug-timestamp
+    // filename, arms recording, and kicks playback so the user gets a
+    // single click instead of "arm then click play". The chart-advance
+    // gate inside the SP callback handles the timing race — anchor
+    // doesn't fire until the chart actually advances past the armed
+    // value (~one SP buffer / 42ms after audio.play() resolves).
+    async function recordSessionStart(seconds) {
+        if (recording) return null;
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const songId = _ndCurrentSongId(songInfo);
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const slug = (songId || 'take').replace(/[^A-Za-z0-9_-]+/g, '_').toLowerCase();
+        const filename = `${slug}-${stamp}.wav`;
+        recordStart(seconds, filename);
+        const audio = document.getElementById('audio');
+        if (audio && audio.paused) {
+            try { await audio.play(); }
+            catch (e) { /* autoplay refusal — user can press play manually */ }
+        }
+        return filename;
     }
 
     // Auto-finalize the active recording at a session boundary

@@ -53,7 +53,7 @@ shape during porting.
              validate via fixtures with cleaner muting first)
 ✓ Unit 4a  WAV recording during play
 ✓ Unit 4b  Auto-dump to server
-☐ Unit 4d  Recording UI in settings panel
+✓ Unit 4d  Recording UI in settings panel
 ```
 
 Each unit lands as its own commit on `port/from-factory` and (when the
