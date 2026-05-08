@@ -7465,6 +7465,11 @@ function createNoteDetector(options = {}) {
     function disable(disableOptions) {
         if (!enabled) return;
         enabled = false;
+        // Unit 4b: persist any active recording before tear-down. The
+        // dump.json sidecar uses noteResults as they stand at this
+        // boundary — fire-and-forget so disable() returns immediately,
+        // matching the snapshotPlay/diagnostics pattern.
+        if (recording) recordAutoFinalize('disable').catch(() => {});
         // Unit S.2: snapshot the play before tear-down so the
         // session's noteResults persist. Fire-and-forget — disable
         // returns quickly to keep the UI responsive. The "Coaching
@@ -7735,6 +7740,11 @@ function createNoteDetector(options = {}) {
         // player sees impact without opening the modal. Pass the array
         // before clear() — the banner reads judgments to bucket them.
         _ndShowIterationBanner(arr);
+        // Unit 4b: drill iteration end is a session boundary — finalize
+        // the recording so the WAV captures one iteration and the next
+        // starts fresh (if the user re-arms). Fire-and-forget; the dump
+        // sidecar reads noteResults BEFORE the clear() below.
+        if (recording) recordAutoFinalize('loop_restart').catch(() => {});
         // The iteration is over — clear noteResults so the next
         // iteration re-judges from scratch instead of carrying stale
         // hits forward.
@@ -9564,24 +9574,102 @@ function createNoteDetector(options = {}) {
         return pcm;
     }
 
-    async function persistRecording(pcm, filename) {
+    async function persistRecording(pcm, filename, opts = {}) {
         const blob = _ndRecordToWavBlob(pcm, recordSampleRate);
         const formData = new FormData();
         formData.append('file', blob, filename);
+        if (opts.dump) formData.append('dump', JSON.stringify(opts.dump));
+        const params = new URLSearchParams({
+            chartStartTime: recordChartStartTime.toFixed(3),
+            sampleRate: String(recordSampleRate),
+        });
+        if (opts.songId) params.set('songId', opts.songId);
+        if (opts.playId) params.set('playId', String(opts.playId));
+        if (opts.reason) params.set('reason', opts.reason);
         try {
-            const resp = await fetch(`/api/plugins/note_detect/recording?chartStartTime=${recordChartStartTime.toFixed(3)}`, {
+            const resp = await fetch(`/api/plugins/note_detect/recording?${params.toString()}`, {
                 method: 'POST',
                 body: formData,
             });
             const result = await resp.json();
             console.log(`[note_detect] Recording saved to server: ${result.path} (${(blob.size / 1024).toFixed(0)} KB, chart start ${recordChartStartTime.toFixed(3)}s)`);
+            return result;
         } catch (e) {
             console.warn('[note_detect] Server save failed, downloading locally:', e);
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url; a.download = filename; a.click();
             URL.revokeObjectURL(url);
+            return null;
         }
+    }
+
+    // Build a replay-baseline-compatible dump.json payload. Flattens the
+    // factory's nested chartNote into top-level s/f/chartT so test/
+    // replay-baseline.js can consume the sidecar without changes.
+    function buildRecordingDumpPayload(reason) {
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const noteResultsFlat = [];
+        for (const [key, v] of noteResults.entries()) {
+            const cn = v.chartNote || v.note || {};
+            const chartT = typeof cn.t === 'number'
+                ? cn.t
+                : (typeof v.noteTime === 'number' ? v.noteTime : null);
+            noteResultsFlat.push({
+                ...v,
+                key,
+                s: typeof cn.s === 'number' ? cn.s : null,
+                f: typeof cn.f === 'number' ? cn.f : null,
+                chartT,
+            });
+        }
+        const scores = _ndScoresFromNotes(noteResultsFlat);
+        return {
+            timestamp: new Date().toISOString(),
+            reason,
+            autoDump: true,
+            noteResults: noteResultsFlat,
+            settings: {
+                arrangement: songInfo.arrangement || currentArrangement,
+                tuning: Array.isArray(songInfo.tuning) ? songInfo.tuning : tuningOffsets,
+                capo: typeof songInfo.capo === 'number' ? songInfo.capo : capo,
+                avOffsetMs: _hw && _hw.getAvOffset ? _hw.getAvOffset() : null,
+                timingTolerance,
+                pitchTolerance,
+            },
+            scoring: {
+                hits: scores.hits,
+                misses: scores.misses,
+                total: scores.total,
+                detection: scores.detection,
+                precision: scores.precision,
+            },
+        };
+    }
+
+    // Auto-finalize the active recording at a session boundary
+    // (disable, drill iteration end, restart). Builds a dump.json
+    // sidecar from the current judgments BEFORE clearing/flushing so
+    // the WAV is paired with the noteResults that were captured during
+    // its lifetime. No-op when recording isn't active.
+    async function recordAutoFinalize(reason) {
+        if (!recording || recordChunks.length === 0) return null;
+        const dump = buildRecordingDumpPayload(reason);
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const songId = _ndCurrentSongId(songInfo);
+        // If the user didn't pick a filename, derive one from songId +
+        // timestamp so each session boundary writes a distinct file.
+        if (!recordFilename || recordFilename === 'auto-recording.wav') {
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const slug = (songId || 'take').replace(/[^A-Za-z0-9_-]+/g, '_').toLowerCase();
+            recordFilename = `${slug}-${stamp}.wav`;
+        }
+        const filename = recordFilename;
+        const pcm = recordFlushPcm();
+        if (!pcm) return null;
+        return persistRecording(pcm, filename, { dump, songId, reason });
     }
 
     // User-facing stop. Always saves to the filename set at arming time

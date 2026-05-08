@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 
@@ -59,6 +59,13 @@ _DIAG_RETENTION = 50
 # blow up the DB; older plays drop on each write.
 _PLAYS_DB_PATH: Path | None = None
 _PLAYS_RETENTION_PER_SONG = 50
+
+# Unit 4b — auto-dumped WAV recordings + JSON judgment sidecars from
+# session-boundary persistence. Resolved lazily in setup() under
+# context["config_dir"] (same /config-rw constraint as plays.db and
+# diagnostics — the plugin dir is bind-mounted READ-ONLY).
+_RECORDING_DIR: Path | None = None
+_RECORDING_RETENTION = 30
 
 _PLAYS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS plays (
@@ -188,6 +195,33 @@ def _prune_old_dumps() -> None:
         pass
 
 
+def _prune_recordings() -> None:
+    """Drop oldest WAV+sidecar trios beyond _RECORDING_RETENTION. Each
+    recording is .wav + .json + .dump.json — pruning by .wav mtime and
+    deleting the matching sidecars keeps them in sync."""
+    if _RECORDING_DIR is None:
+        return
+    try:
+        wavs = sorted(
+            _RECORDING_DIR.glob("*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in wavs[_RECORDING_RETENTION:]:
+            siblings = [
+                stale,
+                stale.with_suffix(".json"),
+                stale.with_name(stale.stem + ".dump.json"),
+            ]
+            for sib in siblings:
+                try:
+                    sib.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def setup(app: FastAPI, context: dict[str, Any]) -> None:
     """Plugin loader entry point. Called once at startup by the
     slopsmith plugin loader (see plugins/__init__.py:setup_plugin)."""
@@ -198,10 +232,11 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
     # persistent, bind-mounted to host) is the only valid home for
     # state files. Same convention the highway_3d and practice_journal
     # plugins use.
-    global _PLAYS_DB_PATH, _DIAG_DIR
+    global _PLAYS_DB_PATH, _DIAG_DIR, _RECORDING_DIR
     config_dir = Path(context.get("config_dir") or "/config")
     _PLAYS_DB_PATH = config_dir / "note_detect" / "plays.db"
     _DIAG_DIR = config_dir / "note_detect" / "diagnostics"
+    _RECORDING_DIR = config_dir / "note_detect" / "recordings"
 
     # Initialize the plays DB schema. Idempotent — safe even if the
     # file already exists from a prior run.
@@ -356,6 +391,112 @@ def setup(app: FastAPI, context: dict[str, Any]) -> None:
 
         _prune_old_dumps()
         return {"ok": True, "path": str(target), "retained": _DIAG_RETENTION}
+
+    # ── Audio recordings (Unit 4b) ────────────────────────────────────
+    # Auto-finalized at session boundaries when client-side recording is
+    # active. Three files land per session: <name>.wav (the audio),
+    # <name>.json (metadata: chartStartTime, sampleRate, songId),
+    # <name>.dump.json (judgment sidecar in replay-baseline-compatible
+    # shape so the WAV can be promoted to a fixture).
+    @app.post("/api/plugins/note_detect/recording")
+    async def post_recording(
+        request: Request,
+        file: UploadFile = File(...),
+        dump: str | None = Form(None),
+    ) -> dict[str, Any]:
+        if _RECORDING_DIR is None:
+            raise HTTPException(500, "recording dir not configured")
+        try:
+            _RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(500, f"recording dir not writable: {e}")
+        name = _slug((file.filename or "recording").rsplit(".wav", 1)[0]) + ".wav"
+        dest = _RECORDING_DIR / name
+        try:
+            content = await file.read()
+            dest.write_bytes(content)
+        except OSError as e:
+            raise HTTPException(500, f"wav write failed: {e}")
+        params = request.query_params
+        try:
+            chart_start = float(params.get("chartStartTime", "0"))
+        except (TypeError, ValueError):
+            chart_start = 0.0
+        try:
+            sample_rate = int(params.get("sampleRate", "48000"))
+        except (TypeError, ValueError):
+            sample_rate = 48000
+        meta = {
+            "filename": name,
+            "chartStartTime": chart_start,
+            "sampleRate": sample_rate,
+            "songId": params.get("songId"),
+            "playId": params.get("playId"),
+            "reason": params.get("reason"),
+        }
+        try:
+            dest.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        except OSError:
+            pass
+        if dump:
+            try:
+                # Validate JSON before writing — a malformed dump
+                # shouldn't pollute the directory.
+                parsed = json.loads(dump)
+                dest.with_name(dest.stem + ".dump.json").write_text(
+                    json.dumps(parsed, indent=2)
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
+        _prune_recordings()
+        return {
+            "ok": True,
+            "path": str(dest),
+            "size": len(content),
+            "chartStartTime": chart_start,
+        }
+
+    @app.get("/api/plugins/note_detect/recordings")
+    def list_recordings() -> dict[str, Any]:
+        if _RECORDING_DIR is None or not _RECORDING_DIR.is_dir():
+            return {"recordings": []}
+        try:
+            wavs = sorted(
+                _RECORDING_DIR.glob("*.wav"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return {"recordings": []}
+        return {
+            "recordings": [
+                {
+                    "name": w.name,
+                    "size": w.stat().st_size,
+                    "mtime": w.stat().st_mtime,
+                }
+                for w in wavs
+            ],
+        }
+
+    @app.get("/api/plugins/note_detect/recording/{name}")
+    def get_recording(name: str) -> Any:
+        if _RECORDING_DIR is None:
+            raise HTTPException(500, "recording dir not configured")
+        if "/" in name or "\\" in name or ".." in name.split("/"):
+            raise HTTPException(400, "invalid recording name")
+        target = (_RECORDING_DIR / name).resolve()
+        try:
+            target.relative_to(_RECORDING_DIR.resolve())
+        except ValueError:
+            raise HTTPException(400, "path escape detected")
+        if not target.is_file():
+            raise HTTPException(404, f"recording not found: {name}")
+        if name.endswith(".wav"):
+            return FileResponse(target, media_type="audio/wav", filename=name)
+        if name.endswith(".json"):
+            return FileResponse(target, media_type="application/json", filename=name)
+        raise HTTPException(400, "unsupported extension")
 
     # Fixtures known to be tuning-mismatched against their charts and
     # therefore meaningless for cross-fixture detector validation. Stand

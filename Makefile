@@ -68,14 +68,19 @@ stat: ## Show staged/unstaged diff stats and short status (frequent during porti
 	@git status -s
 
 .PHONY: pull-recording
-pull-recording: check-slopsmith ## Copy newest /tmp/nd_recordings/*.wav out of the container
-	@latest=$$($(COMPOSE) exec -T web sh -c 'ls -1t /tmp/nd_recordings/*.wav 2>/dev/null | head -1' | tr -d '\r'); \
-	    test -n "$$latest" || { echo "no recordings in container"; exit 1; }; \
-	    name=$$(basename $$latest .wav); \
-	    dest=test/fixtures/staging/$${name}-$$(date +%s).wav; \
+pull-recording: check-slopsmith ## Copy newest recording WAV+sidecars out of the container
+	@latest=$$($(COMPOSE) exec -T web sh -c 'ls -1t /config/note_detect/recordings/*.wav 2>/dev/null | head -1' | tr -d '\r'); \
+	    test -n "$$latest" || { echo "no recordings in /config/note_detect/recordings/"; exit 1; }; \
+	    stem=$$(basename $$latest .wav); \
+	    suffix=$$(date +%s); \
+	    dest_wav=test/fixtures/staging/$${stem}-$${suffix}.wav; \
+	    dest_dump=test/fixtures/staging/$${stem}-$${suffix}.dump.json; \
 	    mkdir -p test/fixtures/staging; \
-	    docker cp $$($(COMPOSE) ps -q web):$$latest $$dest; \
-	    echo "pulled: $$dest"
+	    cid=$$($(COMPOSE) ps -q web); \
+	    docker cp $$cid:$$latest $$dest_wav; \
+	    docker cp $$cid:$${latest%.wav}.dump.json $$dest_dump 2>/dev/null || true; \
+	    echo "pulled: $$dest_wav"; \
+	    test -f $$dest_dump && echo "        $$dest_dump"
 
 .PHONY: replay-baseline
 replay-baseline: ## Run all WAV fixtures through the detector via puppeteer (slopsmith must be running)
