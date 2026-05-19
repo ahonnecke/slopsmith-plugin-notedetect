@@ -11,3 +11,13 @@ __pycache__/
 # example fixtures file tracked as a template; ignore the real ones.
 tools/regression-fixtures.json
 tools/regression-baseline.json
+
+# Audio fixtures (recordings, stitched ground-truth, song-ceiling sources)
+# are large and contributor-local. Host out-of-band; do not commit.
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aiff
+*.aif
+*.m4a
