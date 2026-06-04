@@ -4380,8 +4380,21 @@ function createNoteDetector(options = {}) {
         if (panel) { panel.remove(); return; }
 
         panel = document.createElement('div');
-        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl text-sm';
-        panel.style.pointerEvents = 'auto';
+        panel.className = 'nd-settings-panel';
+        // Core ships PREBUILT Tailwind (Principle II, no Play CDN JIT), so this
+        // external plugin's arbitrary classes (z-[150], w-80, top-16) produce
+        // no CSS — the popover rendered with z-index:auto behind the highway
+        // and looked unclickable. Pin layout + chrome inline so it doesn't
+        // depend on classes core never compiled.
+        panel.style.cssText = [
+            'position:fixed', 'top:4rem', 'right:1rem', 'width:20rem',
+            'max-width:calc(100vw - 2rem)', 'max-height:calc(100vh - 5rem)',
+            'overflow-y:auto', 'z-index:2147483000', 'pointer-events:auto',
+            'background:#1a2230', 'border:1px solid #4b5563',
+            'border-radius:0.75rem', 'padding:1rem',
+            'box-shadow:0 10px 40px rgba(0,0,0,0.6)',
+            'color:#d1d5db', 'font-size:0.875rem',
+        ].join(';');
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
