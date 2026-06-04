@@ -13794,8 +13794,11 @@ setInterval(() => {
 // ── Hook into playSong ─────────────────────────────────────────────────────
 
 (function() {
-    const origPlaySong = window.playSong;
-    window.playSong = async function(filename, arrangement) {
+    // Merged core no longer routes plays through a wrappable window.playSong
+    // (it calls a local playSong() and signals via window.slopsmith events).
+    // Wrapping window.playSong was a no-op here, so the Detect button never
+    // injected and per-song reset never ran. Drive both off `song:loaded`.
+    async function onSongLoaded() {
         // Snapshot the in-flight play (if any) BEFORE resetting — songId is
         // still the previous song's at this point, which is what we want.
         _ndSnapshotPlay('song_change');
@@ -13817,7 +13820,7 @@ setInterval(() => {
         // (drill might have left it slowed) and hides the HUD before the
         // new song loads.
         _ndEndDrill();
-        await origPlaySong(filename, arrangement);
+        // (core already performed the play before emitting song:loaded)
         _ndInjectButton();
         _ndAttachAutoDetectListener();
 
@@ -13852,7 +13855,13 @@ setInterval(() => {
         // Refresh coaching panel + timeline + fretboard heatmap for the
         // new song. All auto-hide if no history exists.
         _ndRunPracticePanelUpdates();
-    };
+    }
+    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        window.slopsmith.on('song:loaded', onSongLoaded);
+    }
+    // A song may already be loaded when this plugin (re)loads — inject now so
+    // the Detect button appears without waiting for the next song change.
+    _ndInjectButton();
 })();
 
 // ── Built-in Diagnostic Panel ─────────────────────────────────────────────
