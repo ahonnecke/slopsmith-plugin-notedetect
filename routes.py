@@ -1,31 +1,73 @@
-"""Note detect plugin routes — diagnostic dump, audio recording, and play-history endpoints.
+"""Server-side routes for the note detection plugin.
 
-Plays history is stored in SQLite at CONFIG_DIR/notedetect_plays.db (two
-tables: plays + play_notes). The diagnostic dump and per-recording
-sidecars stay in /tmp because they are intentionally ephemeral.
+Three concerns live here:
+
+1. Diagnostics dump endpoint (POST/GET /diagnostics) — periodic state
+   capture so the user doesn't have to paste console output.
+2. Fixture serving (GET /fixtures, /fixtures/{name}) — replay
+   harness consumes these for offline detector validation.
+3. Plays storage (POST /plays, GET /plays, GET /play/{id}) — Unit S.1.
+   SQLite-backed snapshots of session-end note results so the modal,
+   history view, prescriptions, and fretboard heatmap can show
+   improvement-over-time + cross-play aggregates.
+
+All three use the bind-mounted plugin directory (NOT /tmp, which is
+tmpfs inside the slopsmith container) so files persist across
+container restarts and are readable from the host.
 """
 
-import json
-import logging
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from __future__ import annotations
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+import json
+import re
+import sqlite3
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
-logger = logging.getLogger("note_detect.routes")
 
-DUMP_FILE = Path("/tmp/nd_diag_dump.json")
-RECORDING_DIR = Path("/tmp/nd_recordings")
-LEGACY_PLAYS_DIR = Path("/tmp/nd_plays")  # pre-SQLite location; one-shot import
-PLAYS_KEEP_PER_SONG = 50  # SQLite makes retention cheap; bumped from JSON-era 10
+# Write to the plugin's own directory rather than /tmp because
+# slopsmith typically runs in a container where /tmp is tmpfs and
+# Diagnostics dump dir is resolved lazily in setup() under
+# context["config_dir"] for the same reason plays.db is — the plugin
+# bind-mount is READ-ONLY inside the container, so any path under
+# Path(__file__).parent fails silently with "read-only filesystem"
+# on every write. The earlier note suggesting `<plugin_dir>/diagnostics/`
+# was wrong and explains why no diagnostics were ever collected.
+_DIAG_DIR: Path | None = None
+# Fixture WAVs live under test/fixtures/ on the host (bind-mounted
+# into the container at the same path). The replay-baseline harness
+# (test/replay-baseline.js) drives puppeteer to fetch fixtures via
+# the route below, so the browser context can replay them through
+# the detection pipeline without a separate file server.
+_FIXTURES_DIR = Path(__file__).parent / "test" / "fixtures"
+# Cap retained dumps so a long-running session doesn't fill /tmp.
+# Newest 50 retained; older silently dropped on each write.
+_DIAG_RETENTION = 50
 
-_DB_PATH: Optional[str] = None  # populated by setup()
+# SQLite DB for play snapshots. Path is resolved lazily inside
+# setup() because we need context["config_dir"] — the plugin dir
+# itself is bind-mounted READ-ONLY in the slopsmith container, so
+# the DB has to live under /config (writable, persists across
+# container restarts, host-readable). Per song we keep the newest
+# _PLAYS_RETENTION_PER_SONG plays so a long-running player doesn't
+# blow up the DB; older plays drop on each write.
+_PLAYS_DB_PATH: Path | None = None
+_PLAYS_RETENTION_PER_SONG = 50
 
-SCHEMA = """
+# Unit 4b — auto-dumped WAV recordings + JSON judgment sidecars from
+# session-boundary persistence. Resolved lazily in setup() under
+# context["config_dir"] (same /config-rw constraint as plays.db and
+# diagnostics — the plugin dir is bind-mounted READ-ONLY).
+_RECORDING_DIR: Path | None = None
+_RECORDING_RETENTION = 30
+
+_PLAYS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS plays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   song_id TEXT NOT NULL,
@@ -34,49 +76,33 @@ CREATE TABLE IF NOT EXISTS plays (
   reason TEXT,
   is_drill INTEGER DEFAULT 0,
   drill_section_name TEXT,
-  hits INTEGER DEFAULT 0,
-  misses INTEGER DEFAULT 0,
-  pitch_score REAL,
+  hits INTEGER,
+  misses INTEGER,
+  total INTEGER,
+  detection REAL,
+  precision_pct REAL,
+  coverage REAL,
+  pitch_pct REAL,
   timing_median_ms REAL,
   timing_std_ms REAL,
-  coverage REAL,
   combined_weighted_score REAL,
   settings_json TEXT,
-  raw_started_at INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS play_notes (
-  play_id INTEGER NOT NULL REFERENCES plays(id) ON DELETE CASCADE,
-  section_name TEXT,
-  chart_t REAL NOT NULL,
-  string_idx INTEGER,
-  fret INTEGER,
-  expected_midi INTEGER,
-  detected_midi INTEGER,
-  primary_verdict TEXT NOT NULL,
-  labels_json TEXT,
-  timing_error_ms REAL,
-  pitch_error_cents REAL,
-  severity REAL,
-  sibling_claimed INTEGER DEFAULT 0,
-  detector_failure INTEGER DEFAULT 0,
-  note_key TEXT
+  note_results_json TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_plays_song ON plays(song_id, played_at DESC);
-CREATE INDEX IF NOT EXISTS idx_play_notes_play ON play_notes(play_id);
-CREATE INDEX IF NOT EXISTS idx_play_notes_section ON play_notes(play_id, section_name);
 """
 
 
 @contextmanager
-def _db():
-    """Per-request SQLite connection with FK enforcement and dict-like rows."""
-    if _DB_PATH is None:
-        raise RuntimeError("notedetect plays DB not initialized — setup() never ran")
-    conn = sqlite3.connect(_DB_PATH)
+def _plays_db() -> Generator[sqlite3.Connection]:
+    """Per-request SQLite connection. Row factory + FK enforcement.
+    Caller must be inside a request handler — the connection is
+    short-lived and committed/closed on context exit."""
+    if _PLAYS_DB_PATH is None:
+        raise RuntimeError("plays db path not configured — setup() never ran")
+    conn = sqlite3.connect(str(_PLAYS_DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -84,128 +110,34 @@ def _db():
         conn.close()
 
 
-def _init_schema():
-    with _db() as conn:
-        conn.executescript(SCHEMA)
+def _init_plays_db() -> None:
+    """Create the plays table on first startup. Idempotent — safe to
+    call on every server boot."""
+    if _PLAYS_DB_PATH is None:
+        raise RuntimeError("plays db path not configured — setup() never ran")
+    _PLAYS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _plays_db() as conn:
+        conn.executescript(_PLAYS_SCHEMA)
 
 
-def _insert_play(conn: sqlite3.Connection, data: dict, played_at_override: Optional[str] = None) -> int:
-    """Insert a play snapshot into plays + play_notes. Returns the new play_id."""
-    played_at = played_at_override or datetime.now(timezone.utc).isoformat()
-    summary = data.get("summary") or {}
-    hits = summary.get("hits", data.get("hits", 0))
-    misses = summary.get("misses", data.get("misses", 0))
-    cur = conn.execute(
-        """INSERT INTO plays (
-            song_id, play_id_client, played_at, reason,
-            is_drill, drill_section_name,
-            hits, misses, pitch_score, timing_median_ms, timing_std_ms,
-            coverage, combined_weighted_score, settings_json, raw_started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data.get("songId") or "unknown",
-            data.get("playId"),
-            played_at,
-            data.get("reason"),
-            1 if data.get("isDrill") else 0,
-            data.get("drillSectionName"),
-            int(hits or 0),
-            int(misses or 0),
-            summary.get("pitchScore"),
-            summary.get("timingMedianMs"),
-            summary.get("timingStdMs"),
-            summary.get("coverage"),
-            summary.get("combinedWeightedScore"),
-            json.dumps(data.get("settings")) if data.get("settings") else None,
-            data.get("startedAt"),
-        ),
-    )
-    play_id = cur.lastrowid
-    if play_id is None:
-        # Defensive: SQLite always returns a rowid for AUTOINCREMENT inserts;
-        # if it doesn't, the schema is wrong and we shouldn't write notes.
-        raise RuntimeError("plays INSERT did not produce a rowid")
-    notes = data.get("noteResults") or []
-    rows = []
-    for n in notes:
-        rows.append(
-            (
-                play_id,
-                n.get("sectionName"),
-                float(n.get("chartT") or 0.0),
-                n.get("s"),
-                n.get("f"),
-                n.get("expectedMidi"),
-                n.get("detectedMidi"),
-                n.get("primary") or "UNKNOWN",
-                json.dumps(n.get("labels")) if n.get("labels") else None,
-                n.get("timingError"),
-                n.get("pitchError"),
-                n.get("severity"),
-                1 if n.get("siblingClaimed") else 0,
-                1 if n.get("detectorFailure") else 0,
-                n.get("key"),
-            )
-        )
-    if rows:
-        conn.executemany(
-            """INSERT INTO play_notes (
-                play_id, section_name, chart_t, string_idx, fret,
-                expected_midi, detected_midi, primary_verdict, labels_json,
-                timing_error_ms, pitch_error_cents, severity,
-                sibling_claimed, detector_failure, note_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            rows,
-        )
-    return play_id
-
-
-def _prune_plays(conn: sqlite3.Connection, song_id: str, keep: int):
-    """Drop oldest plays beyond `keep` for this song. play_notes cascades via FK."""
+def _prune_plays(conn: sqlite3.Connection, song_id: str) -> None:
+    """Drop oldest plays beyond _PLAYS_RETENTION_PER_SONG for this
+    song. Keeps the DB bounded without a cron — runs on each insert."""
     extra = conn.execute(
-        "SELECT id FROM plays WHERE song_id = ? ORDER BY played_at DESC, id DESC LIMIT -1 OFFSET ?",
-        (song_id, keep),
+        "SELECT id FROM plays WHERE song_id = ? "
+        "ORDER BY played_at DESC, id DESC "
+        "LIMIT -1 OFFSET ?",
+        (song_id, _PLAYS_RETENTION_PER_SONG),
     ).fetchall()
-    for r in extra:
-        conn.execute("DELETE FROM plays WHERE id = ?", (r["id"],))
+    for row in extra:
+        conn.execute("DELETE FROM plays WHERE id = ?", (row["id"],))
 
 
-def _migrate_legacy_plays():
-    """Best-effort one-shot import of /tmp/nd_plays/<songId>/*.json into SQLite.
-
-    Idempotent: skips a song if its songId already has any plays in the DB.
-    """
-    if not LEGACY_PLAYS_DIR.exists():
-        return 0
-    imported = 0
-    with _db() as conn:
-        for song_dir in sorted(LEGACY_PLAYS_DIR.iterdir()):
-            if not song_dir.is_dir():
-                continue
-            # The song_dir name is a sanitized version of songId, so we can't
-            # exact-match against the original songId. Skip if any play whose
-            # song_id contains the dir name already exists — good enough to
-            # avoid double-import on repeated startups.
-            existing = conn.execute(
-                "SELECT 1 FROM plays WHERE song_id LIKE ? LIMIT 1",
-                (f"%{song_dir.name}%",),
-            ).fetchone()
-            if existing:
-                continue
-            for f in sorted(song_dir.glob("*.json")):
-                try:
-                    data = json.loads(f.read_text())
-                    _insert_play(conn, data)
-                    imported += 1
-                except Exception as e:
-                    logger.warning(f"skipping legacy play {f}: {e}")
-    if imported:
-        logger.info(f"notedetect: migrated {imported} legacy plays from {LEGACY_PLAYS_DIR}")
-    return imported
-
-
-def _row_to_play(row: sqlite3.Row, notes_rows: list) -> dict:
-    """Reconstruct the JSON shape the existing client expects."""
+def _row_to_play(row: sqlite3.Row) -> dict[str, Any]:
+    """Reconstruct the JSON shape the client expects from a plays row.
+    note_results_json is the full snapshot — port-shape judgments
+    (hit + timingState + pitchState + ignoredAsDetectorFailure +
+    chartNote, etc.) — stored as a blob and returned untouched."""
     return {
         "id": row["id"],
         "songId": row["song_id"],
@@ -217,181 +149,438 @@ def _row_to_play(row: sqlite3.Row, notes_rows: list) -> dict:
         "summary": {
             "hits": row["hits"],
             "misses": row["misses"],
-            "pitchScore": row["pitch_score"],
+            "total": row["total"],
+            "detection": row["detection"],
+            "precision": row["precision_pct"],
+            "coverage": row["coverage"],
+            "pitchPct": row["pitch_pct"],
             "timingMedianMs": row["timing_median_ms"],
             "timingStdMs": row["timing_std_ms"],
-            "coverage": row["coverage"],
             "combinedWeightedScore": row["combined_weighted_score"],
         },
-        "settings": json.loads(row["settings_json"]) if row["settings_json"] else None,
-        "startedAt": row["raw_started_at"],
-        "noteResults": [
-            {
-                "key": n["note_key"],
-                "sectionName": n["section_name"],
-                "chartT": n["chart_t"],
-                "s": n["string_idx"],
-                "f": n["fret"],
-                "expectedMidi": n["expected_midi"],
-                "detectedMidi": n["detected_midi"],
-                "primary": n["primary_verdict"],
-                "labels": json.loads(n["labels_json"]) if n["labels_json"] else [],
-                "timingError": n["timing_error_ms"],
-                "pitchError": n["pitch_error_cents"],
-                "severity": n["severity"],
-                "siblingClaimed": bool(n["sibling_claimed"]),
-                "detectorFailure": bool(n["detector_failure"]),
-            }
-            for n in notes_rows
-        ],
+        "settings": (
+            json.loads(row["settings_json"]) if row["settings_json"] else None
+        ),
+        "noteResults": json.loads(row["note_results_json"]),
     }
 
 
-def setup(app: FastAPI, context: dict):
-    global _DB_PATH
-    config_dir = Path(context.get("config_dir") or (Path.home() / ".local" / "share" / "rocksmith-cdlc"))
-    config_dir.mkdir(parents=True, exist_ok=True)
-    _DB_PATH = str(config_dir / "notedetect_plays.db")
-    _init_schema()
+def _slug(s: str | None) -> str:
+    """Slugify a song-id or title for filename use. Allows ascii
+    letters, digits, underscore and dash; everything else becomes
+    underscore. Empty / None → 'unknown'."""
+    if not s:
+        return "unknown"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_")
+    return cleaned or "unknown"
+
+
+def _prune_old_dumps() -> None:
+    """Drop everything beyond the newest _DIAG_RETENTION files. Called
+    on every write so the directory stays bounded without a cron."""
+    if _DIAG_DIR is None:
+        return
     try:
-        _migrate_legacy_plays()
-    except Exception as e:
-        logger.warning(f"notedetect: legacy plays migration failed: {e}")
-
-    # ── Diagnostic dump ─────────────────────────────────────────────────
-    @app.post("/api/plugins/note_detect/dump")
-    async def save_dump(request: Request):
-        data = await request.json()
-        DUMP_FILE.write_text(json.dumps(data, indent=2))
-        return {"ok": True, "path": str(DUMP_FILE)}
-
-    @app.get("/api/plugins/note_detect/dump")
-    async def get_dump():
-        if DUMP_FILE.exists():
-            return json.loads(DUMP_FILE.read_text())
-        return {"error": "no dump yet"}
-
-    # ── Audio recording ─────────────────────────────────────────────────
-    @app.post("/api/plugins/note_detect/recording")
-    async def save_recording(request: Request, file: UploadFile = File(...)):
-        RECORDING_DIR.mkdir(exist_ok=True)
-        name = file.filename or "recording.wav"
-        dest = RECORDING_DIR / name
-        content = await file.read()
-        dest.write_bytes(content)
-        chart_start = request.query_params.get("chartStartTime", "0")
-        meta = {"chartStartTime": float(chart_start), "sampleRate": 48000, "filename": name}
-        meta_path = dest.with_suffix(".json")
-        meta_path.write_text(json.dumps(meta, indent=2))
-        # Snapshot the global diag dump beside the recording so each session
-        # has its own immutable judgement log. Without this sidecar, the
-        # /tmp/nd_diag_dump.json gets overwritten on every auto-dump and
-        # post-hoc classify-session pulls whichever session's dump was last.
-        dump_dest = dest.with_name(dest.stem + ".dump.json")
-        if DUMP_FILE.exists():
+        files = sorted(
+            _DIAG_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[_DIAG_RETENTION:]:
             try:
-                dump_dest.write_text(DUMP_FILE.read_text())
-            except Exception:
+                stale.unlink()
+            except OSError:
                 pass
-        return {"ok": True, "path": str(dest), "size": len(content), "chartStartTime": float(chart_start)}
+    except OSError:
+        pass
 
-    @app.get("/api/plugins/note_detect/recording/{filename}")
-    async def get_recording(filename: str):
-        path = RECORDING_DIR / filename
-        if path.exists():
-            return FileResponse(path, media_type="audio/wav")
-        return {"error": "recording not found"}
 
-    @app.get("/api/plugins/note_detect/recordings")
-    async def list_recordings():
-        if not RECORDING_DIR.exists():
-            return {"recordings": []}
-        files = sorted(RECORDING_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return {"recordings": [{"name": f.name, "size": f.stat().st_size} for f in files]}
+def _prune_recordings() -> None:
+    """Drop oldest WAV+sidecar trios beyond _RECORDING_RETENTION. Each
+    recording is .wav + .json + .dump.json — pruning by .wav mtime and
+    deleting the matching sidecars keeps them in sync."""
+    if _RECORDING_DIR is None:
+        return
+    try:
+        wavs = sorted(
+            _RECORDING_DIR.glob("*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in wavs[_RECORDING_RETENTION:]:
+            siblings = [
+                stale,
+                stale.with_suffix(".json"),
+                stale.with_name(stale.stem + ".dump.json"),
+            ]
+            for sib in siblings:
+                try:
+                    sib.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
-    # ── Plays history (SQLite-backed) ───────────────────────────────────
+
+def setup(app: FastAPI, context: dict[str, Any]) -> None:
+    """Plugin loader entry point. Called once at startup by the
+    slopsmith plugin loader (see plugins/__init__.py:setup_plugin)."""
+
+    # Resolve the plays DB path AND diagnostics dir under
+    # context["config_dir"]. The plugin dir itself is mounted
+    # read-only in the slopsmith container, so /config (writable,
+    # persistent, bind-mounted to host) is the only valid home for
+    # state files. Same convention the highway_3d and practice_journal
+    # plugins use.
+    global _PLAYS_DB_PATH, _DIAG_DIR, _RECORDING_DIR
+    config_dir = Path(context.get("config_dir") or "/config")
+    _PLAYS_DB_PATH = config_dir / "note_detect" / "plays.db"
+    _DIAG_DIR = config_dir / "note_detect" / "diagnostics"
+    _RECORDING_DIR = config_dir / "note_detect" / "recordings"
+
+    # Initialize the plays DB schema. Idempotent — safe even if the
+    # file already exists from a prior run.
+    try:
+        _init_plays_db()
+    except Exception:
+        # Don't crash plugin load on a DB failure — the diagnostics +
+        # fixtures endpoints should still work even if /plays is broken.
+        pass
+
     @app.post("/api/plugins/note_detect/plays")
-    async def save_play(request: Request):
-        data = await request.json()
-        song_id = data.get("songId") or "unknown"
-        with _db() as conn:
-            play_id = _insert_play(conn, data)
-            _prune_plays(conn, song_id, PLAYS_KEEP_PER_SONG)
+    async def post_plays(request: Request) -> dict[str, Any]:
+        """Snapshot a finished play. Body: {songId, playId, reason,
+        isDrill, drillSectionName, startedAt, summary, settings,
+        noteResults}. Returns {id} for the new row.
+
+        noteResults is stored as a JSON blob (not normalized into
+        rows) — the client knows the shape, and the only access
+        patterns are 'list plays' + 'load one full play', neither of
+        which queries inner fields."""
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(400, f"invalid json: {e}")
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "payload must be an object")
+        song_id = payload.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId is required")
+        note_results = payload.get("noteResults")
+        if not isinstance(note_results, list):
+            raise HTTPException(400, "noteResults must be a list")
+        summary = payload.get("summary") or {}
+        played_at = payload.get("playedAt") or time.strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        try:
+            with _plays_db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO plays ("
+                    "song_id, play_id_client, played_at, reason, "
+                    "is_drill, drill_section_name, "
+                    "hits, misses, total, "
+                    "detection, precision_pct, coverage, pitch_pct, "
+                    "timing_median_ms, timing_std_ms, "
+                    "combined_weighted_score, "
+                    "settings_json, note_results_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?)",
+                    (
+                        str(song_id),
+                        payload.get("playId"),
+                        played_at,
+                        payload.get("reason"),
+                        1 if payload.get("isDrill") else 0,
+                        payload.get("drillSectionName"),
+                        summary.get("hits"),
+                        summary.get("misses"),
+                        summary.get("total"),
+                        summary.get("detection"),
+                        summary.get("precision"),
+                        summary.get("coverage"),
+                        summary.get("pitchPct"),
+                        summary.get("timingMedianMs"),
+                        summary.get("timingStdMs"),
+                        summary.get("combinedWeightedScore"),
+                        (
+                            json.dumps(payload["settings"])
+                            if payload.get("settings") is not None
+                            else None
+                        ),
+                        json.dumps(note_results),
+                    ),
+                )
+                play_id = cur.lastrowid
+                _prune_plays(conn, str(song_id))
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
         return {"ok": True, "id": play_id}
 
     @app.get("/api/plugins/note_detect/plays")
-    async def list_plays(songId: str, limit: int = PLAYS_KEEP_PER_SONG):
-        with _db() as conn:
-            rows = conn.execute(
-                "SELECT * FROM plays WHERE song_id = ? ORDER BY played_at DESC, id DESC LIMIT ?",
-                (songId, limit),
-            ).fetchall()
-            plays = []
-            for r in rows:
-                notes = conn.execute(
-                    "SELECT * FROM play_notes WHERE play_id = ? ORDER BY chart_t",
-                    (r["id"],),
-                ).fetchall()
-                plays.append(_row_to_play(r, notes))
-        return {"plays": plays}
+    def list_plays(songId: str | None = None, limit: int = 10) -> dict[str, Any]:
+        """List plays newest-first. Optional songId filter (most
+        callers want this — history view + improvement deltas only
+        compare against the same song). Limit caps at 50 to bound
+        the response size; the per-song retention is the same so
+        callers can request as many as exist."""
+        try:
+            limit = max(1, min(50, int(limit)))
+        except (TypeError, ValueError):
+            limit = 10
+        try:
+            with _plays_db() as conn:
+                if songId:
+                    rows = conn.execute(
+                        "SELECT * FROM plays WHERE song_id = ? "
+                        "ORDER BY played_at DESC, id DESC LIMIT ?",
+                        (songId, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM plays "
+                        "ORDER BY played_at DESC, id DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
+        return {"plays": [_row_to_play(r) for r in rows]}
 
     @app.get("/api/plugins/note_detect/play/{play_id}")
-    async def get_play(play_id: int):
-        with _db() as conn:
-            row = conn.execute("SELECT * FROM plays WHERE id = ?", (play_id,)).fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="play not found")
-            notes = conn.execute(
-                "SELECT * FROM play_notes WHERE play_id = ? ORDER BY chart_t",
-                (play_id,),
-            ).fetchall()
-        return _row_to_play(row, notes)
+    def get_play(play_id: int) -> dict[str, Any]:
+        """Fetch one play by id. Used by the coaching review modal."""
+        try:
+            with _plays_db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM plays WHERE id = ?", (play_id,)
+                ).fetchone()
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"db error: {e}")
+        if row is None:
+            raise HTTPException(404, f"play {play_id} not found")
+        return _row_to_play(row)
 
-    @app.get("/api/plugins/note_detect/sections/{song_id_b64:path}")
-    async def section_history(song_id_b64: str, limit: int = 10):
-        """Per-section trend across the most-recent plays for this song.
+    @app.post("/api/plugins/note_detect/diagnostics")
+    async def post_diagnostics(request: Request) -> dict[str, Any]:
+        # Wide except: a malformed POST shouldn't crash the route.
+        # The endpoint is best-effort — if a write fails we surface
+        # the reason but don't propagate as a 500 because the plugin
+        # uses fire-and-forget POSTs.
+        try:
+            payload = await request.json()
+        except Exception as e:
+            return {"ok": False, "error": f"invalid json: {e}"}
 
-        Path-encoded song_id (with potential slashes) is matched literally.
-        Returns one entry per distinct section_name with a trend array of
-        per-play scores so the historical view can render a sparkline.
-        """
-        with _db() as conn:
-            recent = conn.execute(
-                "SELECT id, played_at FROM plays WHERE song_id = ? ORDER BY played_at DESC, id DESC LIMIT ?",
-                (song_id_b64, limit),
-            ).fetchall()
-            if not recent:
-                return {"sections": [], "plays": []}
-            play_ids = [r["id"] for r in recent]
-            placeholders = ",".join("?" for _ in play_ids)
-            agg = conn.execute(
-                f"""SELECT play_id, section_name,
-                          SUM(CASE WHEN primary_verdict IN ('HIT','DIRTY_HIT') THEN 1 ELSE 0 END) AS hits,
-                          SUM(CASE WHEN primary_verdict LIKE 'MISSED%' THEN 1 ELSE 0 END) AS misses,
-                          COUNT(*) AS total
-                   FROM play_notes
-                   WHERE play_id IN ({placeholders}) AND section_name IS NOT NULL
-                   GROUP BY play_id, section_name""",
-                play_ids,
-            ).fetchall()
-        # Restructure: sections[name] -> [{playId, hits, misses, total, accuracy}, ...]
-        sections: dict = {}
-        for row in agg:
-            sec = row["section_name"]
-            if sec not in sections:
-                sections[sec] = []
-            total = row["total"] or 0
-            hits = row["hits"] or 0
-            sections[sec].append(
-                {
-                    "playId": row["play_id"],
-                    "hits": hits,
-                    "misses": row["misses"] or 0,
-                    "total": total,
-                    "accuracy": (hits / total) if total else None,
-                }
-            )
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "payload must be an object"}
+
+        if _DIAG_DIR is None:
+            return {"ok": False, "error": "diag dir not configured"}
+
+        song_id = payload.get("songId") or payload.get("songTitle") or "unknown"
+        ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+        slug = _slug(str(song_id))
+        filename = f"{slug}-{ts}.json"
+
+        try:
+            _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+            target = _DIAG_DIR / filename
+            target.write_text(json.dumps(payload, indent=2))
+        except OSError as e:
+            return {"ok": False, "error": f"write failed: {e}"}
+
+        _prune_old_dumps()
+        return {"ok": True, "path": str(target), "retained": _DIAG_RETENTION}
+
+    # ── Audio recordings (Unit 4b) ────────────────────────────────────
+    # Auto-finalized at session boundaries when client-side recording is
+    # active. Three files land per session: <name>.wav (the audio),
+    # <name>.json (metadata: chartStartTime, sampleRate, songId),
+    # <name>.dump.json (judgment sidecar in replay-baseline-compatible
+    # shape so the WAV can be promoted to a fixture).
+    @app.post("/api/plugins/note_detect/recording")
+    async def post_recording(
+        request: Request,
+        file: UploadFile = File(...),
+        dump: str | None = Form(None),
+    ) -> dict[str, Any]:
+        if _RECORDING_DIR is None:
+            raise HTTPException(500, "recording dir not configured")
+        try:
+            _RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(500, f"recording dir not writable: {e}")
+        name = _slug((file.filename or "recording").rsplit(".wav", 1)[0]) + ".wav"
+        dest = _RECORDING_DIR / name
+        try:
+            content = await file.read()
+            dest.write_bytes(content)
+        except OSError as e:
+            raise HTTPException(500, f"wav write failed: {e}")
+        params = request.query_params
+        try:
+            chart_start = float(params.get("chartStartTime", "0"))
+        except (TypeError, ValueError):
+            chart_start = 0.0
+        try:
+            sample_rate = int(params.get("sampleRate", "48000"))
+        except (TypeError, ValueError):
+            sample_rate = 48000
+        meta = {
+            "filename": name,
+            "chartStartTime": chart_start,
+            "sampleRate": sample_rate,
+            "songId": params.get("songId"),
+            "playId": params.get("playId"),
+            "reason": params.get("reason"),
+        }
+        try:
+            dest.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        except OSError:
+            pass
+        if dump:
+            try:
+                # Validate JSON before writing — a malformed dump
+                # shouldn't pollute the directory.
+                parsed = json.loads(dump)
+                dest.with_name(dest.stem + ".dump.json").write_text(
+                    json.dumps(parsed, indent=2)
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
+        _prune_recordings()
         return {
-            "plays": [{"id": r["id"], "playedAt": r["played_at"]} for r in recent],
-            "sections": [{"name": name, "trend": trend} for name, trend in sections.items()],
+            "ok": True,
+            "path": str(dest),
+            "size": len(content),
+            "chartStartTime": chart_start,
+        }
+
+    @app.get("/api/plugins/note_detect/recordings")
+    def list_recordings() -> dict[str, Any]:
+        if _RECORDING_DIR is None or not _RECORDING_DIR.is_dir():
+            return {"recordings": []}
+        try:
+            wavs = sorted(
+                _RECORDING_DIR.glob("*.wav"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return {"recordings": []}
+        return {
+            "recordings": [
+                {
+                    "name": w.name,
+                    "size": w.stat().st_size,
+                    "mtime": w.stat().st_mtime,
+                }
+                for w in wavs
+            ],
+        }
+
+    @app.get("/api/plugins/note_detect/recording/{name}")
+    def get_recording(name: str) -> Any:
+        if _RECORDING_DIR is None:
+            raise HTTPException(500, "recording dir not configured")
+        if "/" in name or "\\" in name or ".." in name.split("/"):
+            raise HTTPException(400, "invalid recording name")
+        target = (_RECORDING_DIR / name).resolve()
+        try:
+            target.relative_to(_RECORDING_DIR.resolve())
+        except ValueError:
+            raise HTTPException(400, "path escape detected")
+        if not target.is_file():
+            raise HTTPException(404, f"recording not found: {name}")
+        if name.endswith(".wav"):
+            return FileResponse(target, media_type="audio/wav", filename=name)
+        if name.endswith(".json"):
+            return FileResponse(target, media_type="application/json", filename=name)
+        raise HTTPException(400, "unsupported extension")
+
+    # Fixtures known to be tuning-mismatched against their charts and
+    # therefore meaningless for cross-fixture detector validation. Stand
+    # By Me recordings are in standard E tuning but the chart authoring
+    # expects Eb — every chart pitch is one semitone off. Tagged here
+    # rather than deleted because the WAVs themselves are still useful
+    # for non-pitch tests (onset density, sustain bleed, hygiene).
+    _EXCLUDED_PREFIXES = ("stand_by_me", "stand-by-me")
+
+    @app.get("/api/plugins/note_detect/fixtures")
+    def list_fixtures() -> dict[str, Any]:
+        """List the WAV fixtures + JSON sidecars available for replay.
+        Used by test/replay-baseline.js to discover what's available
+        without a host-side filesystem walk. Tuning-mismatched
+        fixtures get an `excluded` flag so consumers default to
+        skipping them."""
+        if not _FIXTURES_DIR.is_dir():
+            return {"fixtures": []}
+        wavs = sorted(_FIXTURES_DIR.glob("*.wav"))
+        out: list[dict[str, Any]] = []
+        for w in wavs:
+            sidecar = w.with_suffix(".json")
+            chart_start = 0.0
+            song_id = None
+            if sidecar.is_file():
+                try:
+                    sc = json.loads(sidecar.read_text())
+                    chart_start = float(sc.get("chartStartTime", 0.0))
+                    song_id = sc.get("songId") or sc.get("filename")
+                except Exception:
+                    pass
+            lname = w.name.lower()
+            excluded = any(lname.startswith(p) for p in _EXCLUDED_PREFIXES)
+            entry: dict[str, Any] = {
+                "name": w.name,
+                "size": w.stat().st_size,
+                "chartStartTime": chart_start,
+                "songId": song_id,
+            }
+            if excluded:
+                entry["excluded"] = True
+                entry["excludedReason"] = "tuning mismatch (chart in Eb, recording in E)"
+            out.append(entry)
+        return {"fixtures": out}
+
+    @app.get("/api/plugins/note_detect/fixtures/{name}")
+    def get_fixture(name: str) -> Any:
+        """Serve a WAV fixture file. Path-traversal-safe via name
+        sanitization: must be a single filename ending in .wav and
+        must resolve inside _FIXTURES_DIR."""
+        if "/" in name or "\\" in name or ".." in name.split("/"):
+            raise HTTPException(400, "invalid fixture name")
+        if not name.endswith(".wav"):
+            raise HTTPException(400, "fixture must be a .wav file")
+        target = (_FIXTURES_DIR / name).resolve()
+        try:
+            target.relative_to(_FIXTURES_DIR.resolve())
+        except ValueError:
+            raise HTTPException(400, "path escape detected")
+        if not target.is_file():
+            raise HTTPException(404, f"fixture not found: {name}")
+        return FileResponse(target, media_type="audio/wav", filename=name)
+
+    @app.get("/api/plugins/note_detect/diagnostics")
+    def list_diagnostics() -> dict[str, Any]:
+        # Useful for ad-hoc browsing — returns the most-recent dumps
+        # newest-first as a small JSON listing.
+        if _DIAG_DIR is None or not _DIAG_DIR.is_dir():
+            return {"files": []}
+        try:
+            files = sorted(
+                _DIAG_DIR.glob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return {"files": []}
+        return {
+            "files": [
+                {
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "mtime": f.stat().st_mtime,
+                }
+                for f in files[:_DIAG_RETENTION]
+            ],
         }
