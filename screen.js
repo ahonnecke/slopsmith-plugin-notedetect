@@ -4439,7 +4439,7 @@ function createNoteDetector(options = {}) {
             })()}
 
             <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
-            <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
+            <input type="range" min="0" max="500" value="${Math.round(latencyOffset * 1000)}"
                    class="nd-latency-slider w-full accent-green-400 mb-2">
             <div class="text-[10px] text-gray-600 mb-2 leading-tight">
                 Compensates for USB/audio interface delay. Increase if notes register late.
