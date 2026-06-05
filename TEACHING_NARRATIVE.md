@@ -101,6 +101,24 @@ against recorded takes via `tools/harness.js`. So:
   diagnosable by **replaying a captured WAV offline** — which needs the recording
   pipeline working (see SP-A). Synth tracks pass; real mic input fails.
 
+## Retrospective — why the recording/harness loop kept failing
+
+Every time-sink traced to an **undocumented pipeline internal** or an
+**unverified assumption**, not the detector:
+
+| What broke | Root cause | Fix |
+|---|---|---|
+| Recordings "never saved" (searched `static/`, empty) | `STATIC_DIR` unset → recordings fell to the `/config` Docker **volume**, invisible from the host | `STATIC_DIR=/app/static` in docker-compose (commit 68946a1); PR'd upstream |
+| "Go play" → nothing captured | Sent the user to act without verifying tuning-mode/arm/save-fires first | Verify the whole pipeline before any human action; `tools/sweep-latest.sh` checks for a WAV first |
+| Quoted "Calibrate from this play"/Arm that weren't there | Carried the *recovered fork's* UI after switching to Byron's base (those gate behind `tuningMode`, off) | Re-ground in the running `screen.js` after any base change |
+| WAV save never fired | Save is song-end-only + the gear **Save** button; user stopped early | Flow: Arm → play → **Save** |
+| Harness reported false 0% / low recall | Undocumented chart conventions: `tuning` must be **offsets** not absolute MIDI; bass needs `--string-count 4`; recovered dumps weren't aligned charts | Conventions baked into `tools/sweep-latest.sh`; prefer a sloppak's `arrangements/<id>.json` |
+
+**Codified so it can't recur:** `tools/sweep-latest.sh` (one-command loop, all
+six gotchas baked in), the `STATIC_DIR` fix, and this table. The lesson:
+**human time is precious — verify the running code + the data path before asking
+them to do anything.**
+
 ## Concrete plan
 
 **SP-A (GATING — do first): fix & confirm the test harness + recording pipeline
