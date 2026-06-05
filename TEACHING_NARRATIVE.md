@@ -112,6 +112,7 @@ Every time-sink traced to an **undocumented pipeline internal** or an
 | "Go play" → nothing captured | Sent the user to act without verifying tuning-mode/arm/save-fires first | Verify the whole pipeline before any human action; `tools/sweep-latest.sh` checks for a WAV first |
 | Quoted "Calibrate from this play"/Arm that weren't there | Carried the *recovered fork's* UI after switching to Byron's base (those gate behind `tuningMode`, off) | Re-ground in the running `screen.js` after any base change |
 | WAV save never fired | Save is song-end-only + the gear **Save** button; user stopped early | Flow: Arm → play → **Save** |
+| "Recorded all morning", 0 WAVs, 64 live-judgments | **`tuningMode` was OFF** → the **Arm button isn't even rendered** (gated at screen.js:3803/3942), so nothing armed, `_recChunks` stayed empty, `saveRecordingNow()` bailed at the empty-check. Detect-on still streams judgments, which *looks* like recording. `tuningMode` is **localStorage-only** (`_ND_STORAGE_KEY`) — server can't see or set it | One-time: console `window.noteDetect.setTuningMode(true)` (persists via saveSettings). THEN Arm appears; a **partial** take saves fine via the gear **Save** button — no full song needed |
 | Harness reported false 0% / low recall | Undocumented chart conventions: `tuning` must be **offsets** not absolute MIDI; bass needs `--string-count 4`; recovered dumps weren't aligned charts | Conventions baked into `tools/sweep-latest.sh`; prefer a sloppak's `arrangements/<id>.json` |
 
 **Codified so it can't recur:** `tools/sweep-latest.sh` (one-command loop, all
@@ -131,6 +132,13 @@ harness result without burning the user's time. Required:
 - **The WAV save must actually fire.** For the 2026-06-05 play it didn't (no
   `POST /recording`) — auto-save is song-end-only + a Save button; verify the
   trigger and that `_recChunks` capture when armed.
+  **DONE (v1.13.0):** recording no longer hides behind tuning mode. The new
+  `autoRecord` setting (default on) makes the default singleton auto-arm on
+  every `song:loaded`, so each play with Detect on is captured and auto-saves
+  on song:ended — no Arm click, no tuning mode. Stopping a song mid-play
+  flushes the take on the next load. Opt out in Settings → "Auto-record every
+  play". This was the real root cause of "recorded all morning, 0 WAVs":
+  tuning mode was off → no Arm button → nothing ever armed.
 - **A documented, repeatable harness invocation** (method, `--sample-rate 48000`,
   `--arrangement bass --string-count 4`, chart in wire format with tuning as
   *offsets*) plus one **known-good example** that reproduces a number, so the loop
