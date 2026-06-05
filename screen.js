@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.13.1';
+const _ND_VERSION = '1.13.2';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -5616,12 +5616,6 @@ function createNoteDetector(options = {}) {
         _syncChartStateFromHw();
         _chartStateBindEvents();
 
-        // Auto-record every play (default singleton only; no-op otherwise).
-        // Bound here, with the other enable-time song listeners, so it's
-        // only live while detection is — capture taps the detector graph,
-        // and the vm tests (which can't enable()) never register it.
-        _bindAutoRecord();
-
         resetScoring();
 
         // Queue the audio acquisition through the shared chain so
@@ -5687,6 +5681,13 @@ function createNoteDetector(options = {}) {
         }, 5000);
 
         if (detectionMethod === 'crepe') _ndLoadCrepe();
+
+        // Auto-record every play (default singleton only; no-op otherwise).
+        // Bound only here, on the fully-enabled path after audio is up, and
+        // unbound in disable() — so the song listeners never linger or arm
+        // a take while Detect is off. The vm tests can't enable(), so they
+        // never register it, keeping the listener-count contracts intact.
+        _bindAutoRecord();
         return true;
     }
 
@@ -5705,6 +5706,10 @@ function createNoteDetector(options = {}) {
         sessionGen++;
         stopAudio();
         stopHUD();
+        // Auto-record is the one enable-bound listener we drop on disable()
+        // (not only on destroy): its handler arms/saves takes, so it must
+        // not stay live while Detect is off. Re-enable rebinds it.
+        _unbindAutoRecord();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
