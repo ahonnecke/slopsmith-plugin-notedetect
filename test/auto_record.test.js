@@ -60,13 +60,29 @@ test('non-default instance never binds auto-record', () => {
     det.destroy();
 });
 
-test('_unbindAutoRecord removes the song:loaded listener', () => {
+test('_bindAutoRecord wires song:loaded, song:pause and song:play; _unbindAutoRecord removes all three', () => {
     const core = loadDetectionCore();
     const det = core.createNoteDetector({ isDefault: true });
     det._bindAutoRecord();
     assert.equal(core.slopsmith._listenerCount('song:loaded'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:pause'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:play'), 1);
     det._unbindAutoRecord();
     assert.equal(core.slopsmith._listenerCount('song:loaded'), 0);
+    assert.equal(core.slopsmith._listenerCount('song:pause'), 0);
+    assert.equal(core.slopsmith._listenerCount('song:play'), 0);
+    det.destroy();
+});
+
+test('song:play re-arms when nothing is armed (resume after a pause-save)', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindAutoRecord();
+    // No prior song:loaded — a bare play still arms a fresh take.
+    assert.equal(det.getRecordingState().armed, false);
+    core.slopsmith._fire('song:play', {});
+    assert.equal(det.getRecordingState().armed, true, 'play armed a take');
+    assert.equal(det.getRecordingState().songPlaying, true, 'and marked the song playing so frames capture');
     det.destroy();
 });
 

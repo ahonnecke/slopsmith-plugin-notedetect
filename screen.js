@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.13.0';
+const _ND_VERSION = '1.13.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -6870,10 +6870,17 @@ function createNoteDetector(options = {}) {
     // we must await it before re-arming or the new take loses its
     // listeners. A deliberate training take (_recArmedForTraining) is
     // left untouched.
-    let _autoRecOnLoaded = null;
+    let _autoRecOnLoaded = null, _autoRecOnPause = null, _autoRecOnPlay = null;
+    // Minimum captured seconds before a pause auto-saves — so a brief
+    // pause mid-song (tweaking a setting, then resuming) doesn't spew a
+    // string of tiny fragment WAVs.
+    const _AUTO_REC_MIN_PAUSE_SAVE_S = 3;
     function _bindAutoRecord() {
         if (!isDefault || _autoRecOnLoaded) return;
         if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        // New song loaded → flush any take stranded by a stop (no
+        // song:ended) so two songs don't bleed into one WAV, then arm
+        // the upcoming play.
         _autoRecOnLoaded = async () => {
             if (!autoRecord || !detectPreference) return;
             if (_recArmedForTraining) return;
@@ -6883,13 +6890,40 @@ function createNoteDetector(options = {}) {
             }
             armRecording();
         };
-        try { window.slopsmith.on('song:loaded', _autoRecOnLoaded); }
-        catch (_) { _autoRecOnLoaded = null; }
+        // Pause = "done with this take" for the short-take workflow
+        // (play a bit, stop, harness it). Save it — saveRecordingNow()
+        // disarms; the next song:play re-arms a fresh take. Gated on a
+        // minimum length so a resume-after-a-blip doesn't spam fragments.
+        _autoRecOnPause = () => {
+            if (!autoRecord || _recArmedForTraining || !_recArmed) return;
+            const secs = _recTotalSamples / Math.max(1, _recSampleRate);
+            if (_recChunks.length > 0 && secs >= _AUTO_REC_MIN_PAUSE_SAVE_S) {
+                saveRecordingNow().catch(() => {});
+            }
+        };
+        // Re-arm on play when nothing's armed — covers resume after a
+        // pause-save, and a play not preceded by a fresh song:loaded.
+        // armRecording() binds its own _recOnPlay AFTER this play event
+        // already fired, so set _recSongPlaying here or the first frames
+        // of the resumed take wouldn't be captured.
+        _autoRecOnPlay = () => {
+            if (!autoRecord || !detectPreference || _recArmedForTraining || _recArmed) return;
+            armRecording();
+            _recSongPlaying = true;
+        };
+        try {
+            window.slopsmith.on('song:loaded', _autoRecOnLoaded);
+            window.slopsmith.on('song:pause',  _autoRecOnPause);
+            window.slopsmith.on('song:play',   _autoRecOnPlay);
+        } catch (_) { _unbindAutoRecord(); }
     }
     function _unbindAutoRecord() {
-        if (!_autoRecOnLoaded) return;
-        try { window.slopsmith.off('song:loaded', _autoRecOnLoaded); } catch (_) {}
-        _autoRecOnLoaded = null;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_autoRecOnLoaded) { try { window.slopsmith.off('song:loaded', _autoRecOnLoaded); } catch (_) {} }
+            if (_autoRecOnPause)  { try { window.slopsmith.off('song:pause',  _autoRecOnPause); } catch (_) {} }
+            if (_autoRecOnPlay)   { try { window.slopsmith.off('song:play',   _autoRecOnPlay); } catch (_) {} }
+        }
+        _autoRecOnLoaded = _autoRecOnPause = _autoRecOnPlay = null;
     }
 
     // Live-streaming event bindings — only active while tuning mode is
