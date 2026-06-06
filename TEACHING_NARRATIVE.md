@@ -70,6 +70,29 @@ rushing the position shift; the chorus is solid. Drill bars 17-20 at 80%."*
 - This replaces/augments the programmatic coaching with explanation a learner
   can act on — the whole point of the tool.
 
+### The target: every play yields *actionable* feedback (one of two forms)
+
+The bar for "done" is that a play never just produces a bare number — it
+produces something the learner (or the tool) can act on. Each flagged note
+resolves to exactly one of two outcomes, and **both are acceptable because both
+are actionable**:
+
+1. **Localized + categorized failure** — *where* and *what*: a specific section
+   (intro, the fast run at 0:48) plus a specific failure type (wrong note, late,
+   string noise, muted/ghosted, wrong string). Actionable for the **learner** —
+   they know exactly what to drill.
+2. **"Looked right to the AI → send it to the harness."** When the play looked
+   correct but the tool scored it a miss (the detector's fault, not the
+   player's), the right output is to route that note/clip into the harness for
+   offline detector work. Actionable for the **tool** — it becomes a detector
+   fix, not a false "you missed" that erodes trust.
+
+The system must be able to tell these apart — player error vs detector error —
+and emit the matching action. Outcome 2 is exactly the loop that surfaced the
+frame-size bass-recall fix: a "miss" that was really the detector, caught by the
+harness. Wiring this judgment (player-fault vs tool-fault) into the per-play
+feedback is the concrete shape of the north-star coaching output.
+
 ## How we work (operating model)
 
 **Human time is precious; LLM time is abundant.** The user's only scarce,
