@@ -107,6 +107,25 @@ have a **tool** that fixes it, not only a drill that grinds it:
   permanent metronome over the whole song. This is the concrete tool behind the
   "your tempo is off" feedback (vs. the general drill loop below, which is the
   catch-all for any recurring hot spot).
+- **Played-during-a-rest → score the silence (forward-looking).** "The notes you
+  *don't* play are as important as the ones you do." Bass routinely drops a note
+  on purpose — e.g. *Why'd You Only Call* ~0:45, where the lick that's normally
+  4-5-5 (on the A string at ~0:40) becomes **4-5-SILENT** — and often the rest is
+  the musical point (it lines up with the lyric / a drop-out that lands harder on
+  the re-entry). Playing the dropped note should register as a **miss** (a new
+  failure type, the inverse of `no_detection`: a detection where the chart wants
+  silence). **Why this is harder than it sounds, and a prerequisite, not a quick
+  win:** the chart has to *mark* intentional rests per instrument, and RS2014
+  charts don't — you can't infer "deliberate silence" from a gap, because gaps
+  between phrases are everywhere. `lib/song.py`'s `Note` has `mute`/`palm_mute`/
+  `fret_hand_mute` (muted *notes*) but no rest concept, and `sloppak-spec` has
+  none either. The path: extend the sloppak format (its unknown-keys hook
+  allows it) with an explicit per-instrument **rests** track ("be quiet from t0
+  to t1") — authored or, riskily, heuristically inferred — then the detector
+  flags a confident detection inside a rest window as the error. The *scoring* is
+  easy once the rests exist; **getting the rest markers into the chart is the
+  real work.** (Same shape as a drums drop-out that hits harder on the re-entry —
+  negative space as a first-class, scoreable chart event.)
 - (Other categories — wrong note, string noise, muted/ghosted — get their own
   tools/coaching as they're built out.)
 
