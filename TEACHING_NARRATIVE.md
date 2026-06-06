@@ -210,14 +210,12 @@ play (a free "Practice spots" panel built from `play_feedback.v1`), so the drill
 loop is reachable **without** an Anthropic API key; the LLM-written plan, when a
 key is set, upgrades the same panel in place.
 
-**Open (coaching LLM auth):** the user wants the LLM analysis billed to their
-**Claude Max** subscription (OAuth) rather than a pay-as-you-go API key. Caveat to
-resolve first: the Messages API the coaching plugin calls authenticates with an
-API key; a Max/Pro subscription is a claude.ai consumer plan and does not, on its
-own, grant Messages-API access. A Claude-Code-style OAuth token would need a local
-proxy and is unsupported/ToS-gray for third-party apps — needs verification before
-building. Until resolved, the API-key path stands; the no-key drill panel works
-regardless.
+**Coaching LLM auth — DECIDED (2026-06-06): API key.** The user briefly wanted the
+LLM analysis billed to their **Claude Max** subscription, but Max/Pro is a claude.ai
+consumer plan and does not grant Messages-API access (which the plugin calls with an
+`sk-ant-` key); a Max-OAuth path would need an unsupported local proxy. Given that,
+the user chose to keep the supported API-key path. The no-key drill panel works
+regardless of LLM auth.
 
 ## How we work (operating model)
 
