@@ -93,6 +93,23 @@ frame-size bass-recall fix: a "miss" that was really the detector, caught by the
 harness. Wiring this judgment (player-fault vs tool-fault) into the per-play
 feedback is the concrete shape of the north-star coaching output.
 
+### Per-failure-type tools (the categorized half of outcome 1)
+
+A localized + categorized failure shouldn't just be *named* — each category can
+have a **tool** that fixes it, not only a drill that grinds it:
+
+- **Tempo / timing off → a click track.** A metronome the user can play against.
+  The sharp case is a **bass intro where the bass is the very first beat**: there
+  is no preceding sound to lock to, so the bassist has nothing to time against
+  and the timing scatters. Three modes: **off**, **always on**, or
+  **bass-intros only** — where the click leads the player in and then *fades out
+  once the rest of the mix enters*, so it's a crutch for the entrance only, not a
+  permanent metronome over the whole song. This is the concrete tool behind the
+  "your tempo is off" feedback (vs. the general drill loop below, which is the
+  catch-all for any recurring hot spot).
+- (Other categories — wrong note, string noise, muted/ghosted — get their own
+  tools/coaching as they're built out.)
+
 ### The learner branch: the deliberate-practice drill loop
 
 When the decision is **player-fault**, the feedback the user gets is not a list
