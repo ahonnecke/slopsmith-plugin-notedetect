@@ -93,6 +93,34 @@ frame-size bass-recall fix: a "miss" that was really the detector, caught by the
 harness. Wiring this judgment (player-fault vs tool-fault) into the per-play
 feedback is the concrete shape of the north-star coaching output.
 
+### The learner branch: the deliberate-practice drill loop
+
+When the decision is **player-fault**, the feedback the user gets is not a list
+of mistakes — it's a **practice loop** that walks the classic slow-it-down,
+speed-it-up method automatically:
+
+1. **Find the hot spot** — the section with the most mistakes (from per-section
+   miss stats), not scattered one-off errors.
+2. **Auto-set an A–B loop** bracketing it: start a beat *before* the hot spot,
+   end a beat *after*, so the run-in and run-out are included.
+3. **Play the loop slowed down** — every note, at a reduced playback speed the
+   user can actually hit cleanly.
+4. **Ramp the speed** — once the user clears the loop at the current speed (a
+   per-iteration accuracy threshold), bump the speed and continue.
+5. **Graduate** — when they play the section cleanly at full speed, drop the
+   loop, replay the **full song**, and find the next hot spot.
+6. **Repeat** until no hot spot clears the threshold.
+
+Building blocks that already exist (orchestration is the new part): A–B loops
+(`feat/drill-mode`, the `/api/loops` endpoint), reduced playback speed (the
+half-speed path), per-section accuracy for hot-spot detection, and
+`getDrillStats()` for per-iteration scoring. What's missing is the conductor:
+auto-pick the hot spot → auto-set the loop → auto-ramp speed on a clearance
+criterion → graduate back to the full song. (Reliability prerequisite: the
+detector must be trustworthy enough that a "mistake" is real — otherwise the
+loop drills the player on the detector's blind spots. Hence the bass-recall
+fix lands first.)
+
 ## How we work (operating model)
 
 **Human time is precious; LLM time is abundant.** The user's only scarce,
