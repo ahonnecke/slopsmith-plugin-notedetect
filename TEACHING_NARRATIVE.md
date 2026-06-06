@@ -205,7 +205,19 @@ loop) are now ported too, closing the whole loop:
 The conductor is also reachable via coaching's already-computed
 `hotspot.drill = {loopA, loopB, speedMul, goal}` → `window.noteDetect.startDrill`
 (the coaching panel's "Practice this" button) — a second entry point alongside
-the in-plugin finder banner.
+the in-plugin finder banner. As of coaching v0.5.0 that panel is shown on **every**
+play (a free "Practice spots" panel built from `play_feedback.v1`), so the drill
+loop is reachable **without** an Anthropic API key; the LLM-written plan, when a
+key is set, upgrades the same panel in place.
+
+**Open (coaching LLM auth):** the user wants the LLM analysis billed to their
+**Claude Max** subscription (OAuth) rather than a pay-as-you-go API key. Caveat to
+resolve first: the Messages API the coaching plugin calls authenticates with an
+API key; a Max/Pro subscription is a claude.ai consumer plan and does not, on its
+own, grant Messages-API access. A Claude-Code-style OAuth token would need a local
+proxy and is unsupported/ToS-gray for third-party apps — needs verification before
+building. Until resolved, the API-key path stands; the no-key drill panel works
+regardless.
 
 ## How we work (operating model)
 
