@@ -177,6 +177,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
+        '_ndDrillRampDecision',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -293,6 +294,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
             };
         },
         calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
+        drillRampDecision: sandbox._ndDrillRampDecision,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

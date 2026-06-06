@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.15.2';
+const _ND_VERSION = '1.16.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -510,6 +510,32 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 // window needs to be longer than the input — at 48 kHz a 30 Hz period is
 // ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
 const _ND_MIN_DETECTABLE_HZ = 30;
+
+// ── Drill conductor tuning ───────────────────────────────────────────────
+// The speed/goal orchestrator (startDrill) layered on top of the
+// loop:restart iteration scoring. Defaults recovered from the prior
+// deliberate-practice loop: drill slow, step the speed up only when an
+// iteration clears the accuracy goal, graduate at full speed.
+const _ND_DRILL_LEAD_IN_SEC = 2.0;            // audible pre-roll before the judged window (a count's worth)
+const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
+const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
+const _ND_DRILL_DEFAULT_LADDER = [0.7, 0.85, 1.0];  // playback-speed rungs, slow → full
+
+// Pure goal-gate decision for one finished drill iteration. Given the
+// iteration's accuracy `score` (0..1), the `goal` (0..1), the current
+// ladder `rung`, and the ladder `length`, decide whether to hold at this
+// speed, step up a rung, or graduate. No DOM/audio — unit-testable; the
+// conductor's _drillConductorOnIteration applies the result.
+//   - miss the goal            → { action: 'hold',     nextRung: rung }
+//   - clear it below full speed → { action: 'advance',  nextRung: rung+1 }
+//   - clear it at the top rung  → { action: 'graduate', nextRung: rung }
+function _ndDrillRampDecision(score, goal, rung, ladderLength) {
+    const cleared = Number.isFinite(score) && Number.isFinite(goal) && score >= goal;
+    if (!cleared) return { action: 'hold', nextRung: rung };
+    const atTop = rung >= ladderLength - 1;
+    if (atTop) return { action: 'graduate', nextRung: rung };
+    return { action: 'advance', nextRung: rung + 1 };
+}
 
 function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const threshold = 0.15;
@@ -1744,6 +1770,24 @@ function createNoteDetector(options = {}) {
     // of drill state (iteration push, live counter tick, activation
     // change); _drillRender clears it after redrawing.
     let drillDirty = true;
+
+    // ── Drill conductor state (speed/goal orchestrator) ───────────────
+    // Layered on top of the loop:restart iteration foundation above.
+    // startDrill() arms an A-B loop at a reduced speed with a per-
+    // iteration accuracy goal; each completed iteration that clears the
+    // goal steps the speed up one ladder rung; clearing the goal at full
+    // speed graduates (drops the loop, restores speed). All null/0/false
+    // when no conductor-driven drill is running — a plain manual A-B loop
+    // still scores via the foundation but never touches this state.
+    let drillConductorActive = false;
+    let drillConductorLadder = null;        // [0.7, 0.85, 1.0] — slow → full
+    let drillConductorRung = 0;             // index into the ladder
+    let drillConductorGoal = _ND_DRILL_DEFAULT_GOAL;  // 0..1 iteration accuracy to advance
+    let drillConductorBest = 0;             // best iteration accuracy (0..1) at the current rung
+    let drillConductorFocus = null;         // coaching string shown in the HUD ("Late by 30ms")
+    let drillConductorLabel = null;
+    let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
+    let drillConductorRange = null;         // {loopStart, loopEnd, judgeStart, judgeEnd}
 
     // Detection state
     let detectedMidi = -1;
@@ -4816,6 +4860,12 @@ function createNoteDetector(options = {}) {
             drillIterations.splice(0, drillIterations.length - DRILL_MAX_ITERATIONS);
         }
         drillDirty = true;
+        // Feed the just-finished iteration to the speed/goal conductor so
+        // it can step the speed up or graduate. No-op for a plain manual
+        // A-B loop (drillConductorActive false).
+        if (drillConductorActive) {
+            _drillConductorOnIteration(drillIterations[drillIterations.length - 1]);
+        }
     }
 
     function _drillOnLoopRestart(e) {
@@ -4841,6 +4891,10 @@ function createNoteDetector(options = {}) {
         drillNextIdx = 1;
         drillEnabled = false;
         drillDirty = true;
+        // A song/arrangement change ends any conductor-driven drill — the
+        // passage it targeted is gone. Restore speed + hide the HUD; the
+        // loop is already cleared by the host on song change.
+        if (drillConductorActive) endDrill('song-changed');
     }
 
     function _drillBindEvents() {
@@ -4872,6 +4926,262 @@ function createNoteDetector(options = {}) {
         drillOnLoopRestartFn = onLoopRestart;
         drillOnSongChangedFn = onSongChanged;
         drillSubscribed = true;
+    }
+
+    // ── Drill conductor (speed/goal orchestrator) ─────────────────────
+    //
+    // The deliberate-practice loop, recovered from the prior fork and
+    // adapted onto this build's loop:restart iteration foundation:
+    //   1. startDrill(start, end, opts) arms an A-B loop at the slowest
+    //      ladder rung with a per-iteration accuracy goal.
+    //   2. each completed iteration (foundation _drillSnapshotIteration)
+    //      feeds _drillConductorOnIteration: clear the goal → step up a
+    //      rung (faster); miss it → hold and keep drilling.
+    //   3. clear the goal at the top rung (full speed) → graduate:
+    //      drop the loop, restore speed, emit notedetect:drill-ended.
+    // The host owns playback speed (setSpeed keeps the slider/label,
+    // juce mode, and preserve-pitch in sync) and the loop (setLoop /
+    // clearLoop). We never poke audio.playbackRate directly.
+
+    function _hostGetSpeed() {
+        // The speed slider is the host's source of truth for current
+        // speed (setSpeed writes it); fall back to the audio element.
+        try {
+            const slider = document.getElementById('speed-slider');
+            if (slider && Number.isFinite(Number(slider.value))) return Number(slider.value) / 100;
+        } catch (_) {}
+        const audio = document.getElementById('audio');
+        return (audio && Number.isFinite(audio.playbackRate)) ? audio.playbackRate : 1;
+    }
+
+    function _hostSetSpeed(mul) {
+        if (!Number.isFinite(mul) || mul <= 0) return false;
+        if (typeof window.setSpeed === 'function') { window.setSpeed(mul); return true; }
+        const audio = document.getElementById('audio');
+        if (audio) { audio.playbackRate = mul; return true; }
+        return false;
+    }
+
+    async function startDrill(startSec, endSec, opts = {}) {
+        const {
+            label = null,
+            focus = null,
+            goal = _ND_DRILL_DEFAULT_GOAL,
+            speedLadder = _ND_DRILL_DEFAULT_LADDER,
+        } = opts || {};
+
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const audio = document.getElementById('audio');
+        const totalDuration = Number.isFinite(songInfo.duration)
+            ? songInfo.duration
+            : (audio && Number.isFinite(audio.duration) ? audio.duration : null);
+        if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+            console.warn('[note_detect] startDrill: no song duration available — aborting');
+            return false;
+        }
+
+        const requestedStart = Math.max(0, Number(startSec));
+        const judgeEnd = Math.min(totalDuration - 0.05, Number(endSec));
+        if (!Number.isFinite(requestedStart) || !Number.isFinite(judgeEnd)
+                || judgeEnd - requestedStart < 0.5) {
+            console.warn(`[note_detect] startDrill: range too short/invalid (${requestedStart}–${judgeEnd}) — aborting`);
+            return false;
+        }
+
+        // Validate the ladder; fall back to the default on junk input.
+        // Sort ascending so rung 0 is always the slowest.
+        const ladder = (Array.isArray(speedLadder) && speedLadder.length
+            && speedLadder.every(v => Number.isFinite(v) && v > 0))
+            ? speedLadder.slice().sort((a, b) => a - b)
+            : _ND_DRILL_DEFAULT_LADDER.slice();
+
+        // First-note runway: pull judgeStart back so the first scored
+        // note always has reaction time, even when the cluster boundary
+        // lands right on it.
+        const allNotes = (_hw && _hw.getNotes && _hw.getNotes()) || [];
+        const firstNote = allNotes.find(n => n && Number.isFinite(n.t)
+            && n.t >= requestedStart && n.t <= judgeEnd);
+        const judgeStart = firstNote
+            ? Math.max(0, Math.min(requestedStart, firstNote.t - _ND_DRILL_FIRST_NOTE_RUNWAY_SEC))
+            : requestedStart;
+        const loopStart = Math.max(0, judgeStart - _ND_DRILL_LEAD_IN_SEC);
+        const loopEnd = judgeEnd;
+
+        // Commit conductor state before any await so a loop:restart that
+        // races in mid-setup sees an active drill.
+        drillConductorSavedSpeed = _hostGetSpeed();
+        drillConductorActive = true;
+        drillConductorLadder = ladder;
+        drillConductorRung = 0;
+        drillConductorGoal = Number.isFinite(goal) ? Math.max(0, Math.min(1, goal)) : _ND_DRILL_DEFAULT_GOAL;
+        drillConductorBest = 0;
+        drillConductorFocus = focus;
+        drillConductorLabel = label || `${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s`;
+        drillConductorRange = { loopStart, loopEnd, judgeStart, judgeEnd };
+        // Window-level flag the host's loop-wrap handler reads to skip its
+        // count-in during drill iterations (we own the lead-in).
+        window._ndAnyDrillActive = true;
+
+        _hostSetSpeed(ladder[0]);
+
+        // Arm the loop (seeks to loopStart but does NOT auto-play), then
+        // start playback so the lead-in is actually audible.
+        let looped = false;
+        try {
+            if (window.slopsmith && typeof window.slopsmith.setLoop === 'function') {
+                looped = await window.slopsmith.setLoop(loopStart, loopEnd, { reason: 'note_detect-drill' });
+            }
+        } catch (e) {
+            console.warn('[note_detect] startDrill: setLoop threw:', e);
+        }
+        if (!looped) {
+            console.warn('[note_detect] startDrill: setLoop unavailable/failed — aborting');
+            endDrill('setloop-failed');
+            return false;
+        }
+        if (audio) {
+            try { await audio.play(); } catch (_) { /* autoplay may reject; the loop still runs once playing */ }
+        }
+
+        // Drill is pointless without detection running.
+        if (!enabled) { try { await enable(); } catch (_) {} }
+
+        _drillConductorShowHud();
+        console.log(`[note_detect] Drill "${drillConductorLabel}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s ladder=${ladder.map(r => Math.round(r * 100) + '%').join('→')} goal=${Math.round(drillConductorGoal * 100)}%`);
+        return true;
+    }
+
+    // Goal-gate one finished iteration. `snap` is the foundation's
+    // snapshot {idx, hits, misses, accuracy, ...}; accuracy is 0..100.
+    function _drillConductorOnIteration(snap) {
+        if (!drillConductorActive || !snap) return;
+        const score = (Number.isFinite(snap.accuracy) ? snap.accuracy : 0) / 100;
+        if (score > drillConductorBest) drillConductorBest = score;
+
+        const decision = _ndDrillRampDecision(
+            score, drillConductorGoal, drillConductorRung, drillConductorLadder.length);
+        if (decision.action === 'graduate') {
+            // Cleared the goal at full speed → graduate.
+            _drillConductorUpdateHud({ lastScore: score, graduated: true });
+            endDrill('graduated');
+            return;
+        }
+        if (decision.action === 'advance') {
+            // Step up one rung: faster playback, fresh best for the new
+            // speed (the goal must be re-earned at the harder tempo).
+            drillConductorRung = decision.nextRung;
+            drillConductorBest = 0;
+            _hostSetSpeed(drillConductorLadder[drillConductorRung]);
+        }
+        _drillConductorUpdateHud({ lastScore: score });
+    }
+
+    function endDrill(reason = 'user') {
+        if (!drillConductorActive) return;
+        drillConductorActive = false;
+        const graduated = reason === 'graduated';
+        const label = drillConductorLabel;
+        const best = drillConductorBest;
+
+        // Restore the pre-drill playback speed.
+        if (Number.isFinite(drillConductorSavedSpeed)) _hostSetSpeed(drillConductorSavedSpeed);
+        // Drop the A-B loop (unless the host already cleared it — e.g. a
+        // song change, which routes here with reason 'song-changed').
+        if (reason !== 'song-changed') {
+            try {
+                if (window.slopsmith && typeof window.slopsmith.clearLoop === 'function') {
+                    window.slopsmith.clearLoop({ reason: 'note_detect-drill-end' });
+                }
+            } catch (e) {
+                console.warn('[note_detect] endDrill: clearLoop threw:', e);
+            }
+        }
+        window._ndAnyDrillActive = false;
+        _drillConductorHideHud(graduated);
+
+        // Notify listeners — the finder layer chains to the next hotspot
+        // on graduation, and coaching can log the outcome.
+        try {
+            if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+                window.slopsmith.emit('notedetect:drill-ended', { reason, graduated, label, best });
+            }
+        } catch (_) {}
+
+        drillConductorLadder = null;
+        drillConductorRung = 0;
+        drillConductorBest = 0;
+        drillConductorFocus = null;
+        drillConductorLabel = null;
+        drillConductorSavedSpeed = null;
+        drillConductorRange = null;
+        console.log(`[note_detect] Drill ended (${reason})${graduated ? ` — graduated "${label}" at ${Math.round(best * 100)}%` : ''}`);
+    }
+
+    // ── Drill conductor HUD ───────────────────────────────────────────
+    // Floating overlay on document.body (visible regardless of which
+    // instance container owns the player) showing speed, goal, the last
+    // iteration's score, and best-so-far at the current rung.
+    function _drillConductorShowHud() {
+        let hud = document.getElementById('nd-drill-hud');
+        if (!hud) {
+            hud = document.createElement('div');
+            hud.id = 'nd-drill-hud';
+            hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
+            document.body.appendChild(hud);
+        }
+        _drillConductorUpdateHud();
+    }
+
+    function _drillConductorUpdateHud(extra = {}) {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        const { lastScore = null, graduated = false } = extra;
+        const speedPct = drillConductorLadder
+            ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
+        const goalPct = Math.round((drillConductorGoal || 0) * 100);
+        const bestPct = Math.round((drillConductorBest || 0) * 100);
+        const lastPct = lastScore != null ? Math.round(lastScore * 100) : null;
+        const atTop = drillConductorLadder
+            ? drillConductorRung >= drillConductorLadder.length - 1 : true;
+        const focusLine = drillConductorFocus
+            ? `<div class="text-blue-200 text-xs mt-0.5">${drillConductorFocus}</div>` : '';
+        const speedTag = `<span class="text-yellow-300 text-[11px] ml-2">@ ${speedPct}%</span>`;
+        let body;
+        if (graduated) {
+            body = `<div class="text-green-300 font-bold text-xs mt-1">🎓 Graduated — ${lastPct != null ? lastPct + '%' : ''} at full speed</div>`;
+        } else if (lastPct != null) {
+            body = `<div class="text-gray-300 text-xs mt-1">
+                Iter <span class="font-bold">${lastPct}%</span>
+                · best ${bestPct}% · goal <span class="text-blue-300">${goalPct}%</span>${atTop ? '' : ' · clear it to speed up'}
+            </div>`;
+        } else {
+            body = `<div class="text-gray-500 text-xs mt-1">Play the loop — score updates each pass · goal ${goalPct}%</div>`;
+        }
+        hud.innerHTML = `
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <div class="text-blue-300 text-[10px] uppercase tracking-wide font-semibold">🎯 Drilling${speedTag}</div>
+                    ${drillConductorLabel ? `<div class="text-gray-400 text-[11px]">${drillConductorLabel}</div>` : ''}
+                    ${focusLine}
+                    ${body}
+                </div>
+                <button id="nd-drill-end" class="text-gray-500 hover:text-gray-200 text-xl leading-none px-2" title="End drill">×</button>
+            </div>`;
+        const endBtn = hud.querySelector('#nd-drill-end');
+        if (endBtn) endBtn.onclick = () => endDrill('user');
+    }
+
+    function _drillConductorHideHud(graduated) {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        if (graduated) {
+            // Leave the graduation message up briefly, then fade.
+            _drillConductorUpdateHud({ graduated: true });
+            setTimeout(() => { const h = document.getElementById('nd-drill-hud'); if (h) h.remove(); }, 3000);
+        } else {
+            hud.remove();
+        }
     }
 
     // ── Chart state sync ─────────────────────────────────────────────
@@ -7359,6 +7669,26 @@ function createNoteDetector(options = {}) {
                 iterations: drillIterations.map((it) => ({ ...it })),
             };
         },
+        // Drill conductor (speed/goal orchestrator). startDrill(start,
+        // end, {label, focus, goal, speedLadder}) arms a slowed A-B loop
+        // and steps the speed up as the player clears the accuracy goal,
+        // graduating at full speed. endDrill() bails early. The hotspot
+        // finder and coaching call startDrill; getConductorState drives
+        // external HUDs / tests.
+        startDrill,
+        endDrill,
+        isDrilling: () => drillConductorActive,
+        getConductorState: () => ({
+            active: drillConductorActive,
+            label: drillConductorLabel,
+            focus: drillConductorFocus,
+            goal: drillConductorGoal,
+            best: drillConductorBest,
+            rung: drillConductorRung,
+            ladder: drillConductorLadder ? drillConductorLadder.slice() : null,
+            speed: drillConductorLadder ? (drillConductorLadder[drillConductorRung] || null) : null,
+            range: drillConductorRange ? { ...drillConductorRange } : null,
+        }),
         setChannel,
         injectButton,
         showSummary,

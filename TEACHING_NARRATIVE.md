@@ -164,6 +164,30 @@ prerequisite still holds: a "mistake" must be real, or the loop drills the
 player on the detector's blind spots — hence the bass-recall + A/V-calibration
 fixes land first.)
 
+**Status — conductor RECOVERED (2026-06-06, `feat/drill-loop-orchestrator`, v1.16.0).**
+Step 3 (drill slowed) + step 4 (goal-gate the progression) + step 5 (graduate)
+are ported onto the running build's loop:restart foundation, NOT re-derived:
+- `startDrill(start, end, {label, focus, goal, speedLadder})` — runway-padded
+  A-B loop via the host `slopsmith.setLoop`, dropped to the slowest ladder rung
+  via the host `setSpeed` (keeps the speed slider / juce / preserve-pitch in
+  sync; we never poke `audio.playbackRate`). Exposed on `window.noteDetect`.
+- Each completed iteration feeds the pure goal-gate `_ndDrillRampDecision`
+  (hold / advance / graduate). Clearing the goal steps the speed up one rung;
+  clearing at full speed graduates: `clearLoop`, restore speed, emit
+  `notedetect:drill-ended {graduated}`. `endDrill()` bails early.
+- A floating HUD shows speed/goal/last-iter/best; `getConductorState()` exposes
+  it to coaching and tests. Tested: 8 cases in `test/drill_conductor.test.js`
+  (140/140 suite green).
+- The chartTime-polling restart detector from `recover/reference-v1.2.0` was
+  deliberately NOT ported — the running build gets real `loop:restart` events
+  from the host, so the conductor hooks the existing iteration snapshot.
+
+Still missing for the full loop: **step 1** (multi-play hotspot finder —
+`_ndAggregatePlays`/`_ndSuggestLoops`, needs the SQLite plays history from the
+`fix` branch's `routes.py`) and **step 2** (the "Practice now" banner that calls
+`startDrill`). The conductor is reachable today via coaching's already-computed
+`hotspot.drill = {loopA, loopB, speedMul, goal}` → `window.noteDetect.startDrill`.
+
 ## How we work (operating model)
 
 **Human time is precious; LLM time is abundant.** The user's only scarce,
