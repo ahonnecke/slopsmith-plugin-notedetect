@@ -144,20 +144,34 @@ against recorded takes via `tools/harness.js`. So:
   prior version's UI. (Running base = `adopt-upstream`; Arm + A/V auto-calibrate
   are gated behind `tuningMode`, toggled on the Settings page.)
 
-## Where detection stands (measured)
+## Where detection stands (measured) — SOLVED (2026-06-06)
 
-- **Rocksmith golden (harness):** detector **precise** (96% within 50¢, −6¢/+7 ms
-  when it fires) but **low recall** (~16% pure no-detection); unaffected by
-  gain/frame-size/method.
-- **Scarlett live play (judgment log, 2026-06-05):** same story — **0/16 judged
-  notes detected, `cnf=0` on every one.** So the clean DI did **not** fix it →
-  it's **not** signal quality and **not** calibration; the HPS detector simply
-  produces no pitch on real bass input. `getUserMedia` already disables
-  echo-cancel/noise-suppress/AGC, so that's ruled out. Remaining suspects:
-  **wrong channel** in the browser's stereo view (instrument may not be "right"
-  to getUserMedia), or **input level / confidence gate**. Both are only
-  diagnosable by **replaying a captured WAV offline** — which needs the recording
-  pipeline working (see SP-A). Synth tracks pass; real mic input fails.
+Real bass play now scores ~90%, matching the user's own ear vs Rocksmith. Two
+root causes, both found by **harnessing real takes offline** (never by asking
+the user to keep replaying):
+
+1. **Frame size starved low bass.** The ScriptProcessor callback was 1024
+   samples (~21 ms) — shorter than a low-E period (~24 ms), so the detector
+   silently dropped most bass notes. Harness on a real take: 1024→27%,
+   **2048→77%**, 4096→68%. Fix: the `frameSize` setting, default **2048**
+   (`v1.14.0`). This was the bulk of the old "low recall" — *not* signal
+   quality, channel, or confidence gate (all ruled out).
+2. **A/V offset was stale + hand-set.** Even with recall fixed, a wrong
+   `av_offset_ms` (188 ms) judged every note ~188 ms late → 47%. Fix: the
+   `autoCalibrate` setting (`v1.15.x`) — log offset-free detections, then on
+   song-end **sweep for the offset that maximizes matched notes** (the harness
+   objective) and apply it. On a real take it found **−186 ms, 303/306 matched
+   (99%)** and the next play landed at the user's RS-equivalent score. The
+   −186 (vs the harness's 0) correctly compensates the *live* detector's
+   real-time processing lag, which the synchronous harness doesn't have.
+
+   Bug that hid this for a day: calibrate unbound itself in `disable()`, which
+   the host calls at song-end *before* the plugin's `song:ended` fires —
+   diagnosed via a headless E2E driver + a server-log beacon, **not** by
+   sending the user to replay-and-report.
+
+When the detector reports a miss now, it's much more likely a *real* miss —
+which is the reliability prerequisite the coaching loop (above) depends on.
 
 ## Retrospective — why the recording/harness loop kept failing
 
