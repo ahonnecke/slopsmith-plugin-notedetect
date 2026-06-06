@@ -182,11 +182,30 @@ are ported onto the running build's loop:restart foundation, NOT re-derived:
   deliberately NOT ported — the running build gets real `loop:restart` events
   from the host, so the conductor hooks the existing iteration snapshot.
 
-Still missing for the full loop: **step 1** (multi-play hotspot finder —
-`_ndAggregatePlays`/`_ndSuggestLoops`, needs the SQLite plays history from the
-`fix` branch's `routes.py`) and **step 2** (the "Practice now" banner that calls
-`startDrill`). The conductor is reachable today via coaching's already-computed
-`hotspot.drill = {loopA, loopB, speedMul, goal}` → `window.noteDetect.startDrill`.
+**Status — finder RECOVERED (2026-06-06, `feat/drill-loop-orchestrator`, v1.17.0).**
+Steps 1 (find the hot spot from multi-play evidence) + 2 (offer it → auto-set the
+loop) are now ported too, closing the whole loop:
+- **Backend** (`routes.py`): a LEAN SQLite plays store (`plays` + `play_notes`,
+  `POST`/`GET /api/plugins/note_detect/plays`, retention 25/song). Only the
+  columns the finder reads — the prior fork's rich failure-classification
+  columns are intentionally not reproduced (this build doesn't populate them).
+- **Aggregator** (pure, node-tested): `_ndAggregatePlays` joins per-note
+  verdicts across plays by the chart-stable `noteKey` (`t_s_f`), marking ABSENT
+  (in-range but not attempted) vs OUT_OF_SCOPE; `_ndSuggestLoops` is the
+  sliding-window finder gated on **nAttempts ≥ 2** (multi-play evidence — a
+  single bad take can't fabricate a hotspot).
+- **Wiring**: at song end the default singleton snapshots this play's verdicts,
+  re-aggregates the song's recent FULL plays (drill plays excluded), and if a
+  region recurs pops a **"Practice now"** banner that calls `startDrill` — so the
+  conductor drills it, graduates, and the next full play surfaces the next spot.
+- Tested: 7 finder cases (`test/hotspot_finder.test.js`) + backend round-trip /
+  prune-cascade smoke; 147/147 suite green. Unverified seam (needs a real
+  session): the live banner-click → `startDrill` DOM glue.
+
+The conductor is also reachable via coaching's already-computed
+`hotspot.drill = {loopA, loopB, speedMul, goal}` → `window.noteDetect.startDrill`
+(the coaching panel's "Practice this" button) — a second entry point alongside
+the in-plugin finder banner.
 
 ## How we work (operating model)
 

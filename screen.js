@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.16.0';
+const _ND_VERSION = '1.17.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -535,6 +535,135 @@ function _ndDrillRampDecision(score, goal, rung, ladderLength) {
     const atTop = rung >= ladderLength - 1;
     if (atTop) return { action: 'graduate', nextRung: rung };
     return { action: 'advance', nextRung: rung + 1 };
+}
+
+// ── Multi-play hotspot finder (pure aggregation) ─────────────────────────
+// Recovered from the prior fork's sliding-window finder. Joins per-note
+// verdicts ACROSS plays so a region only flags when the user keeps missing
+// it (not a one-off fumble), then proposes A-B loops over the dense
+// trouble spots. Pure (no DOM/audio) → node-testable; the closure finder
+// fetches plays and feeds them here.
+//
+// Each play: { playId, startedAt, reason, noteResults:[{key, chartT, s, f,
+//   expectedMidi, primary}] }, primary ∈ HIT | MISSED_WRONG_PITCH |
+//   MISSED_NO_DETECTION (a chart note absent from a play that covered its
+//   time counts as an ABSENT attempt; outside the play's range = OUT_OF_SCOPE,
+//   not an attempt).
+
+function _ndAggregatePlays(plays) {
+    // Newest-first so attempt index 0 is the most recent play.
+    plays = (plays || []).slice().sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+    const playMeta = plays.map((p, i) => {
+        // Manual min/max (no spread) — defensive against thousand-note songs.
+        let chartTMin = Infinity, chartTMax = -Infinity, count = 0;
+        for (const r of (p.noteResults || [])) {
+            const t = r.chartT;
+            if (!Number.isFinite(t)) continue;
+            if (t < chartTMin) chartTMin = t;
+            if (t > chartTMax) chartTMax = t;
+            count++;
+        }
+        return {
+            idx: i, playId: p.playId, startedAt: p.startedAt, reason: p.reason,
+            chartTMin: count ? chartTMin : null,
+            chartTMax: count ? chartTMax : null,
+            count: (p.noteResults || []).length,
+        };
+    });
+    const noteIndex = new Map();
+    for (let i = 0; i < plays.length; i++) {
+        for (const r of plays[i].noteResults || []) {
+            if (!noteIndex.has(r.key)) {
+                noteIndex.set(r.key, {
+                    key: r.key, chartT: r.chartT, expectedMidi: r.expectedMidi,
+                    stringFret: `s${r.s}/f${r.f}`, attempts: new Map(),
+                });
+            }
+            noteIndex.get(r.key).attempts.set(i, { primary: r.primary });
+        }
+    }
+    const rows = [];
+    for (const note of noteIndex.values()) {
+        const verdicts = [];
+        for (const meta of playMeta) {
+            const a = note.attempts.get(meta.idx);
+            if (a) verdicts.push({ kind: a.primary });
+            else if (meta.chartTMin != null && note.chartT >= meta.chartTMin && note.chartT <= meta.chartTMax) {
+                verdicts.push({ kind: 'ABSENT' });
+            } else verdicts.push({ kind: 'OUT_OF_SCOPE' });
+        }
+        rows.push({ ...note, verdicts });
+    }
+    rows.sort((a, b) => a.chartT - b.chartT);
+    return { playMeta, rows };
+}
+
+function _ndStatsForRow(row) {
+    const inScope = row.verdicts.filter(v => v.kind !== 'OUT_OF_SCOPE');
+    const cleanHits = inScope.filter(v => v.kind === 'HIT').length;
+    const dirtyHits = inScope.filter(v => v.kind === 'DIRTY_HIT').length;
+    const hits = cleanHits + dirtyHits;
+    const wrongPitch = inScope.filter(v => v.kind === 'MISSED_WRONG_PITCH').length;
+    const noDetection = inScope.filter(v => v.kind === 'MISSED_NO_DETECTION').length;
+    return {
+        nAttempts: inScope.length,
+        hits, cleanHits, dirtyHits, wrongPitch, noDetection,
+        hitRate: inScope.length ? hits / inScope.length : 0,
+    };
+}
+
+function _ndSuggestLoops(rows, opts = {}) {
+    // Sliding-window hotspot finder. Only notes attempted in ≥2 plays count
+    // (multi-play evidence), so a single bad take can't fabricate a hotspot.
+    const { windowSec = 5, slideSec = 0.5, minMissesPerSec = 0.5,
+            minTroubleNotes = 2, maxLoops = 5, padHeadSec = 2.0, padTailSec = 1.0 } = opts;
+    const noteList = (rows || []).map(r => ({ ...r, ..._ndStatsForRow(r) })).filter(r => r.nAttempts >= 2);
+    if (noteList.length === 0) return [];
+    let minT = Infinity, maxT = -Infinity;
+    for (const n of noteList) {
+        if (n.chartT < minT) minT = n.chartT;
+        if (n.chartT > maxT) maxT = n.chartT;
+    }
+    const candidates = [];
+    for (let start = minT - windowSec / 2; start <= maxT + windowSec / 2; start += slideSec) {
+        const end = start + windowSec;
+        let misses = 0, attempts = 0;
+        const inside = [];
+        for (const n of noteList) {
+            if (n.chartT >= start && n.chartT <= end) {
+                inside.push(n);
+                misses += n.nAttempts - n.hits;
+                attempts += n.nAttempts;
+            }
+        }
+        const trouble = inside.filter(n => n.hits < n.nAttempts).length;
+        const density = misses / windowSec;
+        if (density >= minMissesPerSec && trouble >= minTroubleNotes) {
+            candidates.push({ start, end, density, misses, attempts, trouble, notes: inside });
+        }
+    }
+    candidates.sort((a, b) => b.density - a.density);
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxLoops) break;
+        // Skip a candidate that overlaps an already-selected (denser) one.
+        if (selected.some(s => s.start < c.end && s.end > c.start)) continue;
+        selected.push(c);
+    }
+    selected.sort((a, b) => a.start - b.start);
+    return selected.map((c, i) => {
+        const a = Math.max(0, c.start - padHeadSec);
+        const b = c.end + padTailSec;
+        const trouble = c.notes.filter(n => n.hits < n.nAttempts);
+        return {
+            id: i + 1, startSec: a, endSec: b, durationSec: b - a,
+            noteCount: trouble.length,
+            avgMissRate: trouble.length
+                ? trouble.reduce((s, n) => s + (1 - n.hitRate), 0) / trouble.length : 0,
+            positions: [...new Set(trouble.map(n => n.stringFret))].slice(0, 4).join(','),
+            notes: trouble,
+        };
+    });
 }
 
 function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
@@ -1788,6 +1917,13 @@ function createNoteDetector(options = {}) {
     let drillConductorLabel = null;
     let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
     let drillConductorRange = null;         // {loopStart, loopEnd, judgeStart, judgeEnd}
+
+    // ── Hotspot finder state ──────────────────────────────────────────
+    // Multi-play history cache + a re-entrancy guard for the song-end
+    // suggest pass (which posts this play then re-fetches).
+    let _ndPlaysCache = null;
+    let _ndPlaysCacheSongId = null;
+    let _ndSuggestingLoop = false;
 
     // Detection state
     let detectedMidi = -1;
@@ -5184,6 +5320,158 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // ── Hotspot finder (multi-play → drill the recurring weakness) ────
+    //
+    // At song end the default singleton snapshots this play's per-note
+    // verdicts to the backend, then aggregates the recent plays for this
+    // song (_ndAggregatePlays/_ndSuggestLoops above) and, if a region has
+    // multi-play evidence, surfaces a "Practice now" banner that hands it
+    // to the drill conductor (startDrill). This closes the loop: play →
+    // finder picks the worst recurring spot → drill it → graduate → the
+    // next full play surfaces the next spot.
+
+    function _ndCurrentSongId() {
+        const _hw = resolveHw();
+        const info = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || null;
+        if (!info) return null;
+        const fn = info.filename || info.title || 'unknown';
+        const ar = info.arrangement || 'default';
+        return `${fn}__${ar}`;
+    }
+
+    // Map a stored judgment to the finder's coarse verdict. The finder
+    // only needs hit-vs-miss for hotspot density; the miss split is kept
+    // for richer display/debugging.
+    function _ndPrimaryVerdict(j) {
+        if (j && j.hit) return 'HIT';
+        const dm = j && j.detectedMidi;
+        return (Number.isFinite(dm) && dm > 0) ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
+    }
+
+    // Build a persistable snapshot of THIS play from noteResults. Pure
+    // read of closure state — returns null when there's nothing to store.
+    function _buildPlaySnapshot(reason) {
+        if (!noteResults || noteResults.size === 0) return null;
+        const songId = _ndCurrentSongId();
+        if (!songId) return null;
+        const snapNotes = [];
+        let h = 0, mi = 0;
+        for (const [key, j] of noteResults) {
+            const note = (j && (j.note || j.chartNote)) || {};
+            const chartT = Number.isFinite(j && j.noteTime) ? j.noteTime
+                : (Number.isFinite(j && j.time) ? j.time : 0);
+            if (j && j.hit) h++; else mi++;
+            snapNotes.push({
+                key,
+                chartT,
+                s: note.s,
+                f: note.f,
+                expectedMidi: (j && Number.isFinite(j.expectedMidi)) ? j.expectedMidi : null,
+                primary: _ndPrimaryVerdict(j),
+            });
+        }
+        return {
+            songId,
+            playId: new Date().toISOString().replace(/[:.]/g, '-'),
+            reason: reason || null,
+            startedAt: Date.now(),
+            isDrill: !!(window._ndAnyDrillActive || drillConductorActive),
+            summary: { hits: h, misses: mi },
+            noteResults: snapNotes,
+        };
+    }
+
+    async function _ndFetchPlaysForSong(songId) {
+        if (_ndPlaysCacheSongId === songId && _ndPlaysCache) return _ndPlaysCache;
+        try {
+            const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=10`);
+            const data = await r.json();
+            _ndPlaysCache = data.plays || [];
+            _ndPlaysCacheSongId = songId;
+            return _ndPlaysCache;
+        } catch (e) {
+            console.warn('[note_detect] plays fetch failed:', e);
+            return [];
+        }
+    }
+
+    // Persist this play, then (if there's multi-play evidence) suggest a
+    // drill. Builds the snapshot synchronously up front so it captures
+    // noteResults before any caller-side disable()/clear() runs.
+    async function _ndSnapshotPlayAndSuggest(reason) {
+        const snap = _buildPlaySnapshot(reason);
+        if (!snap) return;
+        try {
+            await fetch('/api/plugins/note_detect/plays', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(snap),
+            });
+        } catch (e) {
+            console.warn('[note_detect] play snapshot POST failed:', e);
+        }
+        _ndPlaysCacheSongId = null;  // we just added a play — invalidate cache
+        // Don't pester the user mid-drill; the banner is for full plays.
+        if (drillConductorActive) return;
+        try { await _ndMaybeSuggestPracticeLoop(snap.songId); }
+        catch (e) { console.warn('[note_detect] practice-loop suggest failed:', e); }
+    }
+
+    async function _ndMaybeSuggestPracticeLoop(songId) {
+        if (_ndSuggestingLoop) return null;
+        _ndSuggestingLoop = true;
+        try {
+            // Only full plays are evidence — drill plays cover a single loop.
+            const plays = (await _ndFetchPlaysForSong(songId)).filter(p => !p.isDrill);
+            if (plays.length < 2) return null;  // need recurrence, not one fumble
+            const { rows } = _ndAggregatePlays(plays);
+            const loops = _ndSuggestLoops(rows, { maxLoops: 3 });
+            if (!loops.length) return null;
+            const top = loops[0];
+            if (top.noteCount < 2) return null;
+            _ndShowPracticeBanner(top);
+            return top;
+        } finally {
+            _ndSuggestingLoop = false;
+        }
+    }
+
+    function _ndShowPracticeBanner(hotspot) {
+        const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+        const existing = document.querySelector('.nd-practice-banner');
+        if (existing && existing.dataset.start === hotspot.startSec.toFixed(2)) return;
+        if (existing) existing.remove();
+        const missPct = Math.round(hotspot.avgMissRate * 100);
+        const banner = document.createElement('div');
+        banner.className = 'nd-practice-banner fixed left-1/2 -translate-x-1/2 z-[250] bg-orange-900/90 border-2 border-orange-600 rounded-xl px-4 py-3 shadow-2xl';
+        banner.style.bottom = '80px';
+        banner.dataset.start = hotspot.startSec.toFixed(2);
+        banner.innerHTML = `
+            <div class="flex items-center gap-4">
+                <div>
+                    <div class="text-orange-100 font-semibold text-sm">Hotspot: ${mmss(hotspot.startSec)}–${mmss(hotspot.endSec)}</div>
+                    <div class="text-orange-200 text-[11px] leading-tight">${hotspot.noteCount} note${hotspot.noteCount === 1 ? '' : 's'} you keep missing · ${missPct}% miss rate</div>
+                </div>
+                <button class="nd-practice-btn px-3 py-1.5 bg-orange-200 hover:bg-orange-100 text-orange-900 rounded-lg text-sm font-bold">Practice now</button>
+                <button class="nd-practice-dismiss px-2 py-1 text-orange-300 hover:text-orange-100 text-lg leading-none">&times;</button>
+            </div>`;
+        document.body.appendChild(banner);
+        banner.querySelector('.nd-practice-btn').addEventListener('click', () => {
+            const btn = banner.querySelector('.nd-practice-btn');
+            Promise.resolve(startDrill(hotspot.startSec, hotspot.endSec, {
+                label: `Hotspot ${mmss(hotspot.startSec)}`,
+                goal: _ND_DRILL_DEFAULT_GOAL,
+                speedLadder: _ND_DRILL_DEFAULT_LADDER,
+            })).then((ok) => {
+                if (ok) banner.remove();
+                else if (btn) btn.textContent = 'Couldn’t start';
+            }).catch(() => { if (btn) btn.textContent = 'Failed'; });
+        });
+        banner.querySelector('.nd-practice-dismiss').addEventListener('click', () => banner.remove());
+        // Auto-dismiss if the user doesn't engage.
+        setTimeout(() => { if (banner.parentNode) banner.remove(); }, 20000);
+    }
+
     // ── Chart state sync ─────────────────────────────────────────────
     //
     // `currentArrangement` / `currentStringCount` / `tuningOffsets` /
@@ -5804,6 +6092,12 @@ function createNoteDetector(options = {}) {
             if (_recArmedForTraining && built) _summaryDeferred = true;
         } catch (e) {
             console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
+        }
+        // Persist this play + (if multi-play evidence) surface a drill
+        // banner. Build-and-call BEFORE disable() so the snapshot captures
+        // noteResults before any teardown clears it. Fire-and-forget.
+        try { _ndSnapshotPlayAndSuggest('song_end'); } catch (e) {
+            console.warn('[note_detect] hotspot suggest failed:', e && e.message ? e.message : e);
         }
         try { disable({ silent: true }); } catch (e) {}
     }
@@ -7689,6 +7983,13 @@ function createNoteDetector(options = {}) {
             speed: drillConductorLadder ? (drillConductorLadder[drillConductorRung] || null) : null,
             range: drillConductorRange ? { ...drillConductorRange } : null,
         }),
+        // Hotspot finder. snapshotPlay persists the current play's note
+        // verdicts; suggestPracticeLoop aggregates this song's recent
+        // plays and pops the "Practice now" banner when a region recurs.
+        // The end-of-song handler calls both automatically; these expose
+        // them for manual/console use and tests.
+        snapshotPlayAndSuggest: _ndSnapshotPlayAndSuggest,
+        suggestPracticeLoop: () => _ndMaybeSuggestPracticeLoop(_ndCurrentSongId()),
         setChannel,
         injectButton,
         showSummary,
