@@ -99,27 +99,34 @@ When the decision is **player-fault**, the feedback the user gets is not a list
 of mistakes — it's a **practice loop** that walks the classic slow-it-down,
 speed-it-up method automatically:
 
-1. **Find the hot spot** — the section with the most mistakes (from per-section
-   miss stats), not scattered one-off errors.
-2. **Auto-set an A–B loop** bracketing it: start a beat *before* the hot spot,
-   end a beat *after*, so the run-in and run-out are included.
-3. **Play the loop slowed down** — every note, at a reduced playback speed the
-   user can actually hit cleanly.
-4. **Ramp the speed** — once the user clears the loop at the current speed (a
-   per-iteration accuracy threshold), bump the speed and continue.
-5. **Graduate** — when they play the section cleanly at full speed, drop the
-   loop, replay the **full song**, and find the next hot spot.
-6. **Repeat** until no hot spot clears the threshold.
+1. **Find the hot spot from MULTI-PLAY evidence** — a sliding-window finder over
+   the per-note miss history flags a region only when it recurs (the prior
+   implementation gated on **≥3 misses across plays**), so the loop targets a
+   real weakness, not a one-off fumble.
+2. **Offer it, then auto-set an A–B loop** — surface a banner ("N notes you keep
+   missing · X% miss rate") whose action calls `setActiveLoop(start, end)`,
+   bracketing a beat before/after so run-in and run-out are included.
+3. **Drill the loop slowed down** — every note, at a reduced `speedMul`
+   (playback rate) the user can hit cleanly; original speed is saved and
+   restored on exit.
+4. **Goal-gate the progression** — each loop iteration scores; track the best
+   score; when an iteration clears a target (`drillGoal` → `drillGoalReached`),
+   that's the signal to step the speed up. Concrete criterion, not a blind timer.
+5. **Graduate** — play the section cleanly at full speed → drop the loop, replay
+   the **full song**, find the next hot spot.
+6. **Repeat** until no hot spot clears the evidence bar.
 
-Building blocks that already exist (orchestration is the new part): A–B loops
-(`feat/drill-mode`, the `/api/loops` endpoint), reduced playback speed (the
-half-speed path), per-section accuracy for hot-spot detection, and
-`getDrillStats()` for per-iteration scoring. What's missing is the conductor:
-auto-pick the hot spot → auto-set the loop → auto-ramp speed on a clearance
-criterion → graduate back to the full song. (Reliability prerequisite: the
-detector must be trustworthy enough that a "mistake" is real — otherwise the
-loop drills the player on the detector's blind spots. Hence the bass-recall
-fix lands first.)
+**This is the user's own prior method — recover it, don't re-derive it.** The
+logic survives in `fix/bass-and-low-note-detection` (the sliding-window hotspot
+finder `_ndFindHotspot` + `_ndShowPracticeBanner` → `setActiveLoop`; multi-play
+miss aggregation) and `recover/reference-v1.2.0` (the speed/goal conductor:
+`speedMul`, `drillSavedSpeed`, `drillGoal`/`drillBestScore`/`drillGoalReached`).
+Upstream `feat/drill-mode` provides only the A–B-loop *scoring* foundation
+(`drillIterations`/`Hits`/`Misses`/`Streak`); the hot-spot finder and the
+speed/goal conductor are the missing halves to graft on. (Reliability
+prerequisite still holds: a "mistake" must be real, or the loop drills the
+player on the detector's blind spots — hence the bass-recall + A/V-calibration
+fixes land first.)
 
 ## How we work (operating model)
 
