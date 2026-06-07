@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.23.0';
+const _ND_VERSION = '1.23.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -5248,8 +5248,10 @@ function createNoteDetector(options = {}) {
         // count-in during drill iterations (we own the lead-in).
         window._ndAnyDrillActive = true;
 
-        // Preserve pitch when slowed so the lead-in/notes don't pitch-shift.
-        if (audio) { try { audio.preservesPitch = true; audio.mozPreservesPitch = true; audio.webkitPreservesPitch = true; } catch (_) {} }
+        // NB: do NOT force preservesPitch — real-time time-stretch is CPU-heavy
+        // and was implicated in laggy/buffering playback. Let the host's
+        // setSpeed decide; if no time-stretch, slowing just lowers pitch
+        // (cheap), which is fine for a drill.
         _hostSetSpeed(ladder[0]);
 
         // Arm the loop (seeks to loopStart but does NOT auto-play), then
