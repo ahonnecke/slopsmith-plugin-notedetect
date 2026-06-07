@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.19.1';
+const _ND_VERSION = '1.20.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -1948,6 +1948,7 @@ function createNoteDetector(options = {}) {
     let drillConductorLabel = null;
     let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
     let drillConductorRange = null;         // {loopStart, loopEnd, judgeStart, judgeEnd}
+    let drillConductorOnWrapFn = null;      // bound loop:restart listener (own, not via the foundation)
 
     // ── Hotspot finder state ──────────────────────────────────────────
     // Multi-play history cache + a re-entrancy guard for the song-end
@@ -5027,12 +5028,10 @@ function createNoteDetector(options = {}) {
             drillIterations.splice(0, drillIterations.length - DRILL_MAX_ITERATIONS);
         }
         drillDirty = true;
-        // Feed the just-finished iteration to the speed/goal conductor so
-        // it can step the speed up or graduate. No-op for a plain manual
-        // A-B loop (drillConductorActive false).
-        if (drillConductorActive) {
-            _drillConductorOnIteration(drillIterations[drillIterations.length - 1]);
-        }
+        // NB: the speed/goal conductor no longer piggybacks here — it binds
+        // its OWN loop:restart listener (_drillConductorOnWrap) and scores
+        // from its window, so it doesn't depend on this snapshot firing
+        // (which is gated on drillEnabled/getLoop sync).
     }
 
     function _drillOnLoopRestart(e) {
@@ -5214,6 +5213,13 @@ function createNoteDetector(options = {}) {
         // Drill is pointless without detection running.
         if (!enabled) { try { await enable(); } catch (_) {} }
 
+        // Bind our OWN loop:restart listener so each pass is scored even if
+        // the foundation's drillEnabled sync doesn't flip for a plugin loop.
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            drillConductorOnWrapFn = _drillConductorOnWrap;
+            try { window.slopsmith.on('loop:restart', drillConductorOnWrapFn); } catch (_) {}
+        }
+
         _drillConductorShowHud();
         console.log(`[note_detect] Drill "${drillConductorLabel}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s ladder=${ladder.map(r => Math.round(r * 100) + '%').join('→')} goal=${Math.round(drillConductorGoal * 100)}%`);
         return true;
@@ -5221,15 +5227,33 @@ function createNoteDetector(options = {}) {
 
     // Goal-gate one finished iteration. `snap` is the foundation's
     // snapshot {idx, hits, misses, accuracy, ...}; accuracy is 0..100.
-    function _drillConductorOnIteration(snap) {
-        if (!drillConductorActive || !snap) return;
-        const score = (Number.isFinite(snap.accuracy) ? snap.accuracy : 0) / 100;
+    // One finished loop pass. Scores DIRECTLY from this pass's judgments in
+    // the drill window — self-contained, not gated behind the foundation's
+    // drillEnabled/getLoop sync (which wasn't reliably flipping for a
+    // plugin-set loop, so the HUD never refreshed). noteResults is keyed by
+    // chart note (time_s_f), so each pass overwrites the prior verdict — at
+    // wrap time the window holds exactly this pass's results.
+    function _drillConductorOnWrap() {
+        if (!drillConductorActive || !drillConductorRange) return;
+        const { judgeStart, judgeEnd } = drillConductorRange;
+        const arr = [];
+        for (const v of noteResults.values()) arr.push(v);
+        let hits = 0, total = 0;
+        for (const j of arr) {
+            const t = Number.isFinite(j && j.noteTime) ? j.noteTime : null;
+            if (t == null || t < judgeStart || t > judgeEnd) continue;
+            total++;
+            if (j.hit) hits++;
+        }
+        // An empty pass (nothing judged in the window yet — e.g. the first
+        // wrap before any note crossed) isn't a real attempt. Skip it.
+        if (total === 0) return;
+        const score = hits / total;
         if (score > drillConductorBest) drillConductorBest = score;
 
         const decision = _ndDrillRampDecision(
             score, drillConductorGoal, drillConductorRung, drillConductorLadder.length);
         if (decision.action === 'graduate') {
-            // Cleared the goal at full speed → graduate.
             _drillConductorUpdateHud({ lastScore: score, graduated: true });
             endDrill('graduated');
             return;
@@ -5244,19 +5268,8 @@ function createNoteDetector(options = {}) {
             _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
             return;
         }
-        // Held below the goal — show WHICH notes were missed this pass and
-        // HOW, so the user knows what to fix rather than just a bare score.
-        _drillConductorUpdateHud({ lastScore: score, misses: _drillIterationMisses() });
-    }
-
-    // The misses inside the drill window from the just-finished pass.
-    // noteResults is keyed by chart note (time_s_f), so each pass overwrites
-    // the prior verdict — at wrap time the window holds this pass's results.
-    function _drillIterationMisses() {
-        if (!drillConductorRange) return [];
-        const arr = [];
-        for (const v of noteResults.values()) arr.push(v);
-        return _ndSummarizeWindowMisses(arr, drillConductorRange.judgeStart, drillConductorRange.judgeEnd);
+        // Held below the goal — show WHICH notes were missed this pass and HOW.
+        _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
     }
 
     function endDrill(reason = 'user') {
@@ -5280,6 +5293,11 @@ function createNoteDetector(options = {}) {
             }
         }
         window._ndAnyDrillActive = false;
+        // Unbind our loop:restart listener.
+        if (drillConductorOnWrapFn && window.slopsmith && typeof window.slopsmith.off === 'function') {
+            try { window.slopsmith.off('loop:restart', drillConductorOnWrapFn); } catch (_) {}
+        }
+        drillConductorOnWrapFn = null;
         _drillConductorHideHud(graduated);
 
         // Notify listeners — the finder layer chains to the next hotspot
@@ -5354,7 +5372,8 @@ function createNoteDetector(options = {}) {
                 return `<div class="flex justify-between gap-3"><span class="text-gray-300">${pos}</span><span class="${howColor[m.how] || 'text-gray-400'}">${m.detail}</span></div>`;
             }).join('');
             const more = misses.length > 6 ? `<div class="text-gray-600 text-[10px]">+${misses.length - 6} more</div>` : '';
-            missList = `<div class="mt-1.5 pt-1.5 border-t border-gray-700 text-[11px] font-mono leading-tight">${shown}${more}</div>`;
+            missList = `<div class="mt-1.5 pt-1.5 border-t border-gray-700 text-[11px] font-mono leading-tight">`
+                + `<div class="text-gray-500 text-[10px] uppercase tracking-wide mb-0.5">Missed this pass</div>${shown}${more}</div>`;
         }
         hud.innerHTML = `
             <div class="flex items-start gap-3">

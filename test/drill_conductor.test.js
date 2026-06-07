@@ -12,15 +12,23 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loadDetectionCore } = require('./_loader');
 
-function judgment(hit) {
-    return { hit, note: { s: 1, f: 0 }, noteTime: 0, judgedAt: 0 };
-}
+// 10 note slots inside the drill window [30, 50] (startDrill(30, 50)). The
+// conductor scores each pass from noteResults in this window, so test notes
+// must live here. Stable keys (time_s_f) so each pass OVERWRITES the prior
+// verdict — exactly how the real matcher re-judges a looped passage.
+const WINDOW_TS = [31, 33, 35, 37, 39, 41, 43, 45, 47, 49];
 
-// Record `hits` hits + `misses` misses, then wrap the loop so the
-// foundation snapshots the iteration and the conductor goal-gates it.
-function runIteration(core, det, hits, misses) {
-    for (let i = 0; i < hits; i++) det._recordJudgment(`h${i}_${Math.random()}`, judgment(true));
-    for (let i = 0; i < misses; i++) det._recordJudgment(`m${i}_${Math.random()}`, judgment(false));
+// Run one pass: mark the first `hits` of the 10 window notes as hits, the
+// rest as misses, then fire the loop wrap the conductor listens for.
+function runIteration(core, det, hits) {
+    WINDOW_TS.forEach((t, i) => {
+        const hit = i < hits;
+        det._recordJudgment(`${t.toFixed(3)}_1_0`, {
+            hit, note: { s: 1, f: 0 }, noteTime: t,
+            detectedMidi: hit ? 45 : null,
+            timingState: hit ? 'OK' : null,
+        });
+    });
     core.slopsmith._fire('loop:restart', { loopA: 28, loopB: 50, time: 28 });
 }
 
@@ -135,28 +143,26 @@ test('startDrill arms a slowed loop at the bottom rung', async () => {
 test('clearing the goal steps the speed up one rung per iteration, then graduates', async () => {
     const { core, spies } = loadConductorCore();
     const det = core.createNoteDetector();
-    det._bindDrillEvents();
     await det.startDrill(30, 50, { goal: 0.8, speedLadder: [0.7, 0.85, 1.0] });
-    // Activate the foundation's per-iteration scoring (gated on getLoop()).
-    core.slopsmith._loop = { loopA: 28, loopB: 50 };
-    det._drillSyncFromLoopState();
+    // The conductor scores from its window via its OWN loop:restart listener
+    // (bound in startDrill) — no foundation sync needed.
 
-    // Iteration 1: 90% ≥ 80% goal → advance to rung 1 (0.85×).
-    runIteration(core, det, 9, 1);
+    // Pass 1: 9/10 = 90% ≥ 80% goal → advance to rung 1 (0.85×).
+    runIteration(core, det, 9);
     assert.equal(det.getConductorState().rung, 1);
     assert.equal(det.getConductorState().speed, 0.85);
 
-    // Iteration 2: a miss-heavy pass (40%) holds at rung 1.
-    runIteration(core, det, 4, 6);
+    // Pass 2: 4/10 = 40% holds at rung 1.
+    runIteration(core, det, 4);
     assert.equal(det.getConductorState().rung, 1, 'missing the goal holds the rung');
 
-    // Iteration 3: 100% → advance to the top rung (1.0×).
-    runIteration(core, det, 10, 0);
+    // Pass 3: 10/10 = 100% → advance to the top rung (1.0×).
+    runIteration(core, det, 10);
     assert.equal(det.getConductorState().rung, 2);
     assert.equal(det.getConductorState().speed, 1.0);
 
-    // Iteration 4: clear the goal at full speed → graduate.
-    runIteration(core, det, 9, 1);
+    // Pass 4: clear the goal at full speed → graduate.
+    runIteration(core, det, 9);
     assert.equal(det.isDrilling(), false, 'graduated → drill ended');
     assert.equal(spies.clearLoop.length, 1, 'dropped the A-B loop on graduation');
     const grad = spies.emit.find(([e]) => e === 'notedetect:drill-ended');
