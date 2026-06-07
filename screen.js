@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.19.0';
+const _ND_VERSION = '1.19.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -5525,8 +5525,9 @@ function createNoteDetector(options = {}) {
             }).catch(() => { if (btn) btn.textContent = 'Failed'; });
         });
         banner.querySelector('.nd-practice-dismiss').addEventListener('click', () => banner.remove());
-        // Auto-dismiss if the user doesn't engage.
-        setTimeout(() => { if (banner.parentNode) banner.remove(); }, 20000);
+        // No auto-dismiss: this is the entry to the drill loop, so it stays
+        // until the user acts (Practice / ✕) or a new hotspot replaces it.
+        // It vanishing on its own (the old 20s timeout) just lost the prompt.
     }
 
     // ── Chart state sync ─────────────────────────────────────────────
