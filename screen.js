@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.23.1';
+const _ND_VERSION = '1.24.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -610,7 +610,7 @@ function _ndAggregatePlays(plays) {
                     stringFret: `s${r.s}/f${r.f}`, attempts: new Map(),
                 });
             }
-            noteIndex.get(r.key).attempts.set(i, { primary: r.primary });
+            noteIndex.get(r.key).attempts.set(i, { primary: r.primary, how: r.how || null });
         }
     }
     const rows = [];
@@ -618,7 +618,7 @@ function _ndAggregatePlays(plays) {
         const verdicts = [];
         for (const meta of playMeta) {
             const a = note.attempts.get(meta.idx);
-            if (a) verdicts.push({ kind: a.primary });
+            if (a) verdicts.push({ kind: a.primary, how: a.how || null });
             else if (meta.chartTMin != null && note.chartT >= meta.chartTMin && note.chartT <= meta.chartTMax) {
                 verdicts.push({ kind: 'ABSENT' });
             } else verdicts.push({ kind: 'OUT_OF_SCOPE' });
@@ -701,20 +701,40 @@ function _ndSuggestLoops(rows, opts = {}) {
     });
 }
 
-// Summarise WHY a hotspot is hard, from its trouble notes' per-attempt
-// stats. Coarse (the persisted plays store only keeps hit/no-detection/
-// wrong-pitch); the live drill HUD shows the fine timing/pitch "how".
-// Pure → node-testable.
+// Summarise WHY a hotspot is hard, tallying the fine failure mode (`how`)
+// across its trouble notes' missed attempts: late / early / sharp / flat /
+// missed / wrong. Falls back to the coarse not-detected/wrong-pitch counts
+// for older data with no `how`. Returns ranked {kind, count}. Pure → testable.
 function _ndHotspotReasons(hotspot) {
-    let noDetection = 0, wrongPitch = 0;
+    const LABEL = {
+        late: 'rushing late', early: 'rushing early', sharp: 'sharp', flat: 'flat',
+        missed: 'not detected / not played', wrong: 'wrong note',
+    };
+    const tally = new Map();
+    let usedHow = false;
     for (const n of ((hotspot && hotspot.notes) || [])) {
-        noDetection += n.noDetection || 0;
-        wrongPitch += n.wrongPitch || 0;
+        for (const v of (n.verdicts || [])) {
+            if (!v || v.kind === 'HIT' || v.kind === 'OUT_OF_SCOPE') continue;
+            if (v.how) {
+                usedHow = true;
+                const label = LABEL[v.how] || v.how;
+                tally.set(label, (tally.get(label) || 0) + 1);
+            }
+        }
     }
-    const reasons = [];
-    if (noDetection) reasons.push({ kind: 'not detected / not played', count: noDetection });
-    if (wrongPitch) reasons.push({ kind: 'wrong pitch', count: wrongPitch });
-    return reasons;
+    if (!usedHow) {
+        // Older rows without `how`: fall back to the coarse per-row stats.
+        let noDetection = 0, wrongPitch = 0;
+        for (const n of ((hotspot && hotspot.notes) || [])) {
+            noDetection += n.noDetection || 0;
+            wrongPitch += n.wrongPitch || 0;
+        }
+        if (noDetection) tally.set('not detected / not played', noDetection);
+        if (wrongPitch) tally.set('wrong pitch', wrongPitch);
+    }
+    return [...tally.entries()]
+        .map(([kind, count]) => ({ kind, count }))
+        .sort((a, b) => b.count - a.count);
 }
 
 // Render the practice-loop manager panel from a loops list. Pure → the DOM
@@ -5567,6 +5587,9 @@ function createNoteDetector(options = {}) {
                 f: note.f,
                 expectedMidi: (j && Number.isFinite(j.expectedMidi)) ? j.expectedMidi : null,
                 primary: _ndPrimaryVerdict(j),
+                // Fine failure mode for misses (late/early/sharp/flat/missed/
+                // wrong) so saved-loop reasons are actionable; null for hits.
+                how: (j && j.hit) ? null : _ndDescribeMiss(j).how,
             });
         }
         return {

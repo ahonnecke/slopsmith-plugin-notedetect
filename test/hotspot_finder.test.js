@@ -113,6 +113,18 @@ test('suggestLoops: minAttempts:1 surfaces a hotspot from a SINGLE play', () => 
     assert.ok(loops[0].noteCount >= 2);
 });
 
+test('hotspotReasons: tallies the fine failure mode (how) from verdicts, ranked', () => {
+    const { hotspotReasons } = loadDetectionCore();
+    const r = hotspotReasons({ notes: [
+        { verdicts: [{ kind: 'MISSED_NO_DETECTION', how: 'late' }, { kind: 'HIT' }] },
+        { verdicts: [{ kind: 'MISSED_NO_DETECTION', how: 'late' }, { kind: 'MISSED_WRONG_PITCH', how: 'flat' }] },
+    ] });
+    const byKind = Object.fromEntries(r.map((x) => [x.kind, x.count]));
+    assert.equal(byKind['rushing late'], 2);
+    assert.equal(byKind['flat'], 1);
+    assert.equal(r[0].kind, 'rushing late', 'ranked by count');
+});
+
 test('hotspotReasons: tallies coarse failure reasons from trouble notes', () => {
     const { hotspotReasons } = loadDetectionCore();
     const r = hotspotReasons({ notes: [

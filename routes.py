@@ -182,7 +182,8 @@ CREATE TABLE IF NOT EXISTS play_notes (
   string_idx INTEGER,
   fret INTEGER,
   expected_midi INTEGER,
-  primary_verdict TEXT NOT NULL
+  primary_verdict TEXT NOT NULL,
+  miss_kind TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_plays_song ON plays(song_id, played_at DESC);
@@ -253,13 +254,14 @@ def _insert_play(conn: sqlite3.Connection, data: dict) -> int:
             n.get("f"),
             n.get("expectedMidi"),
             n.get("primary") or "UNKNOWN",
+            n.get("how"),
         ))
     if rows:
         conn.executemany(
             """INSERT INTO play_notes (
                 play_id, note_key, chart_t, string_idx, fret,
-                expected_midi, primary_verdict
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                expected_midi, primary_verdict, miss_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
     return play_id
@@ -294,6 +296,7 @@ def _row_to_play(row: sqlite3.Row, notes_rows: list) -> dict:
                 "f": n["fret"],
                 "expectedMidi": n["expected_midi"],
                 "primary": n["primary_verdict"],
+                "how": (n["miss_kind"] if "miss_kind" in n.keys() else None),
             }
             for n in notes_rows
         ],
@@ -442,6 +445,11 @@ def setup(app, context):
         _PLAYS_DB_PATH = str(base / _PLAYS_DB_REL)
         with _plays_db() as conn:
             conn.executescript(_PLAYS_SCHEMA)
+            # Migrate an existing DB created before play_notes.miss_kind.
+            try:
+                conn.execute("ALTER TABLE play_notes ADD COLUMN miss_kind TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         log.info("note_detect plays DB: %s", _PLAYS_DB_PATH)
         return _PLAYS_DB_PATH
 
