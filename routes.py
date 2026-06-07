@@ -187,6 +187,22 @@ CREATE TABLE IF NOT EXISTS play_notes (
 
 CREATE INDEX IF NOT EXISTS idx_plays_song ON plays(song_id, played_at DESC);
 CREATE INDEX IF NOT EXISTS idx_play_notes_play ON play_notes(play_id);
+
+-- Practice loops: a hotspot saved as a drillable A-B loop for a song, with
+-- its failure reasons and whether it's been passed at full speed. The host's
+-- own `loops` table (id/filename/name/start/end) can't carry reasons/passed,
+-- so the drill loop manager keeps its own richer store.
+CREATE TABLE IF NOT EXISTS practice_loops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id TEXT NOT NULL,
+  label TEXT,
+  loop_a REAL NOT NULL,
+  loop_b REAL NOT NULL,
+  reasons_json TEXT,
+  passed INTEGER DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_practice_loops_song ON practice_loops(song_id, loop_a);
 """
 
 
@@ -482,6 +498,103 @@ def setup(app, context):
 
         plays = await anyio.to_thread.run_sync(_work)
         return {"plays": plays}
+
+    # ── Practice loops (drill loop manager) ───────────────────────────────
+    @app.post("/api/plugins/note_detect/practice-loops")
+    async def save_practice_loop(request: Request):
+        import anyio
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(400, "body must be JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        song_id = data.get("songId")
+        a, b = data.get("loopA"), data.get("loopB")
+        if not song_id or not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or b <= a:
+            raise HTTPException(400, "songId and loopA<loopB required")
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                # De-dupe: a loop within 0.25s of an existing one for this song
+                # is the same hotspot — update its label/reasons instead of
+                # piling up near-identical rows across replays.
+                existing = conn.execute(
+                    "SELECT id FROM practice_loops WHERE song_id = ? AND ABS(loop_a - ?) < 0.25 AND ABS(loop_b - ?) < 0.25",
+                    (song_id, float(a), float(b)),
+                ).fetchone()
+                reasons = json.dumps(data.get("reasons")) if data.get("reasons") is not None else None
+                if existing:
+                    conn.execute(
+                        "UPDATE practice_loops SET label = ?, reasons_json = ? WHERE id = ?",
+                        (data.get("label"), reasons, existing["id"]),
+                    )
+                    return existing["id"]
+                cur = conn.execute(
+                    "INSERT INTO practice_loops (song_id, label, loop_a, loop_b, reasons_json, passed, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    (song_id, data.get("label"), float(a), float(b), reasons,
+                     datetime.now(timezone.utc).isoformat()),
+                )
+                return cur.lastrowid
+
+        loop_id = await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id}
+
+    @app.get("/api/plugins/note_detect/practice-loops")
+    async def list_practice_loops(request: Request):
+        import anyio
+        song_id = request.query_params.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId required")
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                rows = conn.execute(
+                    "SELECT id, song_id, label, loop_a, loop_b, reasons_json, passed, created_at "
+                    "FROM practice_loops WHERE song_id = ? ORDER BY loop_a",
+                    (song_id,),
+                ).fetchall()
+                return [{
+                    "id": r["id"], "songId": r["song_id"], "label": r["label"],
+                    "loopA": r["loop_a"], "loopB": r["loop_b"],
+                    "reasons": json.loads(r["reasons_json"]) if r["reasons_json"] else [],
+                    "passed": bool(r["passed"]), "createdAt": r["created_at"],
+                } for r in rows]
+
+        loops = await anyio.to_thread.run_sync(_work)
+        return {"loops": loops}
+
+    @app.post("/api/plugins/note_detect/practice-loops/{loop_id}/passed")
+    async def mark_practice_loop_passed(loop_id: int, request: Request):
+        import anyio
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        passed = 0 if (isinstance(data, dict) and data.get("passed") is False) else 1
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                conn.execute("UPDATE practice_loops SET passed = ? WHERE id = ?", (passed, loop_id))
+
+        await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id, "passed": bool(passed)}
+
+    @app.delete("/api/plugins/note_detect/practice-loops/{loop_id}")
+    async def delete_practice_loop(loop_id: int):
+        import anyio
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                conn.execute("DELETE FROM practice_loops WHERE id = ?", (loop_id,))
+
+        await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id}
 
     @app.post("/api/plugins/note_detect/recording")
     async def save_recording(request: Request):

@@ -102,6 +102,45 @@ test('suggestLoops: multi-play evidence gate — a single play yields nothing', 
     assert.equal(suggestLoops(rows).length, 0);
 });
 
+test('suggestLoops: minAttempts:1 surfaces a hotspot from a SINGLE play', () => {
+    const { suggestLoops, aggregatePlays } = loadDetectionCore();
+    const { rows } = aggregatePlays([
+        play('A', 1000, [{ t: 20, v: 'MISSED_NO_DETECTION' }, { t: 20.5, v: 'MISSED_NO_DETECTION' },
+                          { t: 21, v: 'MISSED_NO_DETECTION' }]),
+    ]);
+    const loops = suggestLoops(rows, { minAttempts: 1 });
+    assert.ok(loops.length >= 1, 'single-play mode flags the cluster');
+    assert.ok(loops[0].noteCount >= 2);
+});
+
+test('hotspotReasons: tallies coarse failure reasons from trouble notes', () => {
+    const { hotspotReasons } = loadDetectionCore();
+    const r = hotspotReasons({ notes: [
+        { noDetection: 2, wrongPitch: 0 },
+        { noDetection: 1, wrongPitch: 1 },
+    ] });
+    const byKind = Object.fromEntries(r.map((x) => [x.kind, x.count]));
+    assert.equal(byKind['not detected / not played'], 3);
+    assert.equal(byKind['wrong pitch'], 1);
+    assert.equal(hotspotReasons({ notes: [] }).length, 0);
+    assert.equal(hotspotReasons(null).length, 0);
+});
+
+test('renderLoopPanelHtml: lists each loop with range, reasons, pass badge, Drill/Delete', () => {
+    const { renderLoopPanelHtml } = loadDetectionCore();
+    const html = renderLoopPanelHtml([
+        { id: 7, label: '0:18–0:23', loopA: 18, loopB: 23, reasons: [{ kind: 'not detected', count: 4 }], passed: false },
+        { id: 9, label: null, loopA: 40, loopB: 44, reasons: [], passed: true },
+    ]);
+    assert.match(html, /Practice loops/);
+    assert.match(html, /0:18–0:23/);
+    assert.match(html, /4× not detected/);
+    assert.match(html, /nd-loop-drill[^>]*data-id="7"/);
+    assert.match(html, /nd-loop-del[^>]*data-id="7"/);
+    assert.match(html, /✓ passed/, 'passed loop shows the badge');
+    assert.match(html, /0:40–0:44/, 'null label falls back to the mm:ss range');
+});
+
 test('suggestLoops: a one-off fumble (missed in 1 of 2 plays) is not dense enough', () => {
     const { suggestLoops, aggregatePlays } = loadDetectionCore();
     // Same cluster, but play B nailed it — so misses halve and the notes

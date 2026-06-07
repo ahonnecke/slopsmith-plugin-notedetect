@@ -202,6 +202,19 @@ loop) are now ported too, closing the whole loop:
   prune-cascade smoke; 147/147 suite green. Unverified seam (needs a real
   session): the live banner-click → `startDrill` DOM glue.
 
+**Loop manager + single-play (v1.22.0).** A hotspot is offered after a SINGLE
+play now (`_ndSuggestLoops minAttempts:1` when only one play exists; ≥2 still
+required once there's history). Each identified hotspot is persisted as a
+**practice loop** (own `practice_loops` table in the plays DB — the host `loops`
+table can't hold reasons/passed — with `POST/GET/DELETE/{id}/passed` endpoints,
+near-dup de-dupe). A **Practice loops panel** (bottom-left) lists them with their
+coarse failure reasons (not-detected / wrong-pitch counts; fine timing/pitch
+"how" stays in the live drill HUD), a ✓-passed badge, and Drill / Delete per
+loop. Loops survive refresh + restart; the panel + top-hotspot banner re-surface
+when Detect turns on. Graduating a loop at full speed marks it passed. Goal
+reached: pick a song, and every weak spot becomes a saved, drillable,
+pass-trackable loop you grind to full speed.
+
 The conductor is also reachable via coaching's already-computed
 `hotspot.drill = {loopA, loopB, speedMul, goal}` → `window.noteDetect.startDrill`
 (the coaching panel's "Practice this" button) — a second entry point alongside

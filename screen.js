@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.21.0';
+const _ND_VERSION = '1.22.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -647,8 +647,12 @@ function _ndSuggestLoops(rows, opts = {}) {
     // Sliding-window hotspot finder. Only notes attempted in ≥2 plays count
     // (multi-play evidence), so a single bad take can't fabricate a hotspot.
     const { windowSec = 5, slideSec = 0.5, minMissesPerSec = 0.5,
-            minTroubleNotes = 2, maxLoops = 5, padHeadSec = 2.0, padTailSec = 1.0 } = opts;
-    const noteList = (rows || []).map(r => ({ ...r, ..._ndStatsForRow(r) })).filter(r => r.nAttempts >= 2);
+            minTroubleNotes = 2, maxLoops = 5, padHeadSec = 2.0, padTailSec = 1.0,
+            minAttempts = 2 } = opts;
+    // minAttempts gates multi-play evidence: 2 = "missed across plays" (the
+    // default, avoids drilling a one-off fumble); 1 = single-play mode so a
+    // hotspot can be offered right after the first play.
+    const noteList = (rows || []).map(r => ({ ...r, ..._ndStatsForRow(r) })).filter(r => r.nAttempts >= minAttempts);
     if (noteList.length === 0) return [];
     let minT = Infinity, maxT = -Infinity;
     for (const n of noteList) {
@@ -695,6 +699,53 @@ function _ndSuggestLoops(rows, opts = {}) {
             notes: trouble,
         };
     });
+}
+
+// Summarise WHY a hotspot is hard, from its trouble notes' per-attempt
+// stats. Coarse (the persisted plays store only keeps hit/no-detection/
+// wrong-pitch); the live drill HUD shows the fine timing/pitch "how".
+// Pure → node-testable.
+function _ndHotspotReasons(hotspot) {
+    let noDetection = 0, wrongPitch = 0;
+    for (const n of ((hotspot && hotspot.notes) || [])) {
+        noDetection += n.noDetection || 0;
+        wrongPitch += n.wrongPitch || 0;
+    }
+    const reasons = [];
+    if (noDetection) reasons.push({ kind: 'not detected / not played', count: noDetection });
+    if (wrongPitch) reasons.push({ kind: 'wrong pitch', count: wrongPitch });
+    return reasons;
+}
+
+// Render the practice-loop manager panel from a loops list. Pure → the DOM
+// shell (_ndShowLoopPanel) injects this and wires the buttons. Each loop:
+// range + reasons + pass badge + Drill/Delete.
+function _ndRenderLoopPanelHtml(loops) {
+    const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const rows = (loops || []).map((lp) => {
+        const reasons = Array.isArray(lp.reasons) && lp.reasons.length
+            ? lp.reasons.map((r) => `${r.count}× ${esc(r.kind)}`).join(' · ')
+            : 'mixed misses';
+        const badge = lp.passed
+            ? `<span class="text-green-400 text-[10px] font-bold">✓ passed</span>`
+            : `<span class="text-amber-300 text-[10px]">to drill</span>`;
+        const range = lp.label ? esc(lp.label) : `${mmss(lp.loopA)}–${mmss(lp.loopB)}`;
+        return `<li class="bg-dark-700/60 border border-gray-800 rounded-lg p-2 mb-1.5">
+            <div class="flex items-center justify-between gap-2">
+                <span class="text-sm font-semibold text-gray-200">${range}</span>${badge}
+            </div>
+            <div class="text-[11px] text-gray-400 mt-0.5">${reasons}</div>
+            <div class="flex gap-2 mt-1.5">
+                <button class="nd-loop-drill flex-1 px-2 py-1 bg-accent hover:bg-accent-light text-white rounded text-xs font-semibold" data-id="${lp.id}">&#9654; Drill</button>
+                <button class="nd-loop-del px-2 py-1 bg-dark-600 hover:bg-red-900 text-gray-300 rounded text-xs" data-id="${lp.id}" title="Delete loop">🗑</button>
+            </div>
+        </li>`;
+    }).join('');
+    return `<div class="flex items-center justify-between mb-2">
+            <span class="text-sm font-semibold text-gold">Practice loops</span>
+            <button class="nd-loop-close text-gray-500 hover:text-white text-lg leading-none">&times;</button>
+        </div><ul>${rows}</ul>`;
 }
 
 function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
@@ -1956,6 +2007,7 @@ function createNoteDetector(options = {}) {
     let _ndPlaysCache = null;
     let _ndPlaysCacheSongId = null;
     let _ndSuggestingLoop = false;
+    let _ndActiveDrillLoopId = null;   // practice-loop id being drilled, for pass-marking on graduation
 
     // Detection state
     let detectedMidi = -1;
@@ -5315,6 +5367,13 @@ function createNoteDetector(options = {}) {
         drillConductorLabel = null;
         drillConductorSavedSpeed = null;
         drillConductorRange = null;
+        // Graduated a saved practice loop → mark it passed and refresh the
+        // manager so the ✓ shows. Always clear the active-loop id.
+        const passedId = _ndActiveDrillLoopId;
+        _ndActiveDrillLoopId = null;
+        if (graduated && passedId != null) {
+            Promise.resolve(_ndMarkLoopPassed(passedId)).then(() => _ndShowLoopPanel()).catch(() => {});
+        }
         console.log(`[note_detect] Drill ended (${reason})${graduated ? ` — graduated "${label}" at ${Math.round(best * 100)}%` : ''}`);
     }
 
@@ -5499,21 +5558,87 @@ function createNoteDetector(options = {}) {
         try {
             // Only full plays are evidence — drill plays cover a single loop.
             const plays = (await _ndFetchPlaysForSong(songId)).filter(p => !p.isDrill);
-            if (plays.length < 2) return null;  // need recurrence, not one fumble
+            if (plays.length < 1) return null;
             const { rows } = _ndAggregatePlays(plays);
-            const loops = _ndSuggestLoops(rows, { maxLoops: 3 });
-            if (!loops.length) return null;
-            const top = loops[0];
-            if (top.noteCount < 2) return null;
+            // Single play → minAttempts 1 (offer after the first play); multiple
+            // → 2 (recurrence, not a one-off fumble).
+            const minAttempts = plays.length >= 2 ? 2 : 1;
+            const found = _ndSuggestLoops(rows, { maxLoops: 3, minAttempts });
+            if (!found.length) return null;
+            const top = found[0];
+            if (top.noteCount < 1) return null;
+            // Persist every found hotspot as a practice loop (with reasons) so
+            // the loop manager has them across refresh, then surface the top.
+            for (const h of found) {
+                _ndSaveLoop(songId, `${_ndMmSs(h.startSec)}–${_ndMmSs(h.endSec)}`, h.startSec, h.endSec, _ndHotspotReasons(h));
+            }
             _ndShowPracticeBanner(top);
+            _ndShowLoopPanel(songId);  // refresh the manager
             return top;
         } finally {
             _ndSuggestingLoop = false;
         }
     }
 
+    const _ndMmSs = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+    // ── Practice-loop manager (persist hotspots, list, drill, delete) ──
+    async function _ndFetchLoops(songId) {
+        try {
+            const r = await fetch(`/api/plugins/note_detect/practice-loops?songId=${encodeURIComponent(songId)}`);
+            return (await r.json()).loops || [];
+        } catch (e) { console.warn('[note_detect] loops fetch failed:', e); return []; }
+    }
+    function _ndSaveLoop(songId, label, loopA, loopB, reasons) {
+        return fetch('/api/plugins/note_detect/practice-loops', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ songId, label, loopA, loopB, reasons }),
+        }).catch((e) => console.warn('[note_detect] loop save failed:', e));
+    }
+    function _ndDeleteLoop(id) {
+        return fetch(`/api/plugins/note_detect/practice-loops/${id}`, { method: 'DELETE' })
+            .catch((e) => console.warn('[note_detect] loop delete failed:', e));
+    }
+    function _ndMarkLoopPassed(id) {
+        return fetch(`/api/plugins/note_detect/practice-loops/${id}/passed`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passed: true }),
+        }).catch((e) => console.warn('[note_detect] loop passed failed:', e));
+    }
+
+    // Drill a saved loop; remember its id so graduation can mark it passed.
+    function _ndDrillSavedLoop(loop) {
+        _ndActiveDrillLoopId = loop.id != null ? loop.id : null;
+        return startDrill(loop.loopA, loop.loopB, {
+            label: loop.label || `${_ndMmSs(loop.loopA)}–${_ndMmSs(loop.loopB)}`,
+            goal: _ND_DRILL_DEFAULT_GOAL,
+            speedLadder: _ND_DRILL_DEFAULT_LADDER,
+        });
+    }
+
+    async function _ndShowLoopPanel(songId) {
+        const sid = songId || _ndCurrentSongId();
+        if (!sid) return;
+        const loops = await _ndFetchLoops(sid);
+        let panel = document.getElementById('nd-loop-panel');
+        if (!loops.length) { if (panel) panel.remove(); return; }
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'nd-loop-panel';
+            panel.className = 'fixed bottom-4 left-4 z-[200] w-72 max-h-[60vh] overflow-y-auto bg-dark-800 border border-gray-700 rounded-xl p-3 shadow-2xl';
+            document.body.appendChild(panel);
+        }
+        panel.innerHTML = _ndRenderLoopPanelHtml(loops);
+        panel.querySelector('.nd-loop-close').onclick = () => panel.remove();
+        panel.querySelectorAll('.nd-loop-drill').forEach((b) => {
+            b.onclick = () => { const lp = loops.find((x) => String(x.id) === b.dataset.id); if (lp) _ndDrillSavedLoop(lp); };
+        });
+        panel.querySelectorAll('.nd-loop-del').forEach((b) => {
+            b.onclick = async () => { await _ndDeleteLoop(b.dataset.id); _ndShowLoopPanel(sid); };
+        });
+    }
+
     function _ndShowPracticeBanner(hotspot) {
-        const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+        const mmss = _ndMmSs;
         const existing = document.querySelector('.nd-practice-banner');
         if (existing && existing.dataset.start === hotspot.startSec.toFixed(2)) return;
         if (existing) existing.remove();
@@ -6398,7 +6523,11 @@ function createNoteDetector(options = {}) {
         if (isDefault) {
             setTimeout(() => {
                 const sid = _ndCurrentSongId();
-                if (sid) { try { _ndMaybeSuggestPracticeLoop(sid); } catch (_) {} }
+                if (!sid) return;
+                // Show any saved practice loops for this song, and surface the
+                // top hotspot banner from history (both from the persisted DB).
+                try { _ndShowLoopPanel(sid); } catch (_) {}
+                try { _ndMaybeSuggestPracticeLoop(sid); } catch (_) {}
             }, 800);
         }
 
