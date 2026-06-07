@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.17.0';
+const _ND_VERSION = '1.18.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -516,7 +516,7 @@ const _ND_MIN_DETECTABLE_HZ = 30;
 // loop:restart iteration scoring. Defaults recovered from the prior
 // deliberate-practice loop: drill slow, step the speed up only when an
 // iteration clears the accuracy goal, graduate at full speed.
-const _ND_DRILL_LEAD_IN_SEC = 2.0;            // audible pre-roll before the judged window (a count's worth)
+const _ND_DRILL_LEAD_IN_SEC = 3.0;            // audible pre-roll before the judged window (the host adds a 4-beat count-in on each wrap; this covers the first entry)
 const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
 const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
 const _ND_DRILL_DEFAULT_LADDER = [0.7, 0.85, 1.0];  // playback-speed rungs, slow → full
@@ -5208,7 +5208,10 @@ function createNoteDetector(options = {}) {
             // speed (the goal must be re-earned at the harder tempo).
             drillConductorRung = decision.nextRung;
             drillConductorBest = 0;
+            const toPct = Math.round((drillConductorLadder[drillConductorRung] || 1) * 100);
             _hostSetSpeed(drillConductorLadder[drillConductorRung]);
+            _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
+            return;
         }
         _drillConductorUpdateHud({ lastScore: score });
     }
@@ -5263,16 +5266,20 @@ function createNoteDetector(options = {}) {
         if (!hud) {
             hud = document.createElement('div');
             hud.id = 'nd-drill-hud';
-            hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
+            hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] min-w-[330px] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
             document.body.appendChild(hud);
         }
         _drillConductorUpdateHud();
     }
 
+    // Render the drill HUD. The message is the user's "way out" signal —
+    // each pass it says either how far short of the goal you are (keep
+    // going) or that you've earned a speed-up / graduated. Always shows an
+    // obvious End button so the loop is never a trap.
     function _drillConductorUpdateHud(extra = {}) {
         const hud = document.getElementById('nd-drill-hud');
         if (!hud) return;
-        const { lastScore = null, graduated = false } = extra;
+        const { lastScore = null, graduated = false, advanced = false, toPct = null } = extra;
         const speedPct = drillConductorLadder
             ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
         const goalPct = Math.round((drillConductorGoal || 0) * 100);
@@ -5280,29 +5287,25 @@ function createNoteDetector(options = {}) {
         const lastPct = lastScore != null ? Math.round(lastScore * 100) : null;
         const atTop = drillConductorLadder
             ? drillConductorRung >= drillConductorLadder.length - 1 : true;
-        const focusLine = drillConductorFocus
-            ? `<div class="text-blue-200 text-xs mt-0.5">${drillConductorFocus}</div>` : '';
-        const speedTag = `<span class="text-yellow-300 text-[11px] ml-2">@ ${speedPct}%</span>`;
-        let body;
+
+        let banner;
         if (graduated) {
-            body = `<div class="text-green-300 font-bold text-xs mt-1">🎓 Graduated — ${lastPct != null ? lastPct + '%' : ''} at full speed</div>`;
+            banner = `<div class="text-green-300 font-bold text-sm">✓ Nailed it at full speed — drill complete!</div>`;
+        } else if (advanced) {
+            banner = `<div class="text-green-300 font-bold text-sm">▲ Time to go faster — now ${toPct != null ? toPct : speedPct}% speed</div>`;
         } else if (lastPct != null) {
-            body = `<div class="text-gray-300 text-xs mt-1">
-                Iter <span class="font-bold">${lastPct}%</span>
-                · best ${bestPct}% · goal <span class="text-blue-300">${goalPct}%</span>${atTop ? '' : ' · clear it to speed up'}
-            </div>`;
+            const ok = lastPct >= goalPct;
+            banner = ok
+                ? `<div class="text-green-300 text-sm">Last pass <span class="font-bold">${lastPct}%</span> — clean!</div>`
+                : `<div class="text-amber-200 text-sm">Last pass <span class="font-bold">${lastPct}%</span> — need <span class="font-bold">${goalPct}%</span> to speed up. Keep going.</div>`;
         } else {
-            body = `<div class="text-gray-500 text-xs mt-1">Play the loop — score updates each pass · goal ${goalPct}%</div>`;
+            banner = `<div class="text-gray-300 text-sm">Play the loop — hit <span class="font-bold">${goalPct}%</span> clean to speed up.</div>`;
         }
+        const sub = `<div class="text-gray-500 text-[11px] mt-0.5">🎯 ${speedPct}% speed${atTop ? ' (full)' : ''} · best ${bestPct}%${drillConductorFocus ? ' · ' + drillConductorFocus : (drillConductorLabel ? ' · ' + drillConductorLabel : '')}</div>`;
         hud.innerHTML = `
-            <div class="flex items-center justify-between gap-3">
-                <div>
-                    <div class="text-blue-300 text-[10px] uppercase tracking-wide font-semibold">🎯 Drilling${speedTag}</div>
-                    ${drillConductorLabel ? `<div class="text-gray-400 text-[11px]">${drillConductorLabel}</div>` : ''}
-                    ${focusLine}
-                    ${body}
-                </div>
-                <button id="nd-drill-end" class="text-gray-500 hover:text-gray-200 text-xl leading-none px-2" title="End drill">×</button>
+            <div class="flex items-center gap-3">
+                <div class="flex-1">${banner}${sub}</div>
+                <button id="nd-drill-end" class="px-2.5 py-1 bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg text-xs font-semibold whitespace-nowrap" title="End drill">✕ End</button>
             </div>`;
         const endBtn = hud.querySelector('#nd-drill-end');
         if (endBtn) endBtn.onclick = () => endDrill('user');
