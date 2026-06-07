@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.20.0';
+const _ND_VERSION = '1.21.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -6388,6 +6388,19 @@ function createNoteDetector(options = {}) {
 
         _syncChartStateFromHw();
         _chartStateBindEvents();
+
+        // Surface a hotspot from PERSISTED play history (the SQLite plays DB
+        // survives refresh AND container restart) the moment Detect turns on,
+        // so the restart → drill → eval loop doesn't require replaying the
+        // whole song each time. Default singleton only; delayed so the chart/
+        // songId is ready; fire-and-forget (no-ops without ≥2 plays of
+        // evidence for this song).
+        if (isDefault) {
+            setTimeout(() => {
+                const sid = _ndCurrentSongId();
+                if (sid) { try { _ndMaybeSuggestPracticeLoop(sid); } catch (_) {} }
+            }, 800);
+        }
 
         resetScoring();
 
