@@ -58,6 +58,35 @@ test('_ndDrillRampDecision: non-finite score never clears the goal', () => {
     assert.equal(drillRampDecision(undefined, 0.85, 0, 3).action, 'hold');
 });
 
+// ── Per-note "what you missed + how" (pure) ──────────────────────────────
+
+test('_ndDescribeMiss: categorises a miss by failure mode with a human detail', () => {
+    const { describeMiss } = loadDetectionCore();
+    assert.equal(describeMiss({ detectedMidi: null }).how, 'missed');
+    assert.match(describeMiss({ detectedMidi: null }).detail, /not played|not detected/);
+    assert.deepEqual(pick(describeMiss({ detectedMidi: 45, timingState: 'LATE', timingError: 42 })), ['late', '42ms late']);
+    assert.deepEqual(pick(describeMiss({ detectedMidi: 45, timingState: 'EARLY', timingError: -30 })), ['early', '30ms early']);
+    assert.deepEqual(pick(describeMiss({ detectedMidi: 46, pitchState: 'SHARP', pitchError: 28 })), ['sharp', '28¢ sharp']);
+    assert.deepEqual(pick(describeMiss({ detectedMidi: 44, pitchState: 'FLAT', pitchError: -19 })), ['flat', '19¢ flat']);
+    function pick(d) { return [d.how, d.detail]; }
+});
+
+test('_ndSummarizeWindowMisses: only misses inside the window, tagged where+how, time-sorted', () => {
+    const { summarizeWindowMisses } = loadDetectionCore();
+    const judgments = [
+        { hit: true, noteTime: 20.0, note: { s: 1, f: 5 } },                                   // hit — excluded
+        { hit: false, noteTime: 21.0, note: { s: 2, f: 7 }, detectedMidi: null },              // miss in window
+        { hit: false, noteTime: 20.5, note: { s: 1, f: 3 }, detectedMidi: 45, timingState: 'LATE', timingError: 40 },
+        { hit: false, noteTime: 99.0, note: { s: 0, f: 0 }, detectedMidi: null },              // out of window
+    ];
+    const r = summarizeWindowMisses(judgments, 19, 23);
+    assert.equal(r.length, 2, 'only the two in-window misses');
+    assert.deepEqual([r[0].t, r[1].t], [20.5, 21.0], 'sorted by time');
+    assert.equal(r[0].how, 'late');
+    assert.equal(r[0].s, 1); assert.equal(r[0].f, 3);
+    assert.equal(r[1].how, 'missed');
+});
+
 // ── Conductor state machine (enriched stubs) ─────────────────────────────
 
 // Load the core with a sandbox rich enough for startDrill to run: a fake

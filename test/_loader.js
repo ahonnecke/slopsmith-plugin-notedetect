@@ -177,7 +177,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
-        '_ndDrillRampDecision',
+        '_ndDrillRampDecision', '_ndDescribeMiss', '_ndSummarizeWindowMisses',
         '_ndAggregatePlays', '_ndStatsForRow', '_ndSuggestLoops',
         'createNoteDetector',
     ];
@@ -296,6 +296,8 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         },
         calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
         drillRampDecision: sandbox._ndDrillRampDecision,
+        describeMiss: sandbox._ndDescribeMiss,
+        summarizeWindowMisses: sandbox._ndSummarizeWindowMisses,
         aggregatePlays: sandbox._ndAggregatePlays,
         statsForRow: sandbox._ndStatsForRow,
         suggestLoops: sandbox._ndSuggestLoops,

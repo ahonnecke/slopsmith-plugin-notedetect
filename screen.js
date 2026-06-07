@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.18.0';
+const _ND_VERSION = '1.19.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -535,6 +535,37 @@ function _ndDrillRampDecision(score, goal, rung, ladderLength) {
     const atTop = rung >= ladderLength - 1;
     if (atTop) return { action: 'graduate', nextRung: rung };
     return { action: 'advance', nextRung: rung + 1 };
+}
+
+// Describe HOW a missed note failed, from its judgment. Pure → testable.
+// `how` is a short category (for colour-coding); `detail` is the human
+// phrase shown per note in the drill HUD.
+function _ndDescribeMiss(j) {
+    if (!j) return { how: 'missed', detail: 'no note' };
+    const dm = j.detectedMidi;
+    if (dm == null || !Number.isFinite(dm)) return { how: 'missed', detail: 'not played / not detected' };
+    if (j.timingState === 'LATE') return { how: 'late', detail: Number.isFinite(j.timingError) ? `${Math.round(Math.abs(j.timingError))}ms late` : 'late' };
+    if (j.timingState === 'EARLY') return { how: 'early', detail: Number.isFinite(j.timingError) ? `${Math.round(Math.abs(j.timingError))}ms early` : 'early' };
+    if (j.pitchState === 'SHARP') return { how: 'sharp', detail: Number.isFinite(j.pitchError) ? `${Math.round(Math.abs(j.pitchError))}¢ sharp` : 'sharp' };
+    if (j.pitchState === 'FLAT') return { how: 'flat', detail: Number.isFinite(j.pitchError) ? `${Math.round(Math.abs(j.pitchError))}¢ flat` : 'flat' };
+    return { how: 'wrong', detail: 'wrong note' };
+}
+
+// Collect missed notes inside a drill's judge window from a flat list of
+// judgments (noteResults values), tagged with where (string/fret) + how,
+// sorted by chart time. Pure → testable; the conductor renders the result.
+function _ndSummarizeWindowMisses(judgments, startSec, endSec) {
+    const out = [];
+    for (const j of (judgments || [])) {
+        if (!j || j.hit) continue;
+        const t = Number.isFinite(j.noteTime) ? j.noteTime : null;
+        if (t == null || t < startSec || t > endSec) continue;
+        const note = j.note || j.chartNote || {};
+        const d = _ndDescribeMiss(j);
+        out.push({ s: note.s, f: note.f, t, how: d.how, detail: d.detail });
+    }
+    out.sort((a, b) => a.t - b.t);
+    return out;
 }
 
 // ── Multi-play hotspot finder (pure aggregation) ─────────────────────────
@@ -5213,7 +5244,19 @@ function createNoteDetector(options = {}) {
             _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
             return;
         }
-        _drillConductorUpdateHud({ lastScore: score });
+        // Held below the goal — show WHICH notes were missed this pass and
+        // HOW, so the user knows what to fix rather than just a bare score.
+        _drillConductorUpdateHud({ lastScore: score, misses: _drillIterationMisses() });
+    }
+
+    // The misses inside the drill window from the just-finished pass.
+    // noteResults is keyed by chart note (time_s_f), so each pass overwrites
+    // the prior verdict — at wrap time the window holds this pass's results.
+    function _drillIterationMisses() {
+        if (!drillConductorRange) return [];
+        const arr = [];
+        for (const v of noteResults.values()) arr.push(v);
+        return _ndSummarizeWindowMisses(arr, drillConductorRange.judgeStart, drillConductorRange.judgeEnd);
     }
 
     function endDrill(reason = 'user') {
@@ -5279,7 +5322,7 @@ function createNoteDetector(options = {}) {
     function _drillConductorUpdateHud(extra = {}) {
         const hud = document.getElementById('nd-drill-hud');
         if (!hud) return;
-        const { lastScore = null, graduated = false, advanced = false, toPct = null } = extra;
+        const { lastScore = null, graduated = false, advanced = false, toPct = null, misses = null } = extra;
         const speedPct = drillConductorLadder
             ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
         const goalPct = Math.round((drillConductorGoal || 0) * 100);
@@ -5302,9 +5345,20 @@ function createNoteDetector(options = {}) {
             banner = `<div class="text-gray-300 text-sm">Play the loop — hit <span class="font-bold">${goalPct}%</span> clean to speed up.</div>`;
         }
         const sub = `<div class="text-gray-500 text-[11px] mt-0.5">🎯 ${speedPct}% speed${atTop ? ' (full)' : ''} · best ${bestPct}%${drillConductorFocus ? ' · ' + drillConductorFocus : (drillConductorLabel ? ' · ' + drillConductorLabel : '')}</div>`;
+        // Per-note "what you missed + how" for the pass just finished.
+        const howColor = { missed: 'text-red-300', late: 'text-amber-300', early: 'text-amber-300', sharp: 'text-purple-300', flat: 'text-purple-300', wrong: 'text-red-300' };
+        let missList = '';
+        if (Array.isArray(misses) && misses.length) {
+            const shown = misses.slice(0, 6).map((m) => {
+                const pos = `S${(Number.isInteger(m.s) ? m.s + 1 : '?')}·${Number.isInteger(m.f) ? 'fr' + m.f : '?'}`;
+                return `<div class="flex justify-between gap-3"><span class="text-gray-300">${pos}</span><span class="${howColor[m.how] || 'text-gray-400'}">${m.detail}</span></div>`;
+            }).join('');
+            const more = misses.length > 6 ? `<div class="text-gray-600 text-[10px]">+${misses.length - 6} more</div>` : '';
+            missList = `<div class="mt-1.5 pt-1.5 border-t border-gray-700 text-[11px] font-mono leading-tight">${shown}${more}</div>`;
+        }
         hud.innerHTML = `
-            <div class="flex items-center gap-3">
-                <div class="flex-1">${banner}${sub}</div>
+            <div class="flex items-start gap-3">
+                <div class="flex-1">${banner}${sub}${missList}</div>
                 <button id="nd-drill-end" class="px-2.5 py-1 bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg text-xs font-semibold whitespace-nowrap" title="End drill">✕ End</button>
             </div>`;
         const endBtn = hud.querySelector('#nd-drill-end');
