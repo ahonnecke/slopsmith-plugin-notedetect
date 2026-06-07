@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.22.0';
+const _ND_VERSION = '1.23.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -519,7 +519,7 @@ const _ND_MIN_DETECTABLE_HZ = 30;
 const _ND_DRILL_LEAD_IN_SEC = 3.0;            // audible pre-roll before the judged window (the host adds a 4-beat count-in on each wrap; this covers the first entry)
 const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
 const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
-const _ND_DRILL_DEFAULT_LADDER = [0.7, 0.85, 1.0];  // playback-speed rungs, slow → full
+const _ND_DRILL_DEFAULT_LADDER = [0.8, 0.9, 1.0];  // playback-speed rungs, slow → full (0.8 floor: slower time-stretches sound distorted)
 
 // Pure goal-gate decision for one finished drill iteration. Given the
 // iteration's accuracy `score` (0..1), the `goal` (0..1), the current
@@ -2000,6 +2000,8 @@ function createNoteDetector(options = {}) {
     let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
     let drillConductorRange = null;         // {loopStart, loopEnd, judgeStart, judgeEnd}
     let drillConductorOnWrapFn = null;      // bound loop:restart listener (own, not via the foundation)
+    let _ndDrillLastChartT = 0;             // chart time last tick — a backward jump = a loop wrap
+    let _ndDrillLastScoredPerf = 0;         // perf ms of the last scored wrap (dedupe loop:restart vs chart-tick)
 
     // ── Hotspot finder state ──────────────────────────────────────────
     // Multi-play history cache + a re-entrancy guard for the song-end
@@ -4654,6 +4656,9 @@ function createNoteDetector(options = {}) {
         // Bridge slopsmith's loop state into our drill flag once per
         // tick. Cheap (one getLoop read); avoids a separate poll.
         _drillSyncFromLoopState();
+        // Detect conductor loop wraps from the chart clock (reliable; the
+        // host loop:restart event doesn't reach us on this loop path).
+        _drillConductorTick();
         _drillRender();
 
         const total = hits + misses;
@@ -5237,10 +5242,14 @@ function createNoteDetector(options = {}) {
         drillConductorFocus = focus;
         drillConductorLabel = label || `${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s`;
         drillConductorRange = { loopStart, loopEnd, judgeStart, judgeEnd };
+        _ndDrillLastChartT = 0;          // reset wrap detector for this drill
+        _ndDrillLastScoredPerf = 0;
         // Window-level flag the host's loop-wrap handler reads to skip its
         // count-in during drill iterations (we own the lead-in).
         window._ndAnyDrillActive = true;
 
+        // Preserve pitch when slowed so the lead-in/notes don't pitch-shift.
+        if (audio) { try { audio.preservesPitch = true; audio.mozPreservesPitch = true; audio.webkitPreservesPitch = true; } catch (_) {} }
         _hostSetSpeed(ladder[0]);
 
         // Arm the loop (seeks to loopStart but does NOT auto-play), then
@@ -5261,6 +5270,8 @@ function createNoteDetector(options = {}) {
         if (audio) {
             try { await audio.play(); } catch (_) { /* autoplay may reject; the loop still runs once playing */ }
         }
+        // Count-in click over the first entry's lead-in too (not just on wraps).
+        _drillPlayCountIn();
 
         // Drill is pointless without detection running.
         if (!enabled) { try { await enable(); } catch (_) {} }
@@ -5285,8 +5296,11 @@ function createNoteDetector(options = {}) {
     // plugin-set loop, so the HUD never refreshed). noteResults is keyed by
     // chart note (time_s_f), so each pass overwrites the prior verdict — at
     // wrap time the window holds exactly this pass's results.
+    const _ndPerfNow = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+
     function _drillConductorOnWrap() {
         if (!drillConductorActive || !drillConductorRange) return;
+        _ndDrillLastScoredPerf = _ndPerfNow();  // stamp so the chart-tick detector won't double-fire
         const { judgeStart, judgeEnd } = drillConductorRange;
         const arr = [];
         for (const v of noteResults.values()) arr.push(v);
@@ -5310,6 +5324,10 @@ function createNoteDetector(options = {}) {
             endDrill('graduated');
             return;
         }
+        // The loop is restarting — play a count-in click over the lead-in so
+        // the player can come in on the beat (the host's own count-in doesn't
+        // fire on this loop path).
+        _drillPlayCountIn();
         if (decision.action === 'advance') {
             // Step up one rung: faster playback, fresh best for the new
             // speed (the goal must be re-earned at the harder tempo).
@@ -5322,6 +5340,50 @@ function createNoteDetector(options = {}) {
         }
         // Held below the goal — show WHICH notes were missed this pass and HOW.
         _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
+    }
+
+    // Detect a loop wrap from the chart clock (a backward jump) — the
+    // reliable trigger, since the host's loop:restart event doesn't reach
+    // us on this loop path. Called every HUD tick while drilling. Deduped
+    // against _drillConductorOnWrap's own stamp so if loop:restart DID fire
+    // we don't score twice.
+    function _drillConductorTick() {
+        if (!drillConductorActive) return;
+        const _hw = resolveHw();
+        if (!_hw || !_hw.getTime) return;
+        const ct = _hw.getTime();
+        if (_ndDrillLastChartT > 0 && ct >= 0 && ct < _ndDrillLastChartT - 1.0) {
+            // Backward jump = wrap. Skip if a loop:restart already scored it.
+            if (_ndPerfNow() - _ndDrillLastScoredPerf > 1200) _drillConductorOnWrap();
+        }
+        _ndDrillLastChartT = ct;
+    }
+
+    // A short 4-beat count-in click over the lead-in, scheduled on the
+    // detection AudioContext. Best-effort — silent if no context. Beats are
+    // stretched by the current drill speed so they line up with the slowed
+    // playback's pulse.
+    function _drillPlayCountIn() {
+        if (!audioCtx || !drillConductorRange) return;
+        try {
+            const _hw = resolveHw();
+            const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(drillConductorRange.judgeStart) : 100;
+            const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
+            const speed = (drillConductorLadder && drillConductorLadder[drillConductorRung]) || 1;
+            const interval = beat / (speed || 1);
+            const t0 = audioCtx.currentTime + 0.06;
+            for (let i = 0; i < 4; i++) {
+                const at = t0 + i * interval;
+                const osc = audioCtx.createOscillator();
+                const g = audioCtx.createGain();
+                osc.frequency.value = i === 0 ? 1320 : 880;  // accent the downbeat
+                g.gain.setValueAtTime(0.0001, at);
+                g.gain.exponentialRampToValueAtTime(0.35, at + 0.004);
+                g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+                osc.connect(g); g.connect(audioCtx.destination);
+                osc.start(at); osc.stop(at + 0.06);
+            }
+        } catch (_) { /* click is best-effort */ }
     }
 
     function endDrill(reason = 'user') {
