@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.10.0';
+const _ND_VERSION = '1.24.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -209,7 +209,89 @@ const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, h
 // detection resolution — it only halves the input-side buffering
 // latency (1024/48000 ≈ 21 ms vs 2048/48000 ≈ 43 ms). Matches the
 // headless harness's default --frame-size.
-const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
+const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size (hard fallback)
+// Valid ScriptProcessor buffer sizes; the persisted `frameSize` setting is
+// clamped to this set on load. EMPIRICAL CORRECTION to the note above: the
+// callback chunk size DOES affect bass recall — harness on a real take gives
+// 1024→27%, 2048→77%, 4096→68%. The 4096-sample accumulation does NOT fully
+// compensate for a too-short callback granularity on low fundamentals, so the
+// per-instance default is 2048, not _ND_FRAME_SIZE.
+const _ND_VALID_FRAME_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384];
+function _ndClampFrameSize(v) {
+    v = Number(v);
+    return _ND_VALID_FRAME_SIZES.includes(v) ? v : 2048;
+}
+
+// Pitch window the DSP band-energy scorer uses to VERIFY a single note
+// (confirm the expected pitch is what is ringing, vs. a neighbouring
+// fret ~100 cents away). Deliberately decoupled from the user's
+// pitch_tolerance_cents — that setting governs the strict hit/miss
+// pitch CALL in makeMatchedJudgment, which is far tighter than what a
+// coarse FFT peak can verify. 50 cents = a quarter-tone, enough to
+// disambiguate adjacent frets without rejecting real-world intonation.
+const _ND_VERIFY_PITCH_CENTS = 50;
+// Bass widens the pitch-verify window: a low-string fundamental (B0 ≈ 31 Hz)
+// spans barely one FFT bin (~157 cents/bin), so even the engine's
+// harmonic-blended pitch estimate is coarser than guitar's. 60 cents still
+// disambiguates adjacent bass frets (a semitone is 100 cents) without
+// rejecting real intonation on a note the low bins resolve loosely.
+const _ND_VERIFY_PITCH_CENTS_BASS = 60;
+
+// Minimum harmonic-to-floor ratio for the desktop engine's harmonic-comb
+// verifier (scoreChord harmonicVerify mode) to count a single note as
+// present. Tunable here — it rides through the IPC, so calibration does
+// not need a native rebuild.
+const _ND_VERIFY_HARMONIC_SNR = 3.0;
+// Bass lowers the harmonic-to-floor ratio. A bass DI puts less of its energy
+// into the upper partials the comb sums (the fundamental is strong but the
+// harmonic stack is shorter than a guitar's), so the guitar SNR gate of 3.0
+// under-counts genuine low notes — measured against a real bass DI calibration
+// take, dropping to 2.0 raised picked-note recall ~81%→86% with no loss on
+// fingerstyle and no real-world precision cost (the verifier only ever scores
+// the *charted* note, and silence is still rejected by the separate floor/
+// average-bin denominator, not this ratio). Rides the IPC — no native rebuild.
+const _ND_VERIFY_HARMONIC_SNR_BASS = 2.0;
+
+// Fundamental-presence gate for the harmonic-comb verifier (scoreChord
+// `fundamentalRatio`): a note is rejected when its f0 peak is weaker than
+// ratio × its strongest partial — the specificity guard against octave-up
+// impostors. Guitar's DI fundamental is healthy, so 0.20 is safe. A bass DI
+// fundamental is routinely WEAKER than the 2nd harmonic (amp-sim DIs,
+// compression, roll-off below ~60 Hz — see _ndHpsDetect), so the guitar gate
+// false-rejects real bass notes; bass uses a low ratio that still rejects a
+// true octave impostor (which has ~no energy at f0) but passes a weak-but-
+// present fundamental. Rides the IPC — no native rebuild to recalibrate.
+const _ND_VERIFY_FUNDAMENTAL_RATIO = 0.20;
+const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
+
+// Temporal-persistence floor for the engine NoteVerifier (setChart
+// `presenceRatio`): a chart note counts as hit only when the comb confirms its
+// pitch in at least this FRACTION of the frames scored in its window, instead
+// of the legacy "ever present" (any single frame). Measured against real
+// wrong-position bass DI takes: a correctly-fretted note rings present through
+// ~70-100% of its frames, while a note played 2 frets off only flickers present
+// on a handful of stray frames (its harmonics don't align with the comb), so a
+// 0.3 floor cuts wrong-position false-accepts ~70-95% with no loss on the
+// correct take. Guitar keeps 0 (legacy ever-present, byte-identical) — guitar
+// was never reported to false-accept and a floor risks dropping fast/staccato
+// passages. Rides the IPC — no native rebuild to recalibrate.
+const _ND_VERIFY_PRESENCE_RATIO = 0.0;
+const _ND_VERIFY_PRESENCE_RATIO_BASS = 0.3;
+
+// Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
+// `fundamentalRatio` feed both the setChart payload and the scoreChord
+// harmonic-verify call. This helper's `pitchCheckCents` feeds only the
+// scoreChord call; setChart's own `pitchCheckCents` field is populated from
+// the user's Pitch-tolerance slider instead, not from this helper.
+function _ndVerifyParamsFor(arrangement) {
+    const bass = arrangement === 'bass';
+    return {
+        pitchCheckCents: bass ? _ND_VERIFY_PITCH_CENTS_BASS : _ND_VERIFY_PITCH_CENTS,
+        harmonicSnr: bass ? _ND_VERIFY_HARMONIC_SNR_BASS : _ND_VERIFY_HARMONIC_SNR,
+        fundamentalRatio: bass ? _ND_VERIFY_FUNDAMENTAL_RATIO_BASS : _ND_VERIFY_FUNDAMENTAL_RATIO,
+        presenceRatio: bass ? _ND_VERIFY_PRESENCE_RATIO_BASS : _ND_VERIFY_PRESENCE_RATIO,
+    };
+}
 
 // Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
 //
@@ -429,6 +511,263 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 // ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
 const _ND_MIN_DETECTABLE_HZ = 30;
 
+// ── Drill conductor tuning ───────────────────────────────────────────────
+// The speed/goal orchestrator (startDrill) layered on top of the
+// loop:restart iteration scoring. Defaults recovered from the prior
+// deliberate-practice loop: drill slow, step the speed up only when an
+// iteration clears the accuracy goal, graduate at full speed.
+const _ND_DRILL_LEAD_IN_SEC = 3.0;            // audible pre-roll before the judged window (the host adds a 4-beat count-in on each wrap; this covers the first entry)
+const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
+const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
+const _ND_DRILL_DEFAULT_LADDER = [0.8, 0.9, 1.0];  // playback-speed rungs, slow → full (0.8 floor: slower time-stretches sound distorted)
+
+// Pure goal-gate decision for one finished drill iteration. Given the
+// iteration's accuracy `score` (0..1), the `goal` (0..1), the current
+// ladder `rung`, and the ladder `length`, decide whether to hold at this
+// speed, step up a rung, or graduate. No DOM/audio — unit-testable; the
+// conductor's _drillConductorOnIteration applies the result.
+//   - miss the goal            → { action: 'hold',     nextRung: rung }
+//   - clear it below full speed → { action: 'advance',  nextRung: rung+1 }
+//   - clear it at the top rung  → { action: 'graduate', nextRung: rung }
+function _ndDrillRampDecision(score, goal, rung, ladderLength) {
+    const cleared = Number.isFinite(score) && Number.isFinite(goal) && score >= goal;
+    if (!cleared) return { action: 'hold', nextRung: rung };
+    const atTop = rung >= ladderLength - 1;
+    if (atTop) return { action: 'graduate', nextRung: rung };
+    return { action: 'advance', nextRung: rung + 1 };
+}
+
+// Describe HOW a missed note failed, from its judgment. Pure → testable.
+// `how` is a short category (for colour-coding); `detail` is the human
+// phrase shown per note in the drill HUD.
+function _ndDescribeMiss(j) {
+    if (!j) return { how: 'missed', detail: 'no note' };
+    const dm = j.detectedMidi;
+    if (dm == null || !Number.isFinite(dm)) return { how: 'missed', detail: 'not played / not detected' };
+    if (j.timingState === 'LATE') return { how: 'late', detail: Number.isFinite(j.timingError) ? `${Math.round(Math.abs(j.timingError))}ms late` : 'late' };
+    if (j.timingState === 'EARLY') return { how: 'early', detail: Number.isFinite(j.timingError) ? `${Math.round(Math.abs(j.timingError))}ms early` : 'early' };
+    if (j.pitchState === 'SHARP') return { how: 'sharp', detail: Number.isFinite(j.pitchError) ? `${Math.round(Math.abs(j.pitchError))}¢ sharp` : 'sharp' };
+    if (j.pitchState === 'FLAT') return { how: 'flat', detail: Number.isFinite(j.pitchError) ? `${Math.round(Math.abs(j.pitchError))}¢ flat` : 'flat' };
+    return { how: 'wrong', detail: 'wrong note' };
+}
+
+// Collect missed notes inside a drill's judge window from a flat list of
+// judgments (noteResults values), tagged with where (string/fret) + how,
+// sorted by chart time. Pure → testable; the conductor renders the result.
+function _ndSummarizeWindowMisses(judgments, startSec, endSec) {
+    const out = [];
+    for (const j of (judgments || [])) {
+        if (!j || j.hit) continue;
+        const t = Number.isFinite(j.noteTime) ? j.noteTime : null;
+        if (t == null || t < startSec || t > endSec) continue;
+        const note = j.note || j.chartNote || {};
+        const d = _ndDescribeMiss(j);
+        out.push({ s: note.s, f: note.f, t, how: d.how, detail: d.detail });
+    }
+    out.sort((a, b) => a.t - b.t);
+    return out;
+}
+
+// ── Multi-play hotspot finder (pure aggregation) ─────────────────────────
+// Recovered from the prior fork's sliding-window finder. Joins per-note
+// verdicts ACROSS plays so a region only flags when the user keeps missing
+// it (not a one-off fumble), then proposes A-B loops over the dense
+// trouble spots. Pure (no DOM/audio) → node-testable; the closure finder
+// fetches plays and feeds them here.
+//
+// Each play: { playId, startedAt, reason, noteResults:[{key, chartT, s, f,
+//   expectedMidi, primary}] }, primary ∈ HIT | MISSED_WRONG_PITCH |
+//   MISSED_NO_DETECTION (a chart note absent from a play that covered its
+//   time counts as an ABSENT attempt; outside the play's range = OUT_OF_SCOPE,
+//   not an attempt).
+
+function _ndAggregatePlays(plays) {
+    // Newest-first so attempt index 0 is the most recent play.
+    plays = (plays || []).slice().sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+    const playMeta = plays.map((p, i) => {
+        // Manual min/max (no spread) — defensive against thousand-note songs.
+        let chartTMin = Infinity, chartTMax = -Infinity, count = 0;
+        for (const r of (p.noteResults || [])) {
+            const t = r.chartT;
+            if (!Number.isFinite(t)) continue;
+            if (t < chartTMin) chartTMin = t;
+            if (t > chartTMax) chartTMax = t;
+            count++;
+        }
+        return {
+            idx: i, playId: p.playId, startedAt: p.startedAt, reason: p.reason,
+            chartTMin: count ? chartTMin : null,
+            chartTMax: count ? chartTMax : null,
+            count: (p.noteResults || []).length,
+        };
+    });
+    const noteIndex = new Map();
+    for (let i = 0; i < plays.length; i++) {
+        for (const r of plays[i].noteResults || []) {
+            if (!noteIndex.has(r.key)) {
+                noteIndex.set(r.key, {
+                    key: r.key, chartT: r.chartT, expectedMidi: r.expectedMidi,
+                    stringFret: `s${r.s}/f${r.f}`, attempts: new Map(),
+                });
+            }
+            noteIndex.get(r.key).attempts.set(i, { primary: r.primary, how: r.how || null });
+        }
+    }
+    const rows = [];
+    for (const note of noteIndex.values()) {
+        const verdicts = [];
+        for (const meta of playMeta) {
+            const a = note.attempts.get(meta.idx);
+            if (a) verdicts.push({ kind: a.primary, how: a.how || null });
+            else if (meta.chartTMin != null && note.chartT >= meta.chartTMin && note.chartT <= meta.chartTMax) {
+                verdicts.push({ kind: 'ABSENT' });
+            } else verdicts.push({ kind: 'OUT_OF_SCOPE' });
+        }
+        rows.push({ ...note, verdicts });
+    }
+    rows.sort((a, b) => a.chartT - b.chartT);
+    return { playMeta, rows };
+}
+
+function _ndStatsForRow(row) {
+    const inScope = row.verdicts.filter(v => v.kind !== 'OUT_OF_SCOPE');
+    const cleanHits = inScope.filter(v => v.kind === 'HIT').length;
+    const dirtyHits = inScope.filter(v => v.kind === 'DIRTY_HIT').length;
+    const hits = cleanHits + dirtyHits;
+    const wrongPitch = inScope.filter(v => v.kind === 'MISSED_WRONG_PITCH').length;
+    const noDetection = inScope.filter(v => v.kind === 'MISSED_NO_DETECTION').length;
+    return {
+        nAttempts: inScope.length,
+        hits, cleanHits, dirtyHits, wrongPitch, noDetection,
+        hitRate: inScope.length ? hits / inScope.length : 0,
+    };
+}
+
+function _ndSuggestLoops(rows, opts = {}) {
+    // Sliding-window hotspot finder. Only notes attempted in ≥2 plays count
+    // (multi-play evidence), so a single bad take can't fabricate a hotspot.
+    const { windowSec = 5, slideSec = 0.5, minMissesPerSec = 0.5,
+            minTroubleNotes = 2, maxLoops = 5, padHeadSec = 2.0, padTailSec = 1.0,
+            minAttempts = 2 } = opts;
+    // minAttempts gates multi-play evidence: 2 = "missed across plays" (the
+    // default, avoids drilling a one-off fumble); 1 = single-play mode so a
+    // hotspot can be offered right after the first play.
+    const noteList = (rows || []).map(r => ({ ...r, ..._ndStatsForRow(r) })).filter(r => r.nAttempts >= minAttempts);
+    if (noteList.length === 0) return [];
+    let minT = Infinity, maxT = -Infinity;
+    for (const n of noteList) {
+        if (n.chartT < minT) minT = n.chartT;
+        if (n.chartT > maxT) maxT = n.chartT;
+    }
+    const candidates = [];
+    for (let start = minT - windowSec / 2; start <= maxT + windowSec / 2; start += slideSec) {
+        const end = start + windowSec;
+        let misses = 0, attempts = 0;
+        const inside = [];
+        for (const n of noteList) {
+            if (n.chartT >= start && n.chartT <= end) {
+                inside.push(n);
+                misses += n.nAttempts - n.hits;
+                attempts += n.nAttempts;
+            }
+        }
+        const trouble = inside.filter(n => n.hits < n.nAttempts).length;
+        const density = misses / windowSec;
+        if (density >= minMissesPerSec && trouble >= minTroubleNotes) {
+            candidates.push({ start, end, density, misses, attempts, trouble, notes: inside });
+        }
+    }
+    candidates.sort((a, b) => b.density - a.density);
+    const selected = [];
+    for (const c of candidates) {
+        if (selected.length >= maxLoops) break;
+        // Skip a candidate that overlaps an already-selected (denser) one.
+        if (selected.some(s => s.start < c.end && s.end > c.start)) continue;
+        selected.push(c);
+    }
+    selected.sort((a, b) => a.start - b.start);
+    return selected.map((c, i) => {
+        const a = Math.max(0, c.start - padHeadSec);
+        const b = c.end + padTailSec;
+        const trouble = c.notes.filter(n => n.hits < n.nAttempts);
+        return {
+            id: i + 1, startSec: a, endSec: b, durationSec: b - a,
+            noteCount: trouble.length,
+            avgMissRate: trouble.length
+                ? trouble.reduce((s, n) => s + (1 - n.hitRate), 0) / trouble.length : 0,
+            positions: [...new Set(trouble.map(n => n.stringFret))].slice(0, 4).join(','),
+            notes: trouble,
+        };
+    });
+}
+
+// Summarise WHY a hotspot is hard, tallying the fine failure mode (`how`)
+// across its trouble notes' missed attempts: late / early / sharp / flat /
+// missed / wrong. Falls back to the coarse not-detected/wrong-pitch counts
+// for older data with no `how`. Returns ranked {kind, count}. Pure → testable.
+function _ndHotspotReasons(hotspot) {
+    const LABEL = {
+        late: 'rushing late', early: 'rushing early', sharp: 'sharp', flat: 'flat',
+        missed: 'not detected / not played', wrong: 'wrong note',
+    };
+    const tally = new Map();
+    let usedHow = false;
+    for (const n of ((hotspot && hotspot.notes) || [])) {
+        for (const v of (n.verdicts || [])) {
+            if (!v || v.kind === 'HIT' || v.kind === 'OUT_OF_SCOPE') continue;
+            if (v.how) {
+                usedHow = true;
+                const label = LABEL[v.how] || v.how;
+                tally.set(label, (tally.get(label) || 0) + 1);
+            }
+        }
+    }
+    if (!usedHow) {
+        // Older rows without `how`: fall back to the coarse per-row stats.
+        let noDetection = 0, wrongPitch = 0;
+        for (const n of ((hotspot && hotspot.notes) || [])) {
+            noDetection += n.noDetection || 0;
+            wrongPitch += n.wrongPitch || 0;
+        }
+        if (noDetection) tally.set('not detected / not played', noDetection);
+        if (wrongPitch) tally.set('wrong pitch', wrongPitch);
+    }
+    return [...tally.entries()]
+        .map(([kind, count]) => ({ kind, count }))
+        .sort((a, b) => b.count - a.count);
+}
+
+// Render the practice-loop manager panel from a loops list. Pure → the DOM
+// shell (_ndShowLoopPanel) injects this and wires the buttons. Each loop:
+// range + reasons + pass badge + Drill/Delete.
+function _ndRenderLoopPanelHtml(loops) {
+    const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const rows = (loops || []).map((lp) => {
+        const reasons = Array.isArray(lp.reasons) && lp.reasons.length
+            ? lp.reasons.map((r) => `${r.count}× ${esc(r.kind)}`).join(' · ')
+            : 'mixed misses';
+        const badge = lp.passed
+            ? `<span class="text-green-400 text-[10px] font-bold">✓ passed</span>`
+            : `<span class="text-amber-300 text-[10px]">to drill</span>`;
+        const range = lp.label ? esc(lp.label) : `${mmss(lp.loopA)}–${mmss(lp.loopB)}`;
+        return `<li class="bg-dark-700/60 border border-gray-800 rounded-lg p-2 mb-1.5">
+            <div class="flex items-center justify-between gap-2">
+                <span class="text-sm font-semibold text-gray-200">${range}</span>${badge}
+            </div>
+            <div class="text-[11px] text-gray-400 mt-0.5">${reasons}</div>
+            <div class="flex gap-2 mt-1.5">
+                <button class="nd-loop-drill flex-1 px-2 py-1 bg-accent hover:bg-accent-light text-white rounded text-xs font-semibold" data-id="${lp.id}">&#9654; Drill</button>
+                <button class="nd-loop-del px-2 py-1 bg-dark-600 hover:bg-red-900 text-gray-300 rounded text-xs" data-id="${lp.id}" title="Delete loop">🗑</button>
+            </div>
+        </li>`;
+    }).join('');
+    return `<div class="flex items-center justify-between mb-2">
+            <span class="text-sm font-semibold text-gold">Practice loops</span>
+            <button class="nd-loop-close text-gray-500 hover:text-white text-lg leading-none">&times;</button>
+        </div><ul>${rows}</ul>`;
+}
+
 function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const threshold = 0.15;
     const halfLen = Math.floor(buffer.length / 2);
@@ -489,6 +828,73 @@ function _ndNextPow2(n) {
     let p = 1;
     while (p < n) p <<= 1;
     return p;
+}
+
+// Minimum samples to accumulate before a single-note detection frame. Guitar
+// keeps the proven _ND_MIN_YIN_SAMPLES (4096). Bass must span ~2 periods of
+// the lowest detectable fundamental (_ND_MIN_DETECTABLE_HZ, B0 ≈ 31 Hz) for
+// YIN/HPS to lock it — at 96 kHz that exceeds 4096, so a fixed buffer drops
+// low bass silently (the "undersized buffer" warning). Size from the device
+// rate so the floor holds at 44.1, 48, 96, 192 kHz.
+function _ndMinAnalysisSamples(arrangement, sampleRate) {
+    if (arrangement !== 'bass' || !(sampleRate > 0)) return _ND_MIN_YIN_SAMPLES;
+    // Exact two-period floor — do NOT round up to a power of two. YIN's
+    // difference loop is O(n²) in buffer length, so an overshoot (e.g. 192 kHz:
+    // 12800 → 16384) adds real CPU for no benefit; _ndFftMagnitude already
+    // zero-pads its own input to a pow2 ≥ resolutionFloor, so the HPS/FFT path
+    // is unaffected by a non-pow2 accumulation length.
+    const need = Math.ceil(2 * sampleRate / _ND_MIN_DETECTABLE_HZ);
+    return Math.max(_ND_MIN_YIN_SAMPLES, need);
+}
+
+// ── A/V auto-calibration ──────────────────────────────────────────────
+// The harness objective made concrete in-app. Given offset-free detections
+// (`{ bt, m }`: bt = hw.getTime() − latencyOffset, m = detected MIDI) logged
+// across a play, and the chart notes, sweep candidate A/V offsets and return
+// the one (ms) that matches the MOST chart notes within the hit window — then
+// refine by the mean residual so matched detections sit centered in their
+// windows. Maximizing matched-notes (recall) is robust even from a bad start,
+// unlike shifting by the median timing error of whatever hits you already have
+// (which collapses when the offset is far off). Pure + exported for tests;
+// returns null when there isn't enough evidence to decide.
+function _ndCalibrateOffsetMs(detections, chartNotes, geom, hitWindowS, pitchTolCents, opts) {
+    opts = opts || {};
+    const loMs = (opts.loMs != null) ? opts.loMs : -250;
+    const hiMs = (opts.hiMs != null) ? opts.hiMs : 250;
+    const stepMs = opts.stepMs || 10;
+    const minMatched = (opts.minMatched != null) ? opts.minMatched : 12;
+    if (!Array.isArray(detections) || !Array.isArray(chartNotes)) return null;
+    if (detections.length < minMatched || chartNotes.length < minMatched) return null;
+    // Expected MIDI + time per single chart note (skip chord-only / unfingered).
+    const exp = [];
+    for (const n of chartNotes) {
+        const t = (n.time != null) ? n.time : n.t;
+        if (t == null || n.s == null || n.f == null) continue;
+        const em = _ndMidiFromStringFret(n.s, n.f, geom.arrangement, geom.stringCount, geom.offsets, geom.capo);
+        if (Number.isFinite(em)) exp.push({ t, em });
+    }
+    if (exp.length < minMatched) return null;
+    const dets = detections.slice().sort((a, b) => a.bt - b.bt);
+    let best = null;
+    for (let ms = loMs; ms <= hiMs; ms += stepMs) {
+        const off = ms / 1000;
+        let matched = 0, residSum = 0;
+        for (const note of exp) {
+            for (let i = 0; i < dets.length; i++) {
+                const dt = dets[i].bt + off - note.t;
+                if (dt < -hitWindowS) continue;
+                if (dt > hitWindowS) break;            // dets sorted by bt → past the window
+                if (Math.abs(_ndNearestOctaveCents(dets[i].m, note.em)) <= pitchTolCents) {
+                    matched++; residSum += dt; break;
+                }
+            }
+        }
+        if (!best || matched > best.matched) best = { ms, matched, resid: matched ? residSum / matched : 0 };
+    }
+    if (!best || best.matched < minMatched) return null;
+    // Refine: shift so matched detections center in their windows (sub-grid).
+    const refinedMs = Math.round(best.ms - best.resid * 1000);
+    return { offsetMs: Math.max(-1000, Math.min(1000, refinedMs)), matched: best.matched, total: exp.length };
 }
 
 // In-place radix-2 Cooley-Tukey on interleaved {re, im} pairs.
@@ -1175,6 +1581,11 @@ function createNoteDetector(options = {}) {
     // singleton writes back to localStorage; non-default instances keep
     // mutations local.
     let detectionMethod = 'yin';
+    // Whether the user explicitly picked a detection method (settings or the
+    // dropdown). When false, a bass arrangement auto-uses HPS — see
+    // _ndEffectiveDetectionMethod — since YIN locks onto the 2nd harmonic of a
+    // weak-fundamental bass note and reports an octave high.
+    let detectionMethodUserSet = false;
     let timingTolerance = 0.150;
     let pitchTolerance = 50;
     let timingHitThreshold = 0.100;
@@ -1206,6 +1617,26 @@ function createNoteDetector(options = {}) {
     // in the gear popover. Persisted in localStorage alongside the
     // other settings.
     let tuningMode = false;
+    // Auto-record every play (default singleton only) so each take is
+    // captured for later analysis — the teaching-tool goal — without the
+    // user arming anything. Opt out via Settings. The manual Arm /
+    // Arm-(training) dev surfaces stay behind tuningMode and override
+    // this (we only auto-arm when nothing is already armed for training).
+    let autoRecord = true;
+    // Detection frame size — the ScriptProcessor buffer fed to the
+    // detector each callback. 1024 (~21 ms @48k) is too short to resolve a
+    // low-bass fundamental (low-E period ~24 ms), so the detector silently
+    // drops most bass notes; 2048 (~43 ms) nearly triples bass recall
+    // (harness-measured 27%→77% on a real take) for an imperceptible
+    // latency cost. Persisted + tunable so downstream bass-accuracy work is
+    // configuration, not a code fork. Clamped to a valid ScriptProcessor
+    // buffer size on load.
+    let frameSize = 2048;
+    // Auto-calibrate the A/V offset from each play: log offset-free detections,
+    // then on song-end sweep for the offset that maximizes matched notes (the
+    // harness objective) and apply it via window.setAvOffsetMs — so the user
+    // never hand-sets the latency number. Persisted/tunable like the others.
+    let autoCalibrate = true;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1255,7 +1686,16 @@ function createNoteDetector(options = {}) {
             // default to the right channel. Same defensive shape as
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
-            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
+            const storedMethod = (typeof s.method === 'string'
+                && ['yin', 'hps', 'crepe'].includes(s.method)) ? s.method : null;
+            if (storedMethod) detectionMethod = storedMethod;
+            // A persisted `method` alone is NOT a manual override: saveSettings()
+            // always writes the current method, including the untouched default
+            // 'yin'. Treat it as user-set only when the explicit flag is stored,
+            // or a VALIDATED non-default method was stored — otherwise a returning
+            // user who only changed an unrelated setting (or has a corrupted
+            // method value) would lose bass auto-HPS.
+            detectionMethodUserSet = !!s.methodUserSet || (storedMethod !== null && storedMethod !== 'yin');
             // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
             // before deriving hit thresholds so a stale or manually-edited
             // stored value can't produce an invalid range input or a hit
@@ -1273,6 +1713,9 @@ function createNoteDetector(options = {}) {
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
             if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
+            if (s.autoRecord !== undefined) autoRecord = !!s.autoRecord;
+            if (s.frameSize !== undefined) frameSize = _ndClampFrameSize(s.frameSize);
+            if (s.autoCalibrate !== undefined) autoCalibrate = !!s.autoCalibrate;
             // Persisted on/off preference. Absence keeps the default
             // (true), so fresh installs get Detect on out of the box.
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
@@ -1314,6 +1757,19 @@ function createNoteDetector(options = {}) {
     let inputLevel = 0;
     let inputPeak = 0;
     let peakDecay = 0;
+
+    // Renderer-side silence gate. CREPE on this engine emits high-
+    // confidence stuck-pitch output on silence (interference / induced
+    // signal even with the guitar muted); the engine's verifier accepts
+    // it, and bent / slide / harmonic notes' 600¢ pitch leniency widens
+    // the window so far that those phantom pitches pass as hits — giving
+    // ~50% false-hit rate with no input. The fix is to track recent
+    // input levels and, when a verdict arrives, force its `detected` to
+    // false if no real signal existed around the note's chart time.
+    const _ndLevelSamples = [];
+    const _ND_LEVEL_HISTORY_S = 6;
+    const _ND_LEVEL_WIN_HALF = 0.2;  // ±200 ms around chartTime
+    const _ND_SILENCE_THRESHOLD = 0.02;  // ~2% of full scale
 
     // Scoring
     let hits = 0;
@@ -1358,6 +1814,12 @@ function createNoteDetector(options = {}) {
     // a signal that responds linearly to A/V offset, which is what the
     // auto-calibrate button keys off of.
     const _diagTimingErrorsHits = [];
+    // A/V auto-calibration: offset-free detections logged across a play
+    // ({ bt: hw.getTime()-latencyOffset, m: detectedMidi }); swept on song-end.
+    let _calDetections = [];
+    const _CAL_MAX = 8000;          // ~ caps memory on a long take
+    let _calDoneThisPlay = false;   // calibrate at most once per play
+    let _lastAvCalibration = null;  // { offsetMs, matched, total } for the UI
     const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
     // Per-judgment event capture for the downloadable JSON. Capped at a
     // size that keeps the JSON small enough to share via copy-paste.
@@ -1540,6 +2002,35 @@ function createNoteDetector(options = {}) {
     // change); _drillRender clears it after redrawing.
     let drillDirty = true;
 
+    // ── Drill conductor state (speed/goal orchestrator) ───────────────
+    // Layered on top of the loop:restart iteration foundation above.
+    // startDrill() arms an A-B loop at a reduced speed with a per-
+    // iteration accuracy goal; each completed iteration that clears the
+    // goal steps the speed up one ladder rung; clearing the goal at full
+    // speed graduates (drops the loop, restores speed). All null/0/false
+    // when no conductor-driven drill is running — a plain manual A-B loop
+    // still scores via the foundation but never touches this state.
+    let drillConductorActive = false;
+    let drillConductorLadder = null;        // [0.7, 0.85, 1.0] — slow → full
+    let drillConductorRung = 0;             // index into the ladder
+    let drillConductorGoal = _ND_DRILL_DEFAULT_GOAL;  // 0..1 iteration accuracy to advance
+    let drillConductorBest = 0;             // best iteration accuracy (0..1) at the current rung
+    let drillConductorFocus = null;         // coaching string shown in the HUD ("Late by 30ms")
+    let drillConductorLabel = null;
+    let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
+    let drillConductorRange = null;         // {loopStart, loopEnd, judgeStart, judgeEnd}
+    let drillConductorOnWrapFn = null;      // bound loop:restart listener (own, not via the foundation)
+    let _ndDrillLastChartT = 0;             // chart time last tick — a backward jump = a loop wrap
+    let _ndDrillLastScoredPerf = 0;         // perf ms of the last scored wrap (dedupe loop:restart vs chart-tick)
+
+    // ── Hotspot finder state ──────────────────────────────────────────
+    // Multi-play history cache + a re-entrancy guard for the song-end
+    // suggest pass (which posts this play then re-fetches).
+    let _ndPlaysCache = null;
+    let _ndPlaysCacheSongId = null;
+    let _ndSuggestingLoop = false;
+    let _ndActiveDrillLoopId = null;   // practice-loop id being drilled, for pass-marking on graduation
+
     // Detection state
     let detectedMidi = -1;
     let detectedConfidence = 0;
@@ -1610,6 +2101,39 @@ function createNoteDetector(options = {}) {
     // chord branch can dispatch `audio.scoreChord(ctx)` without
     // re-resolving from window on every tick. Cleared by stopAudio().
     let bridgeDesktop = null;
+    // True when the desktop engine exposes the continuous chart-verifier
+    // API (audio.setChart / audio.getNoteVerdicts) AND a chart has been
+    // pushed for the current song. When set, the desktop detect loop drains
+    // engine-finalized verdicts instead of running the per-tick matchNotes()
+    // scoreChord IPC — the engine scores the chart on its own background
+    // thread, so a starved renderer event loop no longer drops note runs.
+    // false on a downlevel addon (pre-NoteVerifier build), where the old
+    // matchNotes path stays in force unchanged.
+    let _ndUsingEngineVerifier = false;
+    // Chart-note lookup for the verifier path: noteKey -> the chart note
+    // object ({ s, f, t, sus, ho... }), so a drained verdict can be mapped
+    // back to its note for the judgment pipeline. Rebuilt on each chart push.
+    let _ndVerifierChartById = new Map();
+    // Chord grouping for the verifier path. The engine scores every chord
+    // constituent as an independent note; these maps let the drain step
+    // regroup the per-constituent verdicts into one chord judgment with
+    // N-of-M leniency (chordHitRatio), matching the legacy chord path.
+    //   _ndVerifierChords     : chordKey -> { t, memberIds[], memberNotes[], maxSus }
+    //   _ndVerifierChordKeyOf : constituent noteKey -> chordKey
+    //   _ndPendingChords      : chordKey -> Map(noteKey -> verdict) still arriving
+    let _ndVerifierChords = new Map();
+    let _ndVerifierChordKeyOf = new Map();
+    let _ndPendingChords = new Map();
+    // Signature of the chart last pushed to the engine (note/chord counts +
+    // arrangement). The chart loads asynchronously — `hw.getNotes()` is empty
+    // for a moment after `song:loaded` — so the detect loop re-pushes whenever
+    // the live signature diverges from this, covering late chart load and
+    // mid-session arrangement switches.
+    let _ndVerifierChartSig = '';
+    // Last playhead pushed to the engine, in corrected song time. Lets
+    // _ndDrainEngineVerdicts spot a backward jump (drill A-B loop wrap or a
+    // manual seek-back) and clear the dedup entries the engine is re-opening.
+    let _ndLastPushedPlayhead = 0;
     // Whether the desktop engine's polyphonic ML detector (Basic Pitch) is
     // actually active this session — queried once at bridge startup via
     // `audio.isMlNoteDetection()`. false on a downlevel addon or when the ML
@@ -1686,6 +2210,9 @@ function createNoteDetector(options = {}) {
                 deviceId: selectedDeviceId,
                 channel: selectedChannel,
                 method: detectionMethod,
+                // Explicit override flag so the loader can tell a deliberate
+                // method choice from the always-persisted default (see load).
+                methodUserSet: detectionMethodUserSet,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
@@ -1695,6 +2222,9 @@ function createNoteDetector(options = {}) {
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
                 tuningMode,
+                autoRecord,
+                frameSize,
+                autoCalibrate,
                 detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
@@ -1800,6 +2330,31 @@ function createNoteDetector(options = {}) {
                         processingFrame = true;
                         const gen = sessionGen;
                         try {
+                            // Engine-verifier path: the engine scores the
+                            // pushed chart on its own background thread, so
+                            // this loop just drains finalized verdicts and
+                            // feeds them through the judgment pipeline. No
+                            // detectNotes / matchNotes work runs here — that
+                            // is exactly the per-tick load this change moves
+                            // off the renderer event loop.
+                            if (_ndUsingEngineVerifier) {
+                                // The chart loads asynchronously after
+                                // song:loaded (and can switch mid-session);
+                                // re-push whenever the live chart diverges
+                                // from what the engine currently holds.
+                                if (_ndChartSignature() !== _ndVerifierChartSig) {
+                                    await _ndPushChartToBridge();
+                                    if (!enabled || gen !== sessionGen) return;
+                                }
+                                await _ndDrainEngineVerdicts();
+                                if (!enabled || gen !== sessionGen) return;
+                                _diagDetector = {
+                                    desktop_bridge: true,
+                                    ml: bridgeMlActive,
+                                    path: 'desktop-engine-verifier',
+                                };
+                                return;
+                            }
                             // Onset-event detection. detectNotes carries a
                             // per-pitch onsetSeq counter; a higher value than
                             // we last consumed means that pitch was struck
@@ -1972,7 +2527,7 @@ function createNoteDetector(options = {}) {
             levelAnalyser.smoothingTimeConstant = 0.8;
             gainNode.connect(levelAnalyser);
 
-            const processor = audioCtx.createScriptProcessor(_ND_FRAME_SIZE, 1, 1);
+            const processor = audioCtx.createScriptProcessor(frameSize, 1, 1);
             worklet = processor;
             accumBuffer = new Float32Array(0);
             pendingBuffer = null;
@@ -1984,9 +2539,12 @@ function createNoteDetector(options = {}) {
                 const combined = new Float32Array(prev.length + input.length);
                 combined.set(prev);
                 combined.set(input, prev.length);
-                if (combined.length >= _ND_MIN_YIN_SAMPLES) {
-                    const start = combined.length - _ND_MIN_YIN_SAMPLES;
-                    pendingBuffer = combined.slice(start, start + _ND_MIN_YIN_SAMPLES);
+                // Bass needs a longer window to resolve its low fundamental;
+                // size the analysis frame from the arrangement + device rate.
+                const minSamples = _ndMinAnalysisSamples(currentArrangement, audioCtx.sampleRate);
+                if (combined.length >= minSamples) {
+                    const start = combined.length - minSamples;
+                    pendingBuffer = combined.slice(start, start + minSamples);
                     accumBuffer = new Float32Array(0);
                 } else {
                     accumBuffer = combined;
@@ -2046,6 +2604,15 @@ function createNoteDetector(options = {}) {
         // enable re-resolves window.slopsmithDesktop fresh.
         usingDesktopBridge = false;
         bridgeDesktop = null;
+        // Drop the engine-verifier state — a subsequent enable re-pushes a
+        // fresh chart via _ndPushChartToBridge(). Any chart still held by the
+        // engine is harmless: nothing drains its verdicts once the flag is off.
+        _ndUsingEngineVerifier = false;
+        _ndVerifierChartById = new Map();
+        _ndVerifierChords = new Map();
+        _ndVerifierChordKeyOf = new Map();
+        _ndPendingChords = new Map();
+        _ndLastPushedPlayhead = 0;
         bridgeMlActive = false;
         bridgeOnsetSeqSeen = new Map();
         bridgeNewOnsets = new Map();
@@ -2191,6 +2758,41 @@ function createNoteDetector(options = {}) {
                 // x, which would inflate the bar during quiet moments.
                 const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
                 inputLevel = Math.min(1, Math.max(0, rawLevel));
+                // Record (songT, level) for the silence gate in the engine
+                // verdict drain. The buffer assumes songT advances
+                // monotonically; on a backward jump (seek, drill loop
+                // restart) we'd otherwise keep stale post-jump high-time
+                // samples that the shift()-prune never removes, mixing two
+                // timelines into the same window and forcing false misses.
+                // Clear the buffer on any backward jump.
+                if (hw && typeof hw.getTime === 'function') {
+                    const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                    const songT = hw.getTime() + avO;
+                    const last = _ndLevelSamples.length
+                        ? _ndLevelSamples[_ndLevelSamples.length - 1].songT
+                        : -Infinity;
+                    if (songT < last - 0.05) {
+                        // Time went backward (seek / drill wrap). Reset.
+                        _ndLevelSamples.length = 0;
+                    }
+                    _ndLevelSamples.push({ songT, level: inputLevel });
+                    const cutoff = songT - _ND_LEVEL_HISTORY_S;
+                    while (_ndLevelSamples.length > 0 && _ndLevelSamples[0].songT < cutoff) {
+                        _ndLevelSamples.shift();
+                    }
+                    // Pause-safe cap: songT-only pruning relies on songT
+                    // advancing, but if playback is paused (or stuck in a
+                    // menu) while this 50 ms timer keeps firing, every new
+                    // sample has the same songT and the time-based prune
+                    // never fires. Enforce a hard sample-count cap as a
+                    // safety net so the buffer can't grow unbounded across
+                    // a paused session. 6 s of 50 ms polls → 120 samples,
+                    // so 240 (2× headroom) is plenty for active playback
+                    // and still bounded during pauses.
+                    while (_ndLevelSamples.length > 240) {
+                        _ndLevelSamples.shift();
+                    }
+                }
                 const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
                 const peak = Math.min(1, Math.max(0, rawPeak));
                 if (peak > inputPeak) {
@@ -2285,7 +2887,8 @@ function createNoteDetector(options = {}) {
         // sample rate cached at startAudio() time instead. Browser
         // path keeps reading audioCtx.sampleRate.
         const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        switch (detectionMethod) {
+        const activeMethod = _ndEffectiveDetectionMethod();
+        switch (activeMethod) {
             case 'crepe':
                 if (_ndShared.model) {
                     result = await _ndCrepeDetect(buffer);
@@ -2336,7 +2939,10 @@ function createNoteDetector(options = {}) {
         }
 
         // Stamp the detector identity for the diagnostic — web JS-DSP path.
-        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + detectionMethod };
+        // Use `detectorUsed` (the detector that actually ran this frame), so an
+        // auto-HPS bass frame reports as hps AND a crepe→yin low-confidence/
+        // missing-model fallback reports the real yin, not the requested crepe.
+        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + (detectorUsed || activeMethod) };
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
@@ -2424,6 +3030,16 @@ function createNoteDetector(options = {}) {
         const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
             + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
 
+        // Anchor the post-strike glow / miss-wash age on when the verdict
+        // landed (_ndDisplayFrom, stamped in recordJudgment), not the note's
+        // chart time. An engine verdict arrives ~0.4 s after the note
+        // crosses the line; measuring the fade from chart time would leave
+        // only a sliver of the window — or none — by the time the gem can
+        // actually be tinted. clamp to chartTime so a verdict that somehow
+        // predates the note can't start the fade early.
+        const dispAnchor = Number.isFinite(j._ndDisplayFrom)
+            ? Math.max(chartTime, j._ndDisplayFrom) : chartTime;
+
         if (j.hit) {
             const sus = +note.sus || 0;
             // Sustained note still inside its ring window AND currently
@@ -2432,15 +3048,15 @@ function createNoteDetector(options = {}) {
                 return { state: 'active', alpha: 1 };
             }
             // Otherwise: brief post-strike glow that fades out over
-            // hitGlowDuration.
-            const age = songT - chartTime;
+            // hitGlowDuration (measured from when the verdict landed).
+            const age = songT - dispAnchor;
             if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
             if (age >= glowDur) return null;
             return { state: 'hit', alpha: 1 - age / glowDur };
         }
         // Missed (timing window expired, or matched-but-not-clean).
-        const age = songT - chartTime;
+        const age = songT - dispAnchor;
         if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
         return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
     }
@@ -2538,7 +3154,11 @@ function createNoteDetector(options = {}) {
             expectedFreq,
             detectedFreq,
             timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
-            pitchThresholdCents: pitchHitThreshold,
+            // A bend / slide / harmonic note's pitch is intentionally not at
+            // the chart pitch — the caller passes a widened threshold so the
+            // hit is not gated on a moving target.
+            pitchThresholdCents: Number.isFinite(extra.pitchThresholdCents)
+                ? extra.pitchThresholdCents : pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
@@ -2736,6 +3356,17 @@ function createNoteDetector(options = {}) {
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        // slopsmith#254 — stamp the song-time at which this verdict became
+        // known. noteStateFor() measures the highway gem's hit/miss display
+        // window from here, not from the note's chart time: the engine
+        // verifier reports verdicts ~0.4 s after the note crosses the line,
+        // so anchoring on chart time would burn most of the glow window
+        // before the verdict even exists. Browser-path judgments are
+        // recorded near chart time, so this is effectively a no-op there.
+        if (judgment && !Number.isFinite(judgment._ndDisplayFrom)) {
+            judgment._ndDisplayFrom = ((hw && hw.getTime) ? hw.getTime() : 0)
+                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+        }
         noteResults.set(key, judgment);
         if (count) {
             _recordDiagnostic(judgment);
@@ -2774,6 +3405,13 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
+        // A/V auto-calibration tap: log the detection offset-free (everything
+        // except av-offset) so a post-play sweep can re-match at any candidate
+        // offset. Gated on the setting + the default singleton so split panels
+        // and disabled-setting users don't accumulate.
+        if (autoCalibrate && isDefault && detectedMidi >= 0 && _calDetections.length < _CAL_MAX) {
+            _calDetections.push({ bt: hw.getTime() - latencyOffset, m: detectedMidi });
+        }
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -2879,64 +3517,129 @@ function createNoteDetector(options = {}) {
             byTime.get(tk).push(cn);
         }
 
-        // ── ML bridge: onset-driven single-note matching ──────────────────
-        // Each fresh onset claims the ONE nearest unmatched single-note chart
-        // note of its pitch. Previously every same-pitch candidate checked the
-        // onset set independently, so a single onset matched 2-4 same-pitch
-        // notes at once on dense passages — recording the extras as early
-        // misses. That one-onset-to-many bug was the dominant accuracy loss.
-        if (usingDesktopBridge && bridgeOnsetPrimed && bridgeNewOnsets.size > 0) {
-            const singles = [];
-            for (const [, group] of byTime) {
-                if (group.length !== 1) continue;
-                const cn = group[0];
-                const key = noteKey(cn, cn.t);
-                if (noteResults.has(key)) continue;
-                singles.push({
-                    cn, key, claimed: false,
-                    em: _ndMidiFromStringFret(cn.s, cn.f, currentArrangement,
-                        currentStringCount, tuningOffsets, capo),
-                });
-            }
-            for (const [midi, onset] of bridgeNewOnsets) {
-                let best = null, bestDist = Infinity;
-                for (const s of singles) {
-                    if (s.claimed) continue;
-                    let ok = (s.em === midi);
-                    if (!ok && (s.cn.b || s.cn.sl)) ok = Math.abs(s.em - midi) <= 2;
-                    if (!ok && s.cn.hm) ok = (midi === s.em + 12 || midi === s.em + 19);
-                    if (!ok) continue;
-                    const dist = Math.abs(s.cn.t - t);  // nearest to the playhead
-                    if (dist < bestDist) { bestDist = dist; best = s; }
+        // ── Single notes: one batched DSP band-energy score per tick ──────
+        // A single note is a 1-string chord. Scoring each one with its own
+        // scoreChord IPC fires one round-trip per note per detect tick — on
+        // a dense lead that floods the renderer event loop and visibly
+        // stutters the highway. scoreChord already returns a per-note
+        // results[] array, so the whole pending set is verified in ONE call
+        // (one FFT). bypassMl forces the DSP spectral check over the
+        // onset-driven ML path, which silently drops fast notes. The
+        // open-domain detector still drives the live HUD readout.
+        const _ndSingleNotes = [];   // cn objects, 1:1 with the batch results
+        for (const [, group] of byTime) {
+            if (group.length !== 1) continue;
+            const cn = group[0];
+            if (noteResults.has(noteKey(cn, cn.t))) continue;
+            _ndSingleNotes.push(cn);
+        }
+        const _ndSingleResult = new Map();   // cn -> per-note band-energy result
+        if (_ndSingleNotes.length > 0) {
+            // Compute the arrangement-aware verify params once per tick — both
+            // the desktop-bridge scoreChord call and the browser fallback below
+            // read from this, instead of re-allocating the object per field.
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
+            let batch = null;
+            if (usingDesktopBridge) {
+                if (bridgeDesktop && bridgeDesktop.audio
+                    && typeof bridgeDesktop.audio.scoreChord === 'function') {
+                    const ctx = {
+                        arrangement: currentArrangement,
+                        stringCount: currentStringCount,
+                        offsets: tuningOffsets.slice(0, currentStringCount),
+                        capo,
+                        // Verification window, deliberately generous. This
+                        // only confirms the chart note is the pitch ringing
+                        // (and rejects a neighbouring fret, ~100 cents away).
+                        // The strict hit/miss pitch call belongs to
+                        // makeMatchedJudgment below, from the measured
+                        // centsError. Passing the user's tight
+                        // pitch_tolerance_cents straight into the DSP scorer
+                        // made it reject ~90% of correctly-played notes — a
+                        // spectral peak is far coarser than a ±10-cent gate.
+                        // Bass relaxes the pitch window + fundamental-presence
+                        // gate (see _ndVerifyParamsFor) — its DI fundamental is
+                        // weak and its low bins resolve pitch coarsely.
+                        pitchCheckCents: verifyParams.pitchCheckCents,
+                        minHitRatio: chordHitRatio,   // unused — per-note results read directly
+                        bypassMl: true,               // force the DSP scorer, not the ML path
+                        harmonicVerify: true,         // harmonic-comb check, not band-energy/total
+                        harmonicSnr: verifyParams.harmonicSnr,
+                        fundamentalRatio: verifyParams.fundamentalRatio,
+                        notes: _ndSingleNotes.map(cn => ({
+                            s: cn.s, f: cn.f,
+                            ho: !!cn.ho, po: !!cn.po,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                        })),
+                    };
+                    const gen = sessionGen;
+                    try {
+                        batch = await bridgeDesktop.audio.scoreChord(ctx);
+                    } catch (e) {
+                        console.warn('[note_detect] scoreChord IPC failed:', e && e.message ? e.message : e);
+                        batch = null;
+                    }
+                    // Re-validate after the IPC await (mirrors the chord path).
+                    if (!enabled || gen !== sessionGen) return;
                 }
-                if (best) {
-                    best.claimed = true;
-                    recordJudgment(best.key, makeMatchedJudgment(
-                        best.cn, best.cn.t, t, best.em, best.em, onset.conf,
-                        { pitchError: 0 }));
+            } else if (frameBuffer) {
+                // Browser: _ndScoreChord is already a DSP band-energy check.
+                const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+                batch = _ndScoreChord(
+                    frameBuffer, sr,
+                    _ndSingleNotes, currentArrangement, currentStringCount,
+                    // Same arrangement-aware pitch window as the desktop-bridge
+                    // path above, so bass gets the wider 60c gate in the browser
+                    // fallback too (otherwise the fallback undercuts the bass
+                    // improvement on low strings whose bins resolve coarsely).
+                    tuningOffsets, capo,
+                    verifyParams.pitchCheckCents,
+                    chordHitRatio
+                );
+            }
+            // results[] is aligned 1:1 with the notes[] array we sent.
+            if (batch && Array.isArray(batch.results)) {
+                for (let i = 0; i < _ndSingleNotes.length && i < batch.results.length; i++) {
+                    _ndSingleResult.set(_ndSingleNotes[i], batch.results[i]);
                 }
             }
         }
 
         for (const [, group] of byTime) {
             if (group.length === 1) {
-                // ML bridge single notes are matched by the onset-driven pass
-                // above; here, only the web / downlevel monophonic path.
-                if (usingDesktopBridge && bridgeOnsetPrimed) continue;
-                if (detectedMidi < 0) continue;
+                // ── Single-note path: DSP band-energy verification ──────────
+                // Per-note result comes from the single batched score above —
+                // a 1-string-chord spectral check at the expected fundamental,
+                // not an open-domain pitch estimate or an ML onset.
                 const cn = group[0];
                 const key = noteKey(cn, cn.t);
                 if (noteResults.has(key)) continue;
 
+                const r = _ndSingleResult.get(cn);
+                // Not verified on this frame (harmonic comb below the SNR
+                // threshold, or off-pitch) — leave the note for a later
+                // frame or for checkMisses() to retire.
+                if (!r || !r.hit) continue;
+
+                // Energy + pitch verified. Build the judgment at the current
+                // playhead, but COMMIT only when the timing is clean. An
+                // isHit frame can land well before the chart time when the
+                // note's string is still ringing from an earlier strike;
+                // committing then would lock in an EARLY miss. Defer until a
+                // frame lands inside the clean window — checkMisses() retires
+                // the note if none ever does.
+                const pitchError = Number.isFinite(r.centsError) ? r.centsError : null;
                 const expectedMidi = _ndMidiFromStringFret(
                     cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
-                if (Math.abs(detectedCents) <= centsTolerance) {
-                    const judgment = makeMatchedJudgment(
-                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
-                        { pitchError: detectedCents }
-                    );
+                const detectedMidiForJudgment = Number.isFinite(pitchError)
+                    ? expectedMidi + pitchError / 100
+                    : null;
+                const judgment = makeMatchedJudgment(
+                    cn, cn.t, t, expectedMidi, detectedMidiForJudgment, detectedConfidence,
+                    { pitchError }
+                );
+                if (judgment.hit) {
                     recordJudgment(key, judgment);
                 }
             } else {
@@ -3257,6 +3960,11 @@ function createNoteDetector(options = {}) {
 
     function checkMisses() {
         if (!enabled) return;
+        // On the engine-verifier path the engine finalizes misses itself
+        // (detected:false verdicts, drained by _ndDrainEngineVerdicts), so
+        // this renderer-side retire scan is superseded. The browser path —
+        // and any desktop session on a downlevel addon — still relies on it.
+        if (_ndUsingEngineVerifier) return;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
@@ -3880,8 +4588,20 @@ function createNoteDetector(options = {}) {
 
     function setMethod(method) {
         detectionMethod = method;
+        detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
         saveSettings();
         if (method === 'crepe') _ndLoadCrepe();
+    }
+
+    // The detection method actually used per frame (web path). A bass
+    // arrangement auto-uses HPS when the user has not explicitly chosen a
+    // method and is still on the YIN default: YIN's time-domain autocorrelation
+    // latches onto the 2nd harmonic of a weak-fundamental bass note and reports
+    // an octave high, while HPS reinforces the true fundamental.
+    function _ndEffectiveDetectionMethod() {
+        if (currentArrangement === 'bass' && !detectionMethodUserSet && detectionMethod === 'yin')
+            return 'hps';
+        return detectionMethod;
     }
 
     // Accepts only the documented channel indices (-1 mono, 0 left,
@@ -3956,6 +4676,9 @@ function createNoteDetector(options = {}) {
         // Bridge slopsmith's loop state into our drill flag once per
         // tick. Cheap (one getLoop read); avoids a separate poll.
         _drillSyncFromLoopState();
+        // Detect conductor loop wraps from the chart clock (reliable; the
+        // host loop:restart event doesn't reach us on this loop path).
+        _drillConductorTick();
         _drillRender();
 
         const total = hits + misses;
@@ -4241,7 +4964,7 @@ function createNoteDetector(options = {}) {
         if (!controls) return;
         if (detectBtn && controls.contains(detectBtn)) return;
 
-        const closeBtn = controls.querySelector('button:last-child');
+        const closeBtn = controls.querySelector(':scope > button:last-of-type');
 
         detectBtn = document.createElement('button');
         detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
@@ -4382,6 +5105,10 @@ function createNoteDetector(options = {}) {
             drillIterations.splice(0, drillIterations.length - DRILL_MAX_ITERATIONS);
         }
         drillDirty = true;
+        // NB: the speed/goal conductor no longer piggybacks here — it binds
+        // its OWN loop:restart listener (_drillConductorOnWrap) and scores
+        // from its window, so it doesn't depend on this snapshot firing
+        // (which is gated on drillEnabled/getLoop sync).
     }
 
     function _drillOnLoopRestart(e) {
@@ -4407,6 +5134,10 @@ function createNoteDetector(options = {}) {
         drillNextIdx = 1;
         drillEnabled = false;
         drillDirty = true;
+        // A song/arrangement change ends any conductor-driven drill — the
+        // passage it targeted is gone. Restore speed + hide the HUD; the
+        // loop is already cleared by the host on song change.
+        if (drillConductorActive) endDrill('song-changed');
     }
 
     function _drillBindEvents() {
@@ -4438,6 +5169,596 @@ function createNoteDetector(options = {}) {
         drillOnLoopRestartFn = onLoopRestart;
         drillOnSongChangedFn = onSongChanged;
         drillSubscribed = true;
+    }
+
+    // ── Drill conductor (speed/goal orchestrator) ─────────────────────
+    //
+    // The deliberate-practice loop, recovered from the prior fork and
+    // adapted onto this build's loop:restart iteration foundation:
+    //   1. startDrill(start, end, opts) arms an A-B loop at the slowest
+    //      ladder rung with a per-iteration accuracy goal.
+    //   2. each completed iteration (foundation _drillSnapshotIteration)
+    //      feeds _drillConductorOnIteration: clear the goal → step up a
+    //      rung (faster); miss it → hold and keep drilling.
+    //   3. clear the goal at the top rung (full speed) → graduate:
+    //      drop the loop, restore speed, emit notedetect:drill-ended.
+    // The host owns playback speed (setSpeed keeps the slider/label,
+    // juce mode, and preserve-pitch in sync) and the loop (setLoop /
+    // clearLoop). We never poke audio.playbackRate directly.
+
+    function _hostGetSpeed() {
+        // The speed slider is the host's source of truth for current
+        // speed (setSpeed writes it); fall back to the audio element.
+        try {
+            const slider = document.getElementById('speed-slider');
+            if (slider && Number.isFinite(Number(slider.value))) return Number(slider.value) / 100;
+        } catch (_) {}
+        const audio = document.getElementById('audio');
+        return (audio && Number.isFinite(audio.playbackRate)) ? audio.playbackRate : 1;
+    }
+
+    function _hostSetSpeed(mul) {
+        if (!Number.isFinite(mul) || mul <= 0) return false;
+        if (typeof window.setSpeed === 'function') { window.setSpeed(mul); return true; }
+        const audio = document.getElementById('audio');
+        if (audio) { audio.playbackRate = mul; return true; }
+        return false;
+    }
+
+    async function startDrill(startSec, endSec, opts = {}) {
+        const {
+            label = null,
+            focus = null,
+            goal = _ND_DRILL_DEFAULT_GOAL,
+            speedLadder = _ND_DRILL_DEFAULT_LADDER,
+        } = opts || {};
+
+        const _hw = resolveHw();
+        const songInfo = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || {};
+        const audio = document.getElementById('audio');
+        const totalDuration = Number.isFinite(songInfo.duration)
+            ? songInfo.duration
+            : (audio && Number.isFinite(audio.duration) ? audio.duration : null);
+        if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+            console.warn('[note_detect] startDrill: no song duration available — aborting');
+            return false;
+        }
+
+        const requestedStart = Math.max(0, Number(startSec));
+        const judgeEnd = Math.min(totalDuration - 0.05, Number(endSec));
+        if (!Number.isFinite(requestedStart) || !Number.isFinite(judgeEnd)
+                || judgeEnd - requestedStart < 0.5) {
+            console.warn(`[note_detect] startDrill: range too short/invalid (${requestedStart}–${judgeEnd}) — aborting`);
+            return false;
+        }
+
+        // Validate the ladder; fall back to the default on junk input.
+        // Sort ascending so rung 0 is always the slowest.
+        const ladder = (Array.isArray(speedLadder) && speedLadder.length
+            && speedLadder.every(v => Number.isFinite(v) && v > 0))
+            ? speedLadder.slice().sort((a, b) => a - b)
+            : _ND_DRILL_DEFAULT_LADDER.slice();
+
+        // First-note runway: pull judgeStart back so the first scored
+        // note always has reaction time, even when the cluster boundary
+        // lands right on it.
+        const allNotes = (_hw && _hw.getNotes && _hw.getNotes()) || [];
+        const firstNote = allNotes.find(n => n && Number.isFinite(n.t)
+            && n.t >= requestedStart && n.t <= judgeEnd);
+        const judgeStart = firstNote
+            ? Math.max(0, Math.min(requestedStart, firstNote.t - _ND_DRILL_FIRST_NOTE_RUNWAY_SEC))
+            : requestedStart;
+        const loopStart = Math.max(0, judgeStart - _ND_DRILL_LEAD_IN_SEC);
+        const loopEnd = judgeEnd;
+
+        // Commit conductor state before any await so a loop:restart that
+        // races in mid-setup sees an active drill.
+        drillConductorSavedSpeed = _hostGetSpeed();
+        drillConductorActive = true;
+        drillConductorLadder = ladder;
+        drillConductorRung = 0;
+        drillConductorGoal = Number.isFinite(goal) ? Math.max(0, Math.min(1, goal)) : _ND_DRILL_DEFAULT_GOAL;
+        drillConductorBest = 0;
+        drillConductorFocus = focus;
+        drillConductorLabel = label || `${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s`;
+        drillConductorRange = { loopStart, loopEnd, judgeStart, judgeEnd };
+        _ndDrillLastChartT = 0;          // reset wrap detector for this drill
+        _ndDrillLastScoredPerf = 0;
+        // Window-level flag the host's loop-wrap handler reads to skip its
+        // count-in during drill iterations (we own the lead-in).
+        window._ndAnyDrillActive = true;
+
+        // NB: do NOT force preservesPitch — real-time time-stretch is CPU-heavy
+        // and was implicated in laggy/buffering playback. Let the host's
+        // setSpeed decide; if no time-stretch, slowing just lowers pitch
+        // (cheap), which is fine for a drill.
+        _hostSetSpeed(ladder[0]);
+
+        // Arm the loop (seeks to loopStart but does NOT auto-play), then
+        // start playback so the lead-in is actually audible.
+        let looped = false;
+        try {
+            if (window.slopsmith && typeof window.slopsmith.setLoop === 'function') {
+                looped = await window.slopsmith.setLoop(loopStart, loopEnd, { reason: 'note_detect-drill' });
+            }
+        } catch (e) {
+            console.warn('[note_detect] startDrill: setLoop threw:', e);
+        }
+        if (!looped) {
+            console.warn('[note_detect] startDrill: setLoop unavailable/failed — aborting');
+            endDrill('setloop-failed');
+            return false;
+        }
+        if (audio) {
+            try { await audio.play(); } catch (_) { /* autoplay may reject; the loop still runs once playing */ }
+        }
+        // Count-in click over the first entry's lead-in too (not just on wraps).
+        _drillPlayCountIn();
+
+        // Drill is pointless without detection running.
+        if (!enabled) { try { await enable(); } catch (_) {} }
+
+        // Bind our OWN loop:restart listener so each pass is scored even if
+        // the foundation's drillEnabled sync doesn't flip for a plugin loop.
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            drillConductorOnWrapFn = _drillConductorOnWrap;
+            try { window.slopsmith.on('loop:restart', drillConductorOnWrapFn); } catch (_) {}
+        }
+
+        _drillConductorShowHud();
+        console.log(`[note_detect] Drill "${drillConductorLabel}" loop=${loopStart.toFixed(1)}–${loopEnd.toFixed(1)}s judge=${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s ladder=${ladder.map(r => Math.round(r * 100) + '%').join('→')} goal=${Math.round(drillConductorGoal * 100)}%`);
+        return true;
+    }
+
+    // Goal-gate one finished iteration. `snap` is the foundation's
+    // snapshot {idx, hits, misses, accuracy, ...}; accuracy is 0..100.
+    // One finished loop pass. Scores DIRECTLY from this pass's judgments in
+    // the drill window — self-contained, not gated behind the foundation's
+    // drillEnabled/getLoop sync (which wasn't reliably flipping for a
+    // plugin-set loop, so the HUD never refreshed). noteResults is keyed by
+    // chart note (time_s_f), so each pass overwrites the prior verdict — at
+    // wrap time the window holds exactly this pass's results.
+    const _ndPerfNow = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+
+    function _drillConductorOnWrap() {
+        if (!drillConductorActive || !drillConductorRange) return;
+        _ndDrillLastScoredPerf = _ndPerfNow();  // stamp so the chart-tick detector won't double-fire
+        const { judgeStart, judgeEnd } = drillConductorRange;
+        const arr = [];
+        for (const v of noteResults.values()) arr.push(v);
+        let hits = 0, total = 0;
+        for (const j of arr) {
+            const t = Number.isFinite(j && j.noteTime) ? j.noteTime : null;
+            if (t == null || t < judgeStart || t > judgeEnd) continue;
+            total++;
+            if (j.hit) hits++;
+        }
+        // An empty pass (nothing judged in the window yet — e.g. the first
+        // wrap before any note crossed) isn't a real attempt. Skip it.
+        if (total === 0) return;
+        const score = hits / total;
+        if (score > drillConductorBest) drillConductorBest = score;
+
+        const decision = _ndDrillRampDecision(
+            score, drillConductorGoal, drillConductorRung, drillConductorLadder.length);
+        if (decision.action === 'graduate') {
+            _drillConductorUpdateHud({ lastScore: score, graduated: true });
+            endDrill('graduated');
+            return;
+        }
+        // The loop is restarting — play a count-in click over the lead-in so
+        // the player can come in on the beat (the host's own count-in doesn't
+        // fire on this loop path).
+        _drillPlayCountIn();
+        if (decision.action === 'advance') {
+            // Step up one rung: faster playback, fresh best for the new
+            // speed (the goal must be re-earned at the harder tempo).
+            drillConductorRung = decision.nextRung;
+            drillConductorBest = 0;
+            const toPct = Math.round((drillConductorLadder[drillConductorRung] || 1) * 100);
+            _hostSetSpeed(drillConductorLadder[drillConductorRung]);
+            _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
+            return;
+        }
+        // Held below the goal — show WHICH notes were missed this pass and HOW.
+        _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
+    }
+
+    // Detect a loop wrap from the chart clock (a backward jump) — the
+    // reliable trigger, since the host's loop:restart event doesn't reach
+    // us on this loop path. Called every HUD tick while drilling. Deduped
+    // against _drillConductorOnWrap's own stamp so if loop:restart DID fire
+    // we don't score twice.
+    function _drillConductorTick() {
+        if (!drillConductorActive) return;
+        const _hw = resolveHw();
+        if (!_hw || !_hw.getTime) return;
+        const ct = _hw.getTime();
+        if (_ndDrillLastChartT > 0 && ct >= 0 && ct < _ndDrillLastChartT - 1.0) {
+            // Backward jump = wrap. Skip if a loop:restart already scored it.
+            if (_ndPerfNow() - _ndDrillLastScoredPerf > 1200) _drillConductorOnWrap();
+        }
+        _ndDrillLastChartT = ct;
+    }
+
+    // A short 4-beat count-in click over the lead-in, scheduled on the
+    // detection AudioContext. Best-effort — silent if no context. Beats are
+    // stretched by the current drill speed so they line up with the slowed
+    // playback's pulse.
+    function _drillPlayCountIn() {
+        if (!audioCtx || !drillConductorRange) return;
+        try {
+            const _hw = resolveHw();
+            const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(drillConductorRange.judgeStart) : 100;
+            const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
+            const speed = (drillConductorLadder && drillConductorLadder[drillConductorRung]) || 1;
+            const interval = beat / (speed || 1);
+            const t0 = audioCtx.currentTime + 0.06;
+            for (let i = 0; i < 4; i++) {
+                const at = t0 + i * interval;
+                const osc = audioCtx.createOscillator();
+                const g = audioCtx.createGain();
+                osc.frequency.value = i === 0 ? 1320 : 880;  // accent the downbeat
+                g.gain.setValueAtTime(0.0001, at);
+                g.gain.exponentialRampToValueAtTime(0.35, at + 0.004);
+                g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+                osc.connect(g); g.connect(audioCtx.destination);
+                osc.start(at); osc.stop(at + 0.06);
+            }
+        } catch (_) { /* click is best-effort */ }
+    }
+
+    function endDrill(reason = 'user') {
+        if (!drillConductorActive) return;
+        drillConductorActive = false;
+        const graduated = reason === 'graduated';
+        const label = drillConductorLabel;
+        const best = drillConductorBest;
+
+        // Restore the pre-drill playback speed.
+        if (Number.isFinite(drillConductorSavedSpeed)) _hostSetSpeed(drillConductorSavedSpeed);
+        // Drop the A-B loop (unless the host already cleared it — e.g. a
+        // song change, which routes here with reason 'song-changed').
+        if (reason !== 'song-changed') {
+            try {
+                if (window.slopsmith && typeof window.slopsmith.clearLoop === 'function') {
+                    window.slopsmith.clearLoop({ reason: 'note_detect-drill-end' });
+                }
+            } catch (e) {
+                console.warn('[note_detect] endDrill: clearLoop threw:', e);
+            }
+        }
+        window._ndAnyDrillActive = false;
+        // Unbind our loop:restart listener.
+        if (drillConductorOnWrapFn && window.slopsmith && typeof window.slopsmith.off === 'function') {
+            try { window.slopsmith.off('loop:restart', drillConductorOnWrapFn); } catch (_) {}
+        }
+        drillConductorOnWrapFn = null;
+        _drillConductorHideHud(graduated);
+
+        // Notify listeners — the finder layer chains to the next hotspot
+        // on graduation, and coaching can log the outcome.
+        try {
+            if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+                window.slopsmith.emit('notedetect:drill-ended', { reason, graduated, label, best });
+            }
+        } catch (_) {}
+
+        drillConductorLadder = null;
+        drillConductorRung = 0;
+        drillConductorBest = 0;
+        drillConductorFocus = null;
+        drillConductorLabel = null;
+        drillConductorSavedSpeed = null;
+        drillConductorRange = null;
+        // Graduated a saved practice loop → mark it passed and refresh the
+        // manager so the ✓ shows. Always clear the active-loop id.
+        const passedId = _ndActiveDrillLoopId;
+        _ndActiveDrillLoopId = null;
+        if (graduated && passedId != null) {
+            Promise.resolve(_ndMarkLoopPassed(passedId)).then(() => _ndShowLoopPanel()).catch(() => {});
+        }
+        console.log(`[note_detect] Drill ended (${reason})${graduated ? ` — graduated "${label}" at ${Math.round(best * 100)}%` : ''}`);
+    }
+
+    // ── Drill conductor HUD ───────────────────────────────────────────
+    // Floating overlay on document.body (visible regardless of which
+    // instance container owns the player) showing speed, goal, the last
+    // iteration's score, and best-so-far at the current rung.
+    function _drillConductorShowHud() {
+        let hud = document.getElementById('nd-drill-hud');
+        if (!hud) {
+            hud = document.createElement('div');
+            hud.id = 'nd-drill-hud';
+            hud.className = 'fixed top-3 left-1/2 -translate-x-1/2 z-[210] min-w-[330px] bg-dark-800 border-2 border-blue-700 rounded-xl shadow-2xl px-4 py-2 text-sm';
+            document.body.appendChild(hud);
+        }
+        _drillConductorUpdateHud();
+    }
+
+    // Render the drill HUD. The message is the user's "way out" signal —
+    // each pass it says either how far short of the goal you are (keep
+    // going) or that you've earned a speed-up / graduated. Always shows an
+    // obvious End button so the loop is never a trap.
+    function _drillConductorUpdateHud(extra = {}) {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        const { lastScore = null, graduated = false, advanced = false, toPct = null, misses = null } = extra;
+        const speedPct = drillConductorLadder
+            ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
+        const goalPct = Math.round((drillConductorGoal || 0) * 100);
+        const bestPct = Math.round((drillConductorBest || 0) * 100);
+        const lastPct = lastScore != null ? Math.round(lastScore * 100) : null;
+        const atTop = drillConductorLadder
+            ? drillConductorRung >= drillConductorLadder.length - 1 : true;
+
+        let banner;
+        if (graduated) {
+            banner = `<div class="text-green-300 font-bold text-sm">✓ Nailed it at full speed — drill complete!</div>`;
+        } else if (advanced) {
+            banner = `<div class="text-green-300 font-bold text-sm">▲ Time to go faster — now ${toPct != null ? toPct : speedPct}% speed</div>`;
+        } else if (lastPct != null) {
+            const ok = lastPct >= goalPct;
+            banner = ok
+                ? `<div class="text-green-300 text-sm">Last pass <span class="font-bold">${lastPct}%</span> — clean!</div>`
+                : `<div class="text-amber-200 text-sm">Last pass <span class="font-bold">${lastPct}%</span> — need <span class="font-bold">${goalPct}%</span> to speed up. Keep going.</div>`;
+        } else {
+            banner = `<div class="text-gray-300 text-sm">Play the loop — hit <span class="font-bold">${goalPct}%</span> clean to speed up.</div>`;
+        }
+        const sub = `<div class="text-gray-500 text-[11px] mt-0.5">🎯 ${speedPct}% speed${atTop ? ' (full)' : ''} · best ${bestPct}%${drillConductorFocus ? ' · ' + drillConductorFocus : (drillConductorLabel ? ' · ' + drillConductorLabel : '')}</div>`;
+        // Per-note "what you missed + how" for the pass just finished.
+        const howColor = { missed: 'text-red-300', late: 'text-amber-300', early: 'text-amber-300', sharp: 'text-purple-300', flat: 'text-purple-300', wrong: 'text-red-300' };
+        let missList = '';
+        if (Array.isArray(misses) && misses.length) {
+            const shown = misses.slice(0, 6).map((m) => {
+                const pos = `S${(Number.isInteger(m.s) ? m.s + 1 : '?')}·${Number.isInteger(m.f) ? 'fr' + m.f : '?'}`;
+                return `<div class="flex justify-between gap-3"><span class="text-gray-300">${pos}</span><span class="${howColor[m.how] || 'text-gray-400'}">${m.detail}</span></div>`;
+            }).join('');
+            const more = misses.length > 6 ? `<div class="text-gray-600 text-[10px]">+${misses.length - 6} more</div>` : '';
+            missList = `<div class="mt-1.5 pt-1.5 border-t border-gray-700 text-[11px] font-mono leading-tight">`
+                + `<div class="text-gray-500 text-[10px] uppercase tracking-wide mb-0.5">Missed this pass</div>${shown}${more}</div>`;
+        }
+        hud.innerHTML = `
+            <div class="flex items-start gap-3">
+                <div class="flex-1">${banner}${sub}${missList}</div>
+                <button id="nd-drill-end" class="px-2.5 py-1 bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg text-xs font-semibold whitespace-nowrap" title="End drill">✕ End</button>
+            </div>`;
+        const endBtn = hud.querySelector('#nd-drill-end');
+        if (endBtn) endBtn.onclick = () => endDrill('user');
+    }
+
+    function _drillConductorHideHud(graduated) {
+        const hud = document.getElementById('nd-drill-hud');
+        if (!hud) return;
+        if (graduated) {
+            // Leave the graduation message up briefly, then fade.
+            _drillConductorUpdateHud({ graduated: true });
+            setTimeout(() => { const h = document.getElementById('nd-drill-hud'); if (h) h.remove(); }, 3000);
+        } else {
+            hud.remove();
+        }
+    }
+
+    // ── Hotspot finder (multi-play → drill the recurring weakness) ────
+    //
+    // At song end the default singleton snapshots this play's per-note
+    // verdicts to the backend, then aggregates the recent plays for this
+    // song (_ndAggregatePlays/_ndSuggestLoops above) and, if a region has
+    // multi-play evidence, surfaces a "Practice now" banner that hands it
+    // to the drill conductor (startDrill). This closes the loop: play →
+    // finder picks the worst recurring spot → drill it → graduate → the
+    // next full play surfaces the next spot.
+
+    function _ndCurrentSongId() {
+        const _hw = resolveHw();
+        const info = (_hw && _hw.getSongInfo && _hw.getSongInfo()) || null;
+        if (!info) return null;
+        const fn = info.filename || info.title || 'unknown';
+        const ar = info.arrangement || 'default';
+        return `${fn}__${ar}`;
+    }
+
+    // Map a stored judgment to the finder's coarse verdict. The finder
+    // only needs hit-vs-miss for hotspot density; the miss split is kept
+    // for richer display/debugging.
+    function _ndPrimaryVerdict(j) {
+        if (j && j.hit) return 'HIT';
+        const dm = j && j.detectedMidi;
+        return (Number.isFinite(dm) && dm > 0) ? 'MISSED_WRONG_PITCH' : 'MISSED_NO_DETECTION';
+    }
+
+    // Build a persistable snapshot of THIS play from noteResults. Pure
+    // read of closure state — returns null when there's nothing to store.
+    function _buildPlaySnapshot(reason) {
+        if (!noteResults || noteResults.size === 0) return null;
+        const songId = _ndCurrentSongId();
+        if (!songId) return null;
+        const snapNotes = [];
+        let h = 0, mi = 0;
+        for (const [key, j] of noteResults) {
+            const note = (j && (j.note || j.chartNote)) || {};
+            const chartT = Number.isFinite(j && j.noteTime) ? j.noteTime
+                : (Number.isFinite(j && j.time) ? j.time : 0);
+            if (j && j.hit) h++; else mi++;
+            snapNotes.push({
+                key,
+                chartT,
+                s: note.s,
+                f: note.f,
+                expectedMidi: (j && Number.isFinite(j.expectedMidi)) ? j.expectedMidi : null,
+                primary: _ndPrimaryVerdict(j),
+                // Fine failure mode for misses (late/early/sharp/flat/missed/
+                // wrong) so saved-loop reasons are actionable; null for hits.
+                how: (j && j.hit) ? null : _ndDescribeMiss(j).how,
+            });
+        }
+        return {
+            songId,
+            playId: new Date().toISOString().replace(/[:.]/g, '-'),
+            reason: reason || null,
+            startedAt: Date.now(),
+            isDrill: !!(window._ndAnyDrillActive || drillConductorActive),
+            summary: { hits: h, misses: mi },
+            noteResults: snapNotes,
+        };
+    }
+
+    async function _ndFetchPlaysForSong(songId) {
+        if (_ndPlaysCacheSongId === songId && _ndPlaysCache) return _ndPlaysCache;
+        try {
+            const r = await fetch(`/api/plugins/note_detect/plays?songId=${encodeURIComponent(songId)}&limit=10`);
+            const data = await r.json();
+            _ndPlaysCache = data.plays || [];
+            _ndPlaysCacheSongId = songId;
+            return _ndPlaysCache;
+        } catch (e) {
+            console.warn('[note_detect] plays fetch failed:', e);
+            return [];
+        }
+    }
+
+    // Persist this play, then (if there's multi-play evidence) suggest a
+    // drill. Builds the snapshot synchronously up front so it captures
+    // noteResults before any caller-side disable()/clear() runs.
+    async function _ndSnapshotPlayAndSuggest(reason) {
+        const snap = _buildPlaySnapshot(reason);
+        if (!snap) return;
+        try {
+            await fetch('/api/plugins/note_detect/plays', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(snap),
+            });
+        } catch (e) {
+            console.warn('[note_detect] play snapshot POST failed:', e);
+        }
+        _ndPlaysCacheSongId = null;  // we just added a play — invalidate cache
+        // Don't pester the user mid-drill; the banner is for full plays.
+        if (drillConductorActive) return;
+        try { await _ndMaybeSuggestPracticeLoop(snap.songId); }
+        catch (e) { console.warn('[note_detect] practice-loop suggest failed:', e); }
+    }
+
+    async function _ndMaybeSuggestPracticeLoop(songId) {
+        if (_ndSuggestingLoop) return null;
+        _ndSuggestingLoop = true;
+        try {
+            // Only full plays are evidence — drill plays cover a single loop.
+            const plays = (await _ndFetchPlaysForSong(songId)).filter(p => !p.isDrill);
+            if (plays.length < 1) return null;
+            const { rows } = _ndAggregatePlays(plays);
+            // Single play → minAttempts 1 (offer after the first play); multiple
+            // → 2 (recurrence, not a one-off fumble).
+            const minAttempts = plays.length >= 2 ? 2 : 1;
+            const found = _ndSuggestLoops(rows, { maxLoops: 3, minAttempts });
+            if (!found.length) return null;
+            const top = found[0];
+            if (top.noteCount < 1) return null;
+            // Persist every found hotspot as a practice loop (with reasons) so
+            // the loop manager has them across refresh, then surface the top.
+            for (const h of found) {
+                _ndSaveLoop(songId, `${_ndMmSs(h.startSec)}–${_ndMmSs(h.endSec)}`, h.startSec, h.endSec, _ndHotspotReasons(h));
+            }
+            _ndShowPracticeBanner(top);
+            _ndShowLoopPanel(songId);  // refresh the manager
+            return top;
+        } finally {
+            _ndSuggestingLoop = false;
+        }
+    }
+
+    const _ndMmSs = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+    // ── Practice-loop manager (persist hotspots, list, drill, delete) ──
+    async function _ndFetchLoops(songId) {
+        try {
+            const r = await fetch(`/api/plugins/note_detect/practice-loops?songId=${encodeURIComponent(songId)}`);
+            return (await r.json()).loops || [];
+        } catch (e) { console.warn('[note_detect] loops fetch failed:', e); return []; }
+    }
+    function _ndSaveLoop(songId, label, loopA, loopB, reasons) {
+        return fetch('/api/plugins/note_detect/practice-loops', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ songId, label, loopA, loopB, reasons }),
+        }).catch((e) => console.warn('[note_detect] loop save failed:', e));
+    }
+    function _ndDeleteLoop(id) {
+        return fetch(`/api/plugins/note_detect/practice-loops/${id}`, { method: 'DELETE' })
+            .catch((e) => console.warn('[note_detect] loop delete failed:', e));
+    }
+    function _ndMarkLoopPassed(id) {
+        return fetch(`/api/plugins/note_detect/practice-loops/${id}/passed`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passed: true }),
+        }).catch((e) => console.warn('[note_detect] loop passed failed:', e));
+    }
+
+    // Drill a saved loop; remember its id so graduation can mark it passed.
+    function _ndDrillSavedLoop(loop) {
+        _ndActiveDrillLoopId = loop.id != null ? loop.id : null;
+        return startDrill(loop.loopA, loop.loopB, {
+            label: loop.label || `${_ndMmSs(loop.loopA)}–${_ndMmSs(loop.loopB)}`,
+            goal: _ND_DRILL_DEFAULT_GOAL,
+            speedLadder: _ND_DRILL_DEFAULT_LADDER,
+        });
+    }
+
+    async function _ndShowLoopPanel(songId) {
+        const sid = songId || _ndCurrentSongId();
+        if (!sid) return;
+        const loops = await _ndFetchLoops(sid);
+        let panel = document.getElementById('nd-loop-panel');
+        if (!loops.length) { if (panel) panel.remove(); return; }
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'nd-loop-panel';
+            panel.className = 'fixed bottom-4 left-4 z-[200] w-72 max-h-[60vh] overflow-y-auto bg-dark-800 border border-gray-700 rounded-xl p-3 shadow-2xl';
+            document.body.appendChild(panel);
+        }
+        panel.innerHTML = _ndRenderLoopPanelHtml(loops);
+        panel.querySelector('.nd-loop-close').onclick = () => panel.remove();
+        panel.querySelectorAll('.nd-loop-drill').forEach((b) => {
+            b.onclick = () => { const lp = loops.find((x) => String(x.id) === b.dataset.id); if (lp) _ndDrillSavedLoop(lp); };
+        });
+        panel.querySelectorAll('.nd-loop-del').forEach((b) => {
+            b.onclick = async () => { await _ndDeleteLoop(b.dataset.id); _ndShowLoopPanel(sid); };
+        });
+    }
+
+    function _ndShowPracticeBanner(hotspot) {
+        const mmss = _ndMmSs;
+        const existing = document.querySelector('.nd-practice-banner');
+        if (existing && existing.dataset.start === hotspot.startSec.toFixed(2)) return;
+        if (existing) existing.remove();
+        const missPct = Math.round(hotspot.avgMissRate * 100);
+        const banner = document.createElement('div');
+        banner.className = 'nd-practice-banner fixed left-1/2 -translate-x-1/2 z-[250] bg-orange-900/90 border-2 border-orange-600 rounded-xl px-4 py-3 shadow-2xl';
+        banner.style.bottom = '80px';
+        banner.dataset.start = hotspot.startSec.toFixed(2);
+        banner.innerHTML = `
+            <div class="flex items-center gap-4">
+                <div>
+                    <div class="text-orange-100 font-semibold text-sm">Hotspot: ${mmss(hotspot.startSec)}–${mmss(hotspot.endSec)}</div>
+                    <div class="text-orange-200 text-[11px] leading-tight">${hotspot.noteCount} note${hotspot.noteCount === 1 ? '' : 's'} you keep missing · ${missPct}% miss rate</div>
+                </div>
+                <button class="nd-practice-btn px-3 py-1.5 bg-orange-200 hover:bg-orange-100 text-orange-900 rounded-lg text-sm font-bold">Practice now</button>
+                <button class="nd-practice-dismiss px-2 py-1 text-orange-300 hover:text-orange-100 text-lg leading-none">&times;</button>
+            </div>`;
+        document.body.appendChild(banner);
+        banner.querySelector('.nd-practice-btn').addEventListener('click', () => {
+            const btn = banner.querySelector('.nd-practice-btn');
+            Promise.resolve(startDrill(hotspot.startSec, hotspot.endSec, {
+                label: `Hotspot ${mmss(hotspot.startSec)}`,
+                goal: _ND_DRILL_DEFAULT_GOAL,
+                speedLadder: _ND_DRILL_DEFAULT_LADDER,
+            })).then((ok) => {
+                if (ok) banner.remove();
+                else if (btn) btn.textContent = 'Couldn’t start';
+            }).catch(() => { if (btn) btn.textContent = 'Failed'; });
+        });
+        banner.querySelector('.nd-practice-dismiss').addEventListener('click', () => banner.remove());
+        // No auto-dismiss: this is the entry to the drill loop, so it stays
+        // until the user acts (Practice / ✕) or a new hotspot replaces it.
+        // It vanishing on its own (the old 20s timeout) just lost the prompt.
     }
 
     // ── Chart state sync ─────────────────────────────────────────────
@@ -4515,6 +5836,446 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // ── Engine-side chart verification (desktop bridge) ───────────────────
+    // Build the song's note chart from the host and push it to the desktop
+    // engine, which scores it continuously on a background thread. Replaces
+    // the renderer's per-tick scoreChord IPC loop. Called once per
+    // arrangement load (and on song:loaded / arrangement:changed). When the
+    // addon predates the NoteVerifier API the function leaves
+    // `_ndUsingEngineVerifier` false and the caller keeps the old matchNotes
+    // path. Safe to call when the bridge isn't active — it just no-ops.
+    // Cheap signature of the currently-loaded chart — raw note/chord counts
+    // plus the active arrangement. Changes exactly when the chart the engine
+    // should be scoring changes (late load, song change, arrangement switch).
+    function _ndChartSignature() {
+        if (!hw || typeof hw.getNotes !== 'function') return '';
+        const notes = hw.getNotes() || [];
+        const n = notes.length;
+        let c = 0;
+        for (const ch of (hw.getChords() || [])) c += ((ch && ch.notes) || []).length;
+        // Cheap content discriminator: first + last note onset time. Two
+        // different songs with the same note/chord counts and arrangement
+        // would otherwise hash identically, leaving a stale chart on the
+        // engine if a song:loaded handler ever misfired.
+        const firstT = n > 0 && Number.isFinite(notes[0].t) ? notes[0].t : 0;
+        const lastT = n > 0 && Number.isFinite(notes[n - 1].t) ? notes[n - 1].t : 0;
+        // timingTolerance / pitchTolerance are part of the signature so moving
+        // a tolerance slider re-pushes the chart and the engine picks the new
+        // value up live — without this the popup sliders are inert on the
+        // engine-verifier path until the next song/arrangement change.
+        return n + ':' + c + ':' + currentArrangement + ':' + currentStringCount
+            + ':' + capo + ':' + timingTolerance + ':' + pitchTolerance
+            + ':' + firstT + ':' + lastT;
+    }
+
+    async function _ndPushChartToBridge() {
+        _ndUsingEngineVerifier = false;
+        _ndVerifierChartById = new Map();
+        _ndVerifierChords = new Map();
+        _ndVerifierChordKeyOf = new Map();
+        _ndPendingChords = new Map();
+        _ndVerifierChartSig = '';
+        _ndLastPushedPlayhead = 0;
+        if (!usingDesktopBridge || !bridgeDesktop || !bridgeDesktop.audio) return;
+        if (typeof bridgeDesktop.audio.setChart !== 'function'
+            || typeof bridgeDesktop.audio.getNoteVerdicts !== 'function') {
+            // Downlevel addon — fall back to the legacy matchNotes path.
+            return;
+        }
+        if (!hw || typeof hw.getNotes !== 'function' || typeof hw.getChords !== 'function') return;
+
+        const notes = [];
+        const byId = new Map();
+        // Chord grouping, built alongside `notes` — see _ndVerifierChords.
+        const chordGroups = new Map();
+        const chordKeyById = new Map();
+        // Single notes. `mt` (muted) notes are skipped — the legacy
+        // matchNotes path skips them too (`if (n.mt) continue`).
+        const single = hw.getNotes() || [];
+        for (const n of single) {
+            if (!n || n.mt) continue;
+            const id = noteKey(n, n.t);
+            if (byId.has(id)) continue;
+            const entry = {
+                id,
+                t: n.t,
+                s: n.s,
+                f: n.f,
+                sus: Number.isFinite(n.sus) ? n.sus : 0,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+            };
+            notes.push(entry);
+            byId.set(id, { ...n });
+        }
+        // Chord constituents from hw.getChords() — pushed as plain notes;
+        // chord grouping happens by timestamp below.
+        const chords = hw.getChords() || [];
+        for (const c of chords) {
+            for (const cn of (c.notes || [])) {
+                if (!cn || cn.mt) continue;
+                const id = noteKey(cn, c.t);
+                if (byId.has(id)) continue;
+                const entry = {
+                    id,
+                    t: c.t,
+                    s: cn.s,
+                    f: cn.f,
+                    sus: Number.isFinite(cn.sus) ? cn.sus : 0,
+                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                };
+                notes.push(entry);
+                byId.set(id, { ...cn, t: c.t });
+            }
+        }
+        // Chord grouping by shared onset time. A power chord / double-stop is
+        // 2+ notes at the same chart time — and in many arrangements (the
+        // "I'm Alive" Lead included) those arrive through hw.getNotes(), not
+        // hw.getChords(). Grouping the flattened note list by timestamp catches
+        // chords regardless of which host array delivered them.
+        const byTime = new Map();
+        for (const e of notes) {
+            const tk = e.t.toFixed(3);
+            if (!byTime.has(tk)) byTime.set(tk, []);
+            byTime.get(tk).push(e);
+        }
+        for (const [tk, grp] of byTime) {
+            if (grp.length < 2) continue;
+            const chordKey = tk + '_chord';
+            let maxSus = 0;
+            for (const e of grp) if ((e.sus || 0) > maxSus) maxSus = e.sus || 0;
+            chordGroups.set(chordKey, {
+                t: grp[0].t,
+                memberIds: grp.map(e => e.id),
+                memberNotes: grp.map(e => ({ s: e.s, f: e.f })),
+                maxSus,
+            });
+            for (const e of grp) chordKeyById.set(e.id, chordKey);
+        }
+
+        try {
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
+            const ok = await bridgeDesktop.audio.setChart({
+                arrangement: currentArrangement,
+                stringCount: currentStringCount,
+                tuningOffsets: tuningOffsets.slice(0, currentStringCount),
+                capo,
+                // The engine's harmonic-comb uses pitchCheckCents as its
+                // presence gate — feed the user's Pitch tolerance slider so
+                // it is honoured, rather than a fixed constant.
+                pitchCheckCents: pitchTolerance,
+                harmonicSnr: verifyParams.harmonicSnr,
+                // Relax the fundamental-presence gate for bass — its DI
+                // fundamental is legitimately weak (see _ndVerifyParamsFor).
+                fundamentalRatio: verifyParams.fundamentalRatio,
+                // Temporal-persistence floor — bass rejects wrong-position notes
+                // that only flicker present on a few frames (see
+                // _ndVerifyParamsFor). 0 on guitar keeps the legacy any-frame rule.
+                presenceRatio: verifyParams.presenceRatio,
+                timingTolerance,
+                notes,
+            });
+            // setChart resolves null on a downlevel addon — keep the legacy
+            // path in that case.
+            if (ok === null || ok === false) return;
+            _ndVerifierChartById = byId;
+            _ndVerifierChords = chordGroups;
+            _ndVerifierChordKeyOf = chordKeyById;
+            _ndPendingChords = new Map();
+            _ndVerifierChartSig = _ndChartSignature();
+            _ndUsingEngineVerifier = true;
+            console.log(`[note_detect] engine chart verifier active — ${notes.length} notes pushed`
+                + ` (${chordGroups.size} chords)`);
+        } catch (e) {
+            console.warn('[note_detect] setChart failed, falling back to matchNotes:',
+                e && e.message ? e.message : e);
+        }
+    }
+
+    // Drain the verdicts the engine's NoteVerifier has finalized and feed
+    // each through the SAME judgment pipeline the legacy path uses, so HUD /
+    // notedetect:* events / live-judgment JSONL all fire unchanged.
+    async function _ndDrainEngineVerdicts() {
+        if (!_ndUsingEngineVerifier || !bridgeDesktop || !bridgeDesktop.audio) return;
+
+        // The engine scores against a playhead the renderer pushes: its own
+        // JUCE backing transport is frozen for HTML5-routed (sloppak) songs.
+        // Push the same corrected clock the legacy matchNotes() path judges
+        // against — hw.getTime() + avOffset - latencyOffset.
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const playheadAudio = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+        const playing = !!(window.slopsmith && window.slopsmith.isPlaying);
+
+        // A backward jump (drill A-B loop wrap or a manual seek-back): the
+        // engine re-opens notes at/after the new position, so drop our dedup
+        // entries for those same notes. Otherwise the re-scored verdicts are
+        // skipped by the `noteResults.has(key)` guard below and a drilled
+        // passage scores only on its first iteration. 0.25 s matches the
+        // engine's own backward-jump threshold.
+        if (playheadAudio < _ndLastPushedPlayhead - 0.25) {
+            for (const [id, cn] of _ndVerifierChartById) {
+                if (cn && Number.isFinite(cn.t) && cn.t >= playheadAudio) {
+                    noteResults.delete(id);
+                    _susActiveUntil.delete(id);
+                }
+            }
+            // Re-opened chords: drop the chord judgment + any half-collected
+            // verdicts so the next pass can re-grade the whole chord.
+            for (const [ckey, grp] of _ndVerifierChords) {
+                if (grp && Number.isFinite(grp.t) && grp.t >= playheadAudio) {
+                    noteResults.delete(ckey);
+                    _ndPendingChords.delete(ckey);
+                }
+            }
+        }
+        _ndLastPushedPlayhead = playheadAudio;
+
+        let verdicts = null;
+        try {
+            verdicts = await bridgeDesktop.audio.getNoteVerdicts(playheadAudio, playing);
+        } catch (e) {
+            console.warn('[note_detect] getNoteVerdicts failed:', e && e.message ? e.message : e);
+            return;
+        }
+        if (!Array.isArray(verdicts) || verdicts.length === 0) return;
+
+        for (const v of verdicts) {
+            if (!v || typeof v.id !== 'string') continue;
+            const cn = _ndVerifierChartById.get(v.id);
+            if (!cn) continue;
+
+            // Silence gate — see _ndLevelSamples. If the input was below
+            // the silence threshold across the entire ±200 ms window
+            // around this note's chart time, the engine's "detected:true"
+            // is almost certainly a CREPE-on-silence phantom-pitch false
+            // positive. Force a miss so the HUD reflects "nothing was
+            // played" instead of the engine's optimistic verdict.
+            //
+            // Skip the gate entirely if the window contained no level
+            // samples — e.g. startup, level-meter hiccup, or right after a
+            // backward-seek reset cleared the buffer. Treating "no
+            // telemetry" as "silent" would force false misses on legitimate
+            // detections in those transient states.
+            if (v.detected && _ndLevelSamples.length > 0) {
+                // _ndLevelSamples are timestamped in the visual clock
+                // (hw.getTime() + avOffset), but `cn.t` (and everywhere
+                // else in this file that compares times against chart
+                // notes) is audio-aligned — see the
+                // `hw.getTime() + avOffset - latencyOffset` formula the
+                // detection pipeline uses to align audio to chart. So
+                // visual time = audio/chart time + latencyOffset. To
+                // find level samples that match this note's chart time,
+                // center the search at `cn.t + latencyOffset` in visual
+                // time; otherwise the configured user latency (up to
+                // 250 ms) would push the real peak outside the
+                // ±_ND_LEVEL_WIN_HALF window and trip false misses.
+                const cnCenterVisualT = cn.t + latencyOffset;
+                let peakL = 0;
+                let inWindow = 0;
+                for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
+                    const s = _ndLevelSamples[i];
+                    if (s.songT > cnCenterVisualT + _ND_LEVEL_WIN_HALF) continue;
+                    if (s.songT < cnCenterVisualT - _ND_LEVEL_WIN_HALF) break;
+                    inWindow++;
+                    if (s.level > peakL) peakL = s.level;
+                }
+                if (inWindow > 0 && peakL < _ND_SILENCE_THRESHOLD) {
+                    v.detected = false;
+                }
+            }
+
+            // Chord constituent — buffer the verdict until every member of
+            // the chord has reported, then judge the whole chord at once
+            // with N-of-M leniency (see _ndFinalizeChordVerdict).
+            const chordKey = _ndVerifierChordKeyOf.get(v.id);
+            if (chordKey) {
+                if (noteResults.has(chordKey)) continue;  // chord already judged
+                let pc = _ndPendingChords.get(chordKey);
+                if (!pc) { pc = new Map(); _ndPendingChords.set(chordKey, pc); }
+                pc.set(v.id, v);
+                const grp = _ndVerifierChords.get(chordKey);
+                if (grp && pc.size >= grp.memberIds.length) {
+                    _ndFinalizeChordVerdict(chordKey, grp, pc);
+                    _ndPendingChords.delete(chordKey);
+                }
+                continue;
+            }
+
+            // Lone single note.
+            const key = v.id;
+            if (noteResults.has(key)) continue;
+
+            const expectedMidi = _ndMidiFromStringFret(
+                cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            if (v.detected) {
+                // detectedSongTime is the playhead the renderer pushed, which
+                // is already avOffset/latency-corrected — use it directly. (It
+                // was previously the engine's own backing clock and needed the
+                // correction here; re-applying it now would double-correct.)
+                const judgedAt = v.detectedSongTime;
+                const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
+                const detectedMidiForJudgment = Number.isFinite(pitchError)
+                    ? expectedMidi + pitchError / 100
+                    : null;
+                // A bend / slide / harmonic note's pitch deliberately leaves
+                // the chart pitch; widen the pitch gate so the hit rides on
+                // presence + timing, not a moving target.
+                const lenientPitch = !!(cn.b || cn.sl || cn.hm);
+                const judgment = makeMatchedJudgment(
+                    cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
+                    { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
+                );
+                recordJudgment(key, judgment);
+            } else {
+                // Engine finalized the note as a miss — its timing window
+                // has fully passed. Mirror the legacy checkMisses() retire.
+                const t = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+                recordJudgment(key, makeMissJudgment(cn, cn.t, t, expectedMidi));
+            }
+        }
+
+        // Flush stuck chords. A chord is normally judged once every
+        // constituent reports a verdict; if the engine ever drops one, the
+        // chord would sit in _ndPendingChords forever (checkMisses is
+        // short-circuited on this path). Once a pending chord's window has
+        // long passed, finalize it with whatever verdicts did arrive —
+        // _ndFinalizeChordVerdict handles a partial set (missing members
+        // simply don't count toward hitStrings).
+        for (const [ckey, pc] of _ndPendingChords) {
+            const grp = _ndVerifierChords.get(ckey);
+            if (!grp) { _ndPendingChords.delete(ckey); continue; }
+            if (playheadAudio > grp.t + (grp.maxSus || 0) + timingTolerance + 1.0) {
+                _ndFinalizeChordVerdict(ckey, grp, pc);
+                _ndPendingChords.delete(ckey);
+            }
+        }
+    }
+
+    // Judge a whole chord from its constituents' engine verdicts. A chord is
+    // a hit when at least chordHitRatio of its strings verified (N-of-M
+    // leniency) — power-chord constituents share harmonics, so demanding
+    // every string would reject chords that clearly rang. Emits one chord
+    // judgment (chord:true), mirroring the legacy chord path.
+    function _ndFinalizeChordVerdict(chordKey, grp, verdictMap) {
+        if (noteResults.has(chordKey)) return;
+        let hitStrings = 0;
+        let detectedTime = null;   // onset-derived time from a struck string
+        let bestCents = null;
+        for (const id of grp.memberIds) {
+            const v = verdictMap.get(id);
+            if (v && v.detected) {
+                hitStrings++;
+                if (detectedTime === null) detectedTime = v.detectedSongTime;
+                if (bestCents === null && Number.isFinite(v.centsError)) bestCents = v.centsError;
+            }
+        }
+        const totalStrings = grp.memberIds.length;
+        const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
+        const lead = _ndVerifierChartById.get(grp.memberIds[0]) || { s: 0, f: 0 };
+        const expectedMidi = _ndMidiFromStringFret(
+            lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+        );
+        const lateGraceMs = Math.min((grp.maxSus || 0) * 1000, 1000);
+
+        const chordIsHit = score >= chordHitRatio && detectedTime !== null;
+        if (chordIsHit) {
+            const detMidi = Number.isFinite(bestCents) ? expectedMidi + bestCents / 100 : null;
+            recordJudgment(chordKey, makeMatchedJudgment(
+                lead, grp.t, detectedTime, expectedMidi, detMidi, 1,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings,
+                  score, pitchError: bestCents, lateGraceMs }
+            ));
+        } else {
+            // Match the legacy chord-miss path: judgedAt is the current
+            // corrected playhead (matchChords' `t`, not the chord's chart
+            // time), and lateGraceMs is included so a chord with a long
+            // sustain stays open to a late grab — both fields needed for
+            // _ndMakeJudgment's timing classification to give the same
+            // result as the legacy browser/desktop chord-miss path.
+            const avOffsetSecMiss = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+            const missJudgedAt = (hw.getTime ? hw.getTime() : 0) + avOffsetSecMiss - latencyOffset;
+            recordJudgment(chordKey, makeMissJudgment(
+                lead, grp.t, missJudgedAt, expectedMidi,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score, lateGraceMs }
+            ));
+        }
+
+        // Stash a per-constituent judgment for every chord string, keyed by
+        // its own noteKey (== its engine id). The chord-level judgment above
+        // owns the HUD totals / event log; these per-string entries exist
+        // purely so the highway's note-state provider (slopsmith#254) can
+        // tint each chord gem and the chord frame. Without them the engine
+        // path stored only `chordKey`, which the highway never queries —
+        // hence the missing chord hit/miss feedback.
+        //
+        // Every constituent carries the *chord-level* verdict, not its own
+        // string's detection: a chord is judged as a unit under N-of-M
+        // leniency — power-chord strings share harmonics, so not every
+        // string verifies individually even on a clean strum. Tinting each
+        // gem and the chord frame with the unit verdict keeps them
+        // consistent: the frame goes green when the chord scored a hit,
+        // instead of red because one harmonically-masked string failed to
+        // verify on its own. (Stashed straight into noteResults +
+        // _recordPerStringForChord, bypassing recordJudgment so the chord
+        // isn't double-counted in HUD totals.)
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const nowSongT = (hw.getTime ? hw.getTime() : 0) + avOffsetSec;
+        const missAt = nowSongT - latencyOffset;
+        for (const id of grp.memberIds) {
+            if (noteResults.has(id)) continue;
+            const mcn = _ndVerifierChartById.get(id);
+            if (!mcn) continue;
+            const mExpectedMidi = _ndMidiFromStringFret(
+                mcn.s, mcn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            // The noteResults entry is stamped with the chord-level verdict
+            // (so the highway tints every chord gem and the chord frame
+            // consistently — power-chord strings share harmonics and aren't
+            // each independently verifiable under N-of-M leniency). But the
+            // per-string diagnostic counter (_diagPerString via
+            // _recordPerStringForChord) needs the *individual* constituent
+            // outcome to stay accurate — otherwise a 4-string chord scored
+            // hit via N-of-M would credit all four strings as hits even
+            // when only two were actually detected, inflating per-string
+            // accuracy.
+            const constituentDetected = !!(verdictMap.get(id) || {}).detected;
+            let mJudgment;
+            if (chordIsHit) {
+                // Pass `chord: true` so _ndMakeJudgment routes through the
+                // chord-judgment branch and the per-constituent `hit`
+                // tracks the chord-level verdict (timing-only). Without
+                // it, `hit` gets gated by per-string pitchState/
+                // pitchHitThreshold and can become false even when
+                // chordIsHit is true — e.g. a chord scored a hit via
+                // N-of-M leniency but bestCents (lifted from one
+                // constituent) sits outside the 28¢ pitch threshold.
+                // That false-`hit` would then make noteStateFor return
+                // 'miss' for the constituent, undoing the whole point of
+                // stamping it with the chord verdict.
+                const lenientPitch = !!(mcn.b || mcn.sl || mcn.hm);
+                const mDetMidi = Number.isFinite(bestCents)
+                    ? mExpectedMidi + bestCents / 100 : null;
+                mJudgment = makeMatchedJudgment(
+                    mcn, mcn.t, detectedTime, mExpectedMidi, mDetMidi, 1,
+                    { chord: true, pitchError: bestCents,
+                      pitchThresholdCents: lenientPitch ? 600 : undefined,
+                      lateGraceMs }
+                );
+            } else {
+                mJudgment = makeMissJudgment(mcn, mcn.t, missAt, mExpectedMidi,
+                    { chord: true, lateGraceMs });
+            }
+            // Verdict landed now — anchor the highway gem's display window
+            // here (see recordJudgment / noteStateFor).
+            mJudgment._ndDisplayFrom = nowSongT;
+            noteResults.set(id, mJudgment);
+            // Per-string diagnostic uses the individual outcome rather than
+            // the unit chord verdict. Built as a minimal shape — only `hit`
+            // and `chartNote` are read by _recordPerStringForChord.
+            _recordPerStringForChord({ hit: constituentDetected, chartNote: mcn });
+        }
+    }
+
     let _chartStateSubscribed = false;
     let _chartStateOnChange = null;
     function _chartStateBindEvents() {
@@ -4522,13 +6283,32 @@ function createNoteDetector(options = {}) {
         if (!window.slopsmith
             || typeof window.slopsmith.on !== 'function'
             || typeof window.slopsmith.off !== 'function') return;
-        const onChange = () => { _syncChartStateFromHw(); };
+        // On a song / arrangement change, refresh the chart context and —
+        // on the desktop bridge — re-push the new note chart to the engine
+        // verifier. _ndPushChartToBridge() no-ops on the browser path.
+        const onChange = () => {
+            _syncChartStateFromHw();
+            // Swallow rejections — a chart-build failure (e.g. hw.getNotes()
+            // throwing) inside a slopsmith host event callback must not
+            // surface as an unhandled rejection in the host's dispatch.
+            Promise.resolve(_ndPushChartToBridge()).catch(() => {});
+        };
         try {
+            // song:loaded fires early (with metadata) — chart contents
+            // (notes / chords / beats) stream in afterwards over the WS.
+            // song:ready fires once the chart has fully arrived, which is
+            // the actually-correct moment to push to the engine. We
+            // subscribe to both: song:loaded keeps the legacy path that
+            // also resets chart-derived state, and song:ready guarantees
+            // a re-push once hw.getNotes()/getChords() returns the full
+            // chart instead of an empty / partial early snapshot.
             window.slopsmith.on('song:loaded',          onChange);
+            window.slopsmith.on('song:ready',           onChange);
             window.slopsmith.on('arrangement:changed',  onChange);
         } catch (e) {
             if (typeof window.slopsmith.off === 'function') {
                 try { window.slopsmith.off('song:loaded',         onChange); } catch (_) {}
+                try { window.slopsmith.off('song:ready',          onChange); } catch (_) {}
                 try { window.slopsmith.off('arrangement:changed', onChange); } catch (_) {}
             }
             return;
@@ -4540,6 +6320,7 @@ function createNoteDetector(options = {}) {
         if (!_chartStateSubscribed) return;
         if (window.slopsmith && typeof window.slopsmith.off === 'function' && _chartStateOnChange) {
             try { window.slopsmith.off('song:loaded',         _chartStateOnChange); } catch (_) {}
+            try { window.slopsmith.off('song:ready',          _chartStateOnChange); } catch (_) {}
             try { window.slopsmith.off('arrangement:changed', _chartStateOnChange); } catch (_) {}
         }
         _chartStateOnChange = null;
@@ -4600,6 +6381,12 @@ function createNoteDetector(options = {}) {
             if (_recArmedForTraining && built) _summaryDeferred = true;
         } catch (e) {
             console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
+        }
+        // Persist this play + (if multi-play evidence) surface a drill
+        // banner. Build-and-call BEFORE disable() so the snapshot captures
+        // noteResults before any teardown clears it. Fire-and-forget.
+        try { _ndSnapshotPlayAndSuggest('song_end'); } catch (e) {
+            console.warn('[note_detect] hotspot suggest failed:', e && e.message ? e.message : e);
         }
         try { disable({ silent: true }); } catch (e) {}
     }
@@ -4814,6 +6601,23 @@ function createNoteDetector(options = {}) {
         _syncChartStateFromHw();
         _chartStateBindEvents();
 
+        // Surface a hotspot from PERSISTED play history (the SQLite plays DB
+        // survives refresh AND container restart) the moment Detect turns on,
+        // so the restart → drill → eval loop doesn't require replaying the
+        // whole song each time. Default singleton only; delayed so the chart/
+        // songId is ready; fire-and-forget (no-ops without ≥2 plays of
+        // evidence for this song).
+        if (isDefault) {
+            setTimeout(() => {
+                const sid = _ndCurrentSongId();
+                if (!sid) return;
+                // Show any saved practice loops for this song, and surface the
+                // top hotspot banner from history (both from the persisted DB).
+                try { _ndShowLoopPanel(sid); } catch (_) {}
+                try { _ndMaybeSuggestPracticeLoop(sid); } catch (_) {}
+            }, 800);
+        }
+
         resetScoring();
 
         // Queue the audio acquisition through the shared chain so
@@ -4859,6 +6663,13 @@ function createNoteDetector(options = {}) {
         missCheckInterval = setInterval(checkMisses, 100);
         startHUD();
 
+        // Desktop bridge: push the current song's note chart to the engine
+        // so its NoteVerifier thread scores it continuously. No-ops on the
+        // browser path and on a downlevel addon (where the legacy matchNotes
+        // loop stays in force). startAudio() has already established
+        // usingDesktopBridge / bridgeDesktop by this point.
+        await _ndPushChartToBridge();
+
         // Per-instance GC of noteResults — previously a module-level
         // setInterval; moving it into the closure lets each instance
         // prune its own Map.
@@ -4872,6 +6683,16 @@ function createNoteDetector(options = {}) {
         }, 5000);
 
         if (detectionMethod === 'crepe') _ndLoadCrepe();
+
+        // Auto-record every play (default singleton only; no-op otherwise).
+        // Bound only here, on the fully-enabled path after audio is up, and
+        // unbound in disable() — so the song listeners never linger or arm
+        // a take while Detect is off. The vm tests can't enable(), so they
+        // never register it, keeping the listener-count contracts intact.
+        _bindAutoRecord();
+        // A/V auto-calibrate (default singleton only; no-op otherwise) — same
+        // enable-time lifecycle as auto-record.
+        _calBindEvents();
         return true;
     }
 
@@ -4890,6 +6711,14 @@ function createNoteDetector(options = {}) {
         sessionGen++;
         stopAudio();
         stopHUD();
+        // Auto-record is the one enable-bound listener we drop on disable()
+        // (not only on destroy): its handler arms/saves takes, so it must
+        // not stay live while Detect is off. Re-enable rebinds it.
+        _unbindAutoRecord();
+        // NOTE: deliberately do NOT unbind auto-calibrate here. The host
+        // disable()s detection at song-end (sometimes BEFORE the plugin's
+        // song:ended handler runs), so unbinding on disable would drop the
+        // calibrate trigger. Self-gated + once-per-play; torn down in destroy().
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
@@ -4920,6 +6749,8 @@ function createNoteDetector(options = {}) {
         _endOfSongUnbindEvents();
         _chartStateUnbindEvents();
         _recUnbindEvents();
+        _unbindAutoRecord();
+        _calUnbindEvents();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
         // shouldn't write a half-captured WAV (or fire off an upload).
@@ -6034,6 +7865,137 @@ function createNoteDetector(options = {}) {
         _recSubscribed = false;
     }
 
+    // ── Auto-record every play ────────────────────────────────────────
+    // Capture every play for later analysis (the teaching-tool goal),
+    // not just deliberate dev/tuning takes. On song:loaded, arm the
+    // upcoming play so it rides the existing capture + song:ended
+    // auto-save path — no manual Arm. Gated to:
+    //   • the default singleton (isDefault) — so split-screen panels
+    //     don't each save their own WAV, and the test instances
+    //     (always isDefault:false) never bind an extra song:ended
+    //     listener that would break the listener-count assertions;
+    //   • `autoRecord` being on (user opt-out) and `detectPreference`
+    //     (Detect on — capture taps the detector's input graph, so an
+    //     armed-without-Detect take captures nothing).
+    // A song stopped mid-play doesn't emit song:ended (stopAudio), so a
+    // prior take can still be armed when the next song loads. Flush it
+    // first — save if it caught audio, else discard — so two songs never
+    // bleed into one WAV. saveRecordingNow() encodes the WAV
+    // synchronously before its await and only unbinds in its finally, so
+    // we must await it before re-arming or the new take loses its
+    // listeners. A deliberate training take (_recArmedForTraining) is
+    // left untouched.
+    let _autoRecOnLoaded = null, _autoRecOnPause = null, _autoRecOnPlay = null;
+    // Minimum captured seconds before a pause auto-saves — so a brief
+    // pause mid-song (tweaking a setting, then resuming) doesn't spew a
+    // string of tiny fragment WAVs.
+    const _AUTO_REC_MIN_PAUSE_SAVE_S = 3;
+    function _bindAutoRecord() {
+        if (!isDefault || _autoRecOnLoaded) return;
+        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        // New song loaded → flush any take stranded by a stop (no
+        // song:ended) so two songs don't bleed into one WAV, then arm
+        // the upcoming play.
+        _autoRecOnLoaded = async () => {
+            if (!autoRecord || !detectPreference) return;
+            if (_recArmedForTraining) return;
+            if (_recArmed) {
+                if (_recChunks.length > 0) { try { await saveRecordingNow(); } catch (_) {} }
+                else { discardRecording(); }
+            }
+            armRecording();
+        };
+        // Pause = "done with this take" for the short-take workflow
+        // (play a bit, stop, harness it). Save it — saveRecordingNow()
+        // disarms; the next song:play re-arms a fresh take. Gated on a
+        // minimum length so a resume-after-a-blip doesn't spam fragments.
+        _autoRecOnPause = () => {
+            if (!autoRecord || _recArmedForTraining || !_recArmed) return;
+            const secs = _recTotalSamples / Math.max(1, _recSampleRate);
+            if (_recChunks.length > 0 && secs >= _AUTO_REC_MIN_PAUSE_SAVE_S) {
+                saveRecordingNow().catch(() => {});
+            }
+        };
+        // Re-arm on play when nothing's armed — covers resume after a
+        // pause-save, and a play not preceded by a fresh song:loaded.
+        // armRecording() binds its own _recOnPlay AFTER this play event
+        // already fired, so set _recSongPlaying here or the first frames
+        // of the resumed take wouldn't be captured.
+        _autoRecOnPlay = () => {
+            if (!autoRecord || !detectPreference || _recArmedForTraining || _recArmed) return;
+            armRecording();
+            _recSongPlaying = true;
+        };
+        try {
+            window.slopsmith.on('song:loaded', _autoRecOnLoaded);
+            window.slopsmith.on('song:pause',  _autoRecOnPause);
+            window.slopsmith.on('song:play',   _autoRecOnPlay);
+        } catch (_) { _unbindAutoRecord(); }
+    }
+    function _unbindAutoRecord() {
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_autoRecOnLoaded) { try { window.slopsmith.off('song:loaded', _autoRecOnLoaded); } catch (_) {} }
+            if (_autoRecOnPause)  { try { window.slopsmith.off('song:pause',  _autoRecOnPause); } catch (_) {} }
+            if (_autoRecOnPlay)   { try { window.slopsmith.off('song:play',   _autoRecOnPlay); } catch (_) {} }
+        }
+        _autoRecOnLoaded = _autoRecOnPause = _autoRecOnPlay = null;
+    }
+
+    // ── A/V auto-calibrate lifecycle ──────────────────────────────────
+    // On song-end, sweep the play's offset-free detections for the av-offset
+    // that maximizes matched notes and apply it. At most once per play; the
+    // detection log + the once-guard reset on song:loaded. Bound from
+    // enableImpl() / unbound in disable()+destroy(), so the audio-less vm
+    // tests never register these listeners (keeps listener-count contracts).
+    // Returns a short reason string (for the test/debug hook); the listeners
+    // ignore it. The success path sets _lastAvCalibration + applies the offset.
+    function _ndRunAutoCalibrate() {
+        if (!autoCalibrate) return 'autoCalibrate off';
+        if (!isDefault) return 'not default';
+        if (_calDoneThisPlay) return 'already done this play';
+        if (typeof window.setAvOffsetMs !== 'function') return 'no window.setAvOffsetMs';
+        const notes = (hw && hw.getNotes) ? hw.getNotes() : null;
+        if (!notes || !notes.length) return 'no notes';
+        const geom = { arrangement: currentArrangement, stringCount: currentStringCount, offsets: tuningOffsets, capo };
+        const r = _ndCalibrateOffsetMs(_calDetections, notes, geom, timingHitThreshold, pitchTolerance, {});
+        if (!r) return `sweep null (dets=${_calDetections.length}, notes=${notes.length}, arr=${currentArrangement}/${currentStringCount}, win=${timingHitThreshold}, tol=${pitchTolerance})`;
+        _calDoneThisPlay = true;
+        _lastAvCalibration = r;
+        try {
+            window.setAvOffsetMs(r.offsetMs);
+            console.log(`[note_detect] A/V auto-calibrated to ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
+            if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+                window.slopsmith.emit('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
+            }
+        } catch (e) { return 'setAvOffsetMs threw: ' + (e && e.message || e); }
+        return 'OK ' + JSON.stringify(r);
+    }
+    let _calOnLoaded = null, _calOnEnded = null, _calOnPause = null, _calSubscribed = false;
+    function _calBindEvents() {
+        if (!isDefault || _calSubscribed) return;
+        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        _calOnLoaded = () => { _calDetections = []; _calDoneThisPlay = false; _lastAvCalibration = null; };
+        _calOnEnded  = () => { _ndRunAutoCalibrate(); };
+        // Also fire on pause — the host may end a take via pause (or stop)
+        // rather than a clean song:ended; once-per-play guards re-runs.
+        _calOnPause  = () => { _ndRunAutoCalibrate(); };
+        try {
+            window.slopsmith.on('song:loaded', _calOnLoaded);
+            window.slopsmith.on('song:ended',  _calOnEnded);
+            window.slopsmith.on('song:pause',  _calOnPause);
+            _calSubscribed = true;
+        } catch (_) { _calUnbindEvents(); }
+    }
+    function _calUnbindEvents() {
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_calOnLoaded) { try { window.slopsmith.off('song:loaded', _calOnLoaded); } catch (_) {} }
+            if (_calOnEnded)  { try { window.slopsmith.off('song:ended',  _calOnEnded); } catch (_) {} }
+            if (_calOnPause)  { try { window.slopsmith.off('song:pause',  _calOnPause); } catch (_) {} }
+        }
+        _calOnLoaded = _calOnEnded = _calOnPause = null;
+        _calSubscribed = false;
+    }
+
     // Live-streaming event bindings — only active while tuning mode is
     // on. Mints a fresh session id on song:play so every take produces
     // its own `live_<id>.jsonl` file server-side; clears it on song:end
@@ -6307,6 +8269,33 @@ function createNoteDetector(options = {}) {
                 iterations: drillIterations.map((it) => ({ ...it })),
             };
         },
+        // Drill conductor (speed/goal orchestrator). startDrill(start,
+        // end, {label, focus, goal, speedLadder}) arms a slowed A-B loop
+        // and steps the speed up as the player clears the accuracy goal,
+        // graduating at full speed. endDrill() bails early. The hotspot
+        // finder and coaching call startDrill; getConductorState drives
+        // external HUDs / tests.
+        startDrill,
+        endDrill,
+        isDrilling: () => drillConductorActive,
+        getConductorState: () => ({
+            active: drillConductorActive,
+            label: drillConductorLabel,
+            focus: drillConductorFocus,
+            goal: drillConductorGoal,
+            best: drillConductorBest,
+            rung: drillConductorRung,
+            ladder: drillConductorLadder ? drillConductorLadder.slice() : null,
+            speed: drillConductorLadder ? (drillConductorLadder[drillConductorRung] || null) : null,
+            range: drillConductorRange ? { ...drillConductorRange } : null,
+        }),
+        // Hotspot finder. snapshotPlay persists the current play's note
+        // verdicts; suggestPracticeLoop aggregates this song's recent
+        // plays and pops the "Practice now" banner when a region recurs.
+        // The end-of-song handler calls both automatically; these expose
+        // them for manual/console use and tests.
+        snapshotPlayAndSuggest: _ndSnapshotPlayAndSuggest,
+        suggestPracticeLoop: () => _ndMaybeSuggestPracticeLoop(_ndCurrentSongId()),
         setChannel,
         injectButton,
         showSummary,
@@ -6332,6 +8321,7 @@ function createNoteDetector(options = {}) {
             partial = partial || {};
             if (typeof partial.method === 'string' && ['yin', 'hps', 'crepe'].includes(partial.method)) {
                 detectionMethod = partial.method;
+                detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
             }
             if (Number.isFinite(partial.timingTolerance)) {
                 timingTolerance = Math.max(0.03, Math.min(0.3, partial.timingTolerance));
@@ -6421,6 +8411,35 @@ function createNoteDetector(options = {}) {
             if (tuningMode) _liveBindEvents(); else _liveUnbindEvents();
             saveSettings();
         },
+        // Auto-record-every-play opt-out. The song:loaded listener reads
+        // `autoRecord` at fire time, so flipping the flag is enough — no
+        // rebind. An in-progress auto-take is left to finish/save on its
+        // own song:ended.
+        isAutoRecord: () => autoRecord,
+        setAutoRecord: (v) => {
+            const next = !!v;
+            if (next === autoRecord) return;
+            autoRecord = next;
+            saveSettings();
+        },
+        // A/V auto-calibrate opt-out + last result for the Settings UI.
+        isAutoCalibrate: () => autoCalibrate,
+        setAutoCalibrate: (v) => {
+            const next = !!v;
+            if (next === autoCalibrate) return;
+            autoCalibrate = next;
+            saveSettings();
+        },
+        getLastCalibration: () => _lastAvCalibration,
+        // Debug hooks: detection-log state + a manual calibrate trigger, so a
+        // headless run can see whether the log fills and why calibrate no-ops.
+        _calDebug: () => ({ detections: _calDetections.length, subscribed: _calSubscribed, autoCalibrate, isDefault, notes: (hw && hw.getNotes) ? (hw.getNotes() || []).length : -1 }),
+        _calDetectionsDump: () => _calDetections.slice(),
+        _runAutoCalibrate: () => _ndRunAutoCalibrate(),
+        // Test hook: run the offset sweep on a supplied detection log + notes
+        // without the audio pipeline. Production calls _ndRunAutoCalibrate().
+        _calibrateOffsetMs: (dets, notes, geom, winS, tolC, opts) =>
+            _ndCalibrateOffsetMs(dets, notes, geom, winS, tolC, opts),
         // Reference-recording capture for the headless harness. Arms
         // the next song-play to capture the detector's input audio,
         // auto-saves on song:ended. POSTs the WAV to the plugin's
@@ -6460,8 +8479,12 @@ function createNoteDetector(options = {}) {
                 baseLatency:   Number.isFinite(audioCtx.baseLatency)   ? audioCtx.baseLatency   : null,
                 outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
                 sampleRate:    audioCtx.sampleRate,
-                frameSize:     _ND_FRAME_SIZE,
-                yinBufferSize: _ND_MIN_YIN_SAMPLES,
+                frameSize:     frameSize,
+                // Effective single-note analysis window: bass widens this from
+                // the YIN floor to span ~2 periods of the lowest detectable
+                // fundamental at the device rate (see _ndMinAnalysisSamples), so
+                // report the real value, not the fixed floor.
+                yinBufferSize: _ndMinAnalysisSamples(currentArrangement, audioCtx.sampleRate),
                 state:         audioCtx.state,
             };
         },
@@ -6501,6 +8524,11 @@ function createNoteDetector(options = {}) {
         _bindChartStateEvents: _chartStateBindEvents,
         _unbindChartStateEvents: _chartStateUnbindEvents,
         _syncChartStateFromHw: _syncChartStateFromHw,
+        // Auto-record test hooks — same rationale. Production binds from
+        // enableImpl() / unbinds from destroy(); tests drive them without
+        // the audio pipeline to assert the song:loaded auto-arm.
+        _bindAutoRecord: _bindAutoRecord,
+        _unbindAutoRecord: _unbindAutoRecord,
         _getChartState: () => ({
             arrangement: currentArrangement,
             stringCount: currentStringCount,
@@ -6540,8 +8568,10 @@ function createNoteDetector(options = {}) {
                 // that the harness CLI explicitly rejects — and the
                 // detector would silently fall back to YIN at runtime.
                 // Keep the internal API aligned with the CLI's whitelist.
-                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method))
+                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method)) {
                     detectionMethod = s.method;
+                    detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
+                }
                 if (Number.isFinite(s.pitchTolerance))      pitchTolerance      = s.pitchTolerance;
                 if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
                 if (Number.isFinite(s.timingTolerance))     timingTolerance     = s.timingTolerance;

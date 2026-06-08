@@ -173,9 +173,13 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering', '_ndNearestOctaveCents',
+        '_ndCalibrateOffsetMs',
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
+        '_ndDrillRampDecision', '_ndDescribeMiss', '_ndSummarizeWindowMisses',
+        '_ndAggregatePlays', '_ndStatsForRow', '_ndSuggestLoops',
+        '_ndHotspotReasons', '_ndRenderLoopPanelHtml',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -291,6 +295,15 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
                 })),
             };
         },
+        calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
+        drillRampDecision: sandbox._ndDrillRampDecision,
+        describeMiss: sandbox._ndDescribeMiss,
+        summarizeWindowMisses: sandbox._ndSummarizeWindowMisses,
+        aggregatePlays: sandbox._ndAggregatePlays,
+        statsForRow: sandbox._ndStatsForRow,
+        suggestLoops: sandbox._ndSuggestLoops,
+        hotspotReasons: sandbox._ndHotspotReasons,
+        renderLoopPanelHtml: sandbox._ndRenderLoopPanelHtml,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

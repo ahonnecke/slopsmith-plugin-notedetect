@@ -56,10 +56,13 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import time
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from fastapi import HTTPException, Request
 
 # pCloud public upload link ("puplink") for the curated note_detect
@@ -147,6 +150,157 @@ _MAX_BYTES = 32 * 1024 * 1024
 # client could spam huge blobs. Cap individual payloads so the JSONL
 # file can't be DoSed into millions of bytes per line.
 _LIVE_JUDGMENT_MAX_BYTES = 8 * 1024
+
+# ── Plays history (multi-play hotspot finder) ─────────────────────────────
+# A per-play note-verdict store so the frontend finder can flag a region
+# the user keeps missing ACROSS plays (not a one-off fumble) and offer to
+# drill it. Deliberately LEAN — only the columns the finder reads: the
+# rich per-note failure-classification model from the prior fork is not
+# reproduced here (the running build doesn't populate it). SQLite lives at
+# the first writable base (CONFIG_DIR persists across container restarts).
+_PLAYS_DB_REL = "notedetect_plays.db"
+_PLAYS_KEEP_PER_SONG = 25   # retain the most recent N full plays per song
+_PLAYS_DB_PATH: Optional[str] = None  # resolved lazily in setup()
+
+_PLAYS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plays (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id TEXT NOT NULL,
+  play_id_client TEXT,
+  played_at TEXT NOT NULL,
+  reason TEXT,
+  is_drill INTEGER DEFAULT 0,
+  hits INTEGER DEFAULT 0,
+  misses INTEGER DEFAULT 0,
+  raw_started_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS play_notes (
+  play_id INTEGER NOT NULL REFERENCES plays(id) ON DELETE CASCADE,
+  note_key TEXT,
+  chart_t REAL NOT NULL,
+  string_idx INTEGER,
+  fret INTEGER,
+  expected_midi INTEGER,
+  primary_verdict TEXT NOT NULL,
+  miss_kind TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_plays_song ON plays(song_id, played_at DESC);
+CREATE INDEX IF NOT EXISTS idx_play_notes_play ON play_notes(play_id);
+
+-- Practice loops: a hotspot saved as a drillable A-B loop for a song, with
+-- its failure reasons and whether it's been passed at full speed. The host's
+-- own `loops` table (id/filename/name/start/end) can't carry reasons/passed,
+-- so the drill loop manager keeps its own richer store.
+CREATE TABLE IF NOT EXISTS practice_loops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id TEXT NOT NULL,
+  label TEXT,
+  loop_a REAL NOT NULL,
+  loop_b REAL NOT NULL,
+  reasons_json TEXT,
+  passed INTEGER DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_practice_loops_song ON practice_loops(song_id, loop_a);
+"""
+
+
+@contextmanager
+def _plays_db():
+    """Per-request SQLite connection with FK enforcement and dict rows."""
+    if _PLAYS_DB_PATH is None:
+        raise RuntimeError("notedetect plays DB not initialized — setup() never ran")
+    conn = sqlite3.connect(_PLAYS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_play(conn: sqlite3.Connection, data: dict) -> int:
+    """Insert one play snapshot into plays + play_notes. Returns the play_id."""
+    summary = data.get("summary") or {}
+    cur = conn.execute(
+        """INSERT INTO plays (
+            song_id, play_id_client, played_at, reason, is_drill,
+            hits, misses, raw_started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            data.get("songId") or "unknown",
+            data.get("playId"),
+            datetime.now(timezone.utc).isoformat(),
+            data.get("reason"),
+            1 if data.get("isDrill") else 0,
+            int(summary.get("hits") or 0),
+            int(summary.get("misses") or 0),
+            data.get("startedAt"),
+        ),
+    )
+    play_id = cur.lastrowid
+    if play_id is None:
+        raise RuntimeError("plays INSERT did not produce a rowid")
+    rows = []
+    for n in (data.get("noteResults") or []):
+        rows.append((
+            play_id,
+            n.get("key"),
+            float(n.get("chartT") or 0.0),
+            n.get("s"),
+            n.get("f"),
+            n.get("expectedMidi"),
+            n.get("primary") or "UNKNOWN",
+            n.get("how"),
+        ))
+    if rows:
+        conn.executemany(
+            """INSERT INTO play_notes (
+                play_id, note_key, chart_t, string_idx, fret,
+                expected_midi, primary_verdict, miss_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+    return play_id
+
+
+def _prune_plays(conn: sqlite3.Connection, song_id: str, keep: int):
+    """Drop the oldest plays beyond `keep` for this song (notes cascade)."""
+    extra = conn.execute(
+        "SELECT id FROM plays WHERE song_id = ? ORDER BY played_at DESC, id DESC LIMIT -1 OFFSET ?",
+        (song_id, keep),
+    ).fetchall()
+    for r in extra:
+        conn.execute("DELETE FROM plays WHERE id = ?", (r["id"],))
+
+
+def _row_to_play(row: sqlite3.Row, notes_rows: list) -> dict:
+    """Reconstruct the JSON shape _ndFetchPlays / _ndAggregatePlays expect."""
+    return {
+        "id": row["id"],
+        "songId": row["song_id"],
+        "playId": row["play_id_client"],
+        "playedAt": row["played_at"],
+        "reason": row["reason"],
+        "isDrill": bool(row["is_drill"]),
+        "summary": {"hits": row["hits"], "misses": row["misses"]},
+        "startedAt": row["raw_started_at"],
+        "noteResults": [
+            {
+                "key": n["note_key"],
+                "chartT": n["chart_t"],
+                "s": n["string_idx"],
+                "f": n["fret"],
+                "expectedMidi": n["expected_midi"],
+                "primary": n["primary_verdict"],
+                "how": (n["miss_kind"] if "miss_kind" in n.keys() else None),
+            }
+            for n in notes_rows
+        ],
+    }
 
 # JSONL files for a single session shouldn't exceed this — caps total
 # accumulation per session. A 2-minute song produces ~60 KB; this gives
@@ -278,6 +432,177 @@ def setup(app, context):
             "could not find a writable recordings directory (tried: "
             + "; ".join(errors) + ")",
         )
+
+    def _ensure_plays_db() -> str:
+        # The plays DB lives in the same resolved writable base as
+        # recordings (host-visible in Docker, CONFIG_DIR in the desktop
+        # bundle). Resolved + schema-created lazily on first use so route
+        # registration never fails on a read-only / missing base.
+        global _PLAYS_DB_PATH
+        if _PLAYS_DB_PATH is not None:
+            return _PLAYS_DB_PATH
+        base = _ensure_out_dir()
+        _PLAYS_DB_PATH = str(base / _PLAYS_DB_REL)
+        with _plays_db() as conn:
+            conn.executescript(_PLAYS_SCHEMA)
+            # Migrate an existing DB created before play_notes.miss_kind.
+            try:
+                conn.execute("ALTER TABLE play_notes ADD COLUMN miss_kind TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        log.info("note_detect plays DB: %s", _PLAYS_DB_PATH)
+        return _PLAYS_DB_PATH
+
+    @app.post("/api/plugins/note_detect/plays")
+    async def save_play(request: Request):
+        import anyio
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(400, "body must be JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        song_id = data.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId required")
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                pid = _insert_play(conn, data)
+                _prune_plays(conn, song_id, _PLAYS_KEEP_PER_SONG)
+                return pid
+
+        pid = await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": pid}
+
+    @app.get("/api/plugins/note_detect/plays")
+    async def list_plays(request: Request):
+        import anyio
+        song_id = request.query_params.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId required")
+        try:
+            limit = int(request.query_params.get("limit", "10"))
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(50, limit))
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                prows = conn.execute(
+                    "SELECT * FROM plays WHERE song_id = ? ORDER BY played_at DESC, id DESC LIMIT ?",
+                    (song_id, limit),
+                ).fetchall()
+                out = []
+                for pr in prows:
+                    nrows = conn.execute(
+                        "SELECT * FROM play_notes WHERE play_id = ? ORDER BY chart_t ASC",
+                        (pr["id"],),
+                    ).fetchall()
+                    out.append(_row_to_play(pr, nrows))
+                return out
+
+        plays = await anyio.to_thread.run_sync(_work)
+        return {"plays": plays}
+
+    # ── Practice loops (drill loop manager) ───────────────────────────────
+    @app.post("/api/plugins/note_detect/practice-loops")
+    async def save_practice_loop(request: Request):
+        import anyio
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(400, "body must be JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        song_id = data.get("songId")
+        a, b = data.get("loopA"), data.get("loopB")
+        if not song_id or not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or b <= a:
+            raise HTTPException(400, "songId and loopA<loopB required")
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                # De-dupe: a loop within 0.25s of an existing one for this song
+                # is the same hotspot — update its label/reasons instead of
+                # piling up near-identical rows across replays.
+                existing = conn.execute(
+                    "SELECT id FROM practice_loops WHERE song_id = ? AND ABS(loop_a - ?) < 0.25 AND ABS(loop_b - ?) < 0.25",
+                    (song_id, float(a), float(b)),
+                ).fetchone()
+                reasons = json.dumps(data.get("reasons")) if data.get("reasons") is not None else None
+                if existing:
+                    conn.execute(
+                        "UPDATE practice_loops SET label = ?, reasons_json = ? WHERE id = ?",
+                        (data.get("label"), reasons, existing["id"]),
+                    )
+                    return existing["id"]
+                cur = conn.execute(
+                    "INSERT INTO practice_loops (song_id, label, loop_a, loop_b, reasons_json, passed, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    (song_id, data.get("label"), float(a), float(b), reasons,
+                     datetime.now(timezone.utc).isoformat()),
+                )
+                return cur.lastrowid
+
+        loop_id = await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id}
+
+    @app.get("/api/plugins/note_detect/practice-loops")
+    async def list_practice_loops(request: Request):
+        import anyio
+        song_id = request.query_params.get("songId")
+        if not song_id:
+            raise HTTPException(400, "songId required")
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                rows = conn.execute(
+                    "SELECT id, song_id, label, loop_a, loop_b, reasons_json, passed, created_at "
+                    "FROM practice_loops WHERE song_id = ? ORDER BY loop_a",
+                    (song_id,),
+                ).fetchall()
+                return [{
+                    "id": r["id"], "songId": r["song_id"], "label": r["label"],
+                    "loopA": r["loop_a"], "loopB": r["loop_b"],
+                    "reasons": json.loads(r["reasons_json"]) if r["reasons_json"] else [],
+                    "passed": bool(r["passed"]), "createdAt": r["created_at"],
+                } for r in rows]
+
+        loops = await anyio.to_thread.run_sync(_work)
+        return {"loops": loops}
+
+    @app.post("/api/plugins/note_detect/practice-loops/{loop_id}/passed")
+    async def mark_practice_loop_passed(loop_id: int, request: Request):
+        import anyio
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        passed = 0 if (isinstance(data, dict) and data.get("passed") is False) else 1
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                conn.execute("UPDATE practice_loops SET passed = ? WHERE id = ?", (passed, loop_id))
+
+        await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id, "passed": bool(passed)}
+
+    @app.delete("/api/plugins/note_detect/practice-loops/{loop_id}")
+    async def delete_practice_loop(loop_id: int):
+        import anyio
+        _ensure_plays_db()
+
+        def _work():
+            with _plays_db() as conn:
+                conn.execute("DELETE FROM practice_loops WHERE id = ?", (loop_id,))
+
+        await anyio.to_thread.run_sync(_work)
+        return {"ok": True, "id": loop_id}
 
     @app.post("/api/plugins/note_detect/recording")
     async def save_recording(request: Request):
