@@ -1636,7 +1636,15 @@ function createNoteDetector(options = {}) {
     // then on song-end sweep for the offset that maximizes matched notes (the
     // harness objective) and apply it via window.setAvOffsetMs — so the user
     // never hand-sets the latency number. Persisted/tunable like the others.
-    let autoCalibrate = true;
+    //
+    // Default OFF: the sweep is unreliable on real takes — across back-to-back
+    // sessions it wrote A/V offsets ranging +188ms to -212ms (a ~400ms swing),
+    // which destabilised detection timing (median |timing error| jumped from a
+    // tight ~20ms pre-feature to 300ms+, with many takes matching 0 notes) and
+    // silently clobbered any offset the user set by hand. Detection was stable
+    // and accurate before this feature existed; until the sweep is made robust
+    // it's opt-in, not the default. See docs/note-detect-tuning.md.
+    let autoCalibrate = false;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
