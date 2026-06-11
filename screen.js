@@ -182,6 +182,24 @@ const _ndShared = (window.__ndShared = window.__ndShared || {
     // wrapper so the training-bundle manifest can populate the CDLC
     // File Name field that getSongInfo can't supply on its own.
     currentFilename: null,
+    // Token of the detector instance that currently owns an engine chart slot
+    // for a contained-playback verifier (setContainedChart), plus the engine
+    // SOURCE that slot belongs to. The engine has one chart slot PER source; a
+    // contained chart and the host-song chart contend for the same slot, and so
+    // do two detector instances bound to the SAME source (split-screen). These
+    // cross-instance fields let setContainedChart refuse a second arm on that
+    // source, AND let every instance on that source skip its own host-chart
+    // pushes/drains while another instance holds the contained slot — so a
+    // non-owning instance can't overwrite the contained chart. Instances bound
+    // to a DIFFERENT source use a different slot and are unaffected.
+    // Map of engine sourceId (null = default source 0) -> the detector instance
+    // that owns the contained chart slot on THAT source. Keyed per source because
+    // each source has its own engine chart slot — two instances on the same
+    // source contend (only one may hold the contained slot), but instances on
+    // different sources don't. setContainedChart refuses a second arm on a source
+    // already owned, and every instance on a source skips its own host-chart
+    // pushes/drains while another instance owns that source's contained slot.
+    containedSlotOwners: new Map(),
 });
 // Local aliases — kept for readability of the rest of the file, but
 // they're the same objects as `window.__ndShared.*`.
@@ -2092,6 +2110,46 @@ function createNoteDetector(options = {}) {
     // _ndDrainEngineVerdicts spot a backward jump (drill A-B loop wrap or a
     // manual seek-back) and clear the dedup entries the engine is re-opening.
     let _ndLastPushedPlayhead = 0;
+
+    // ── Contained-playback verifier (setContainedChart / pushContainedPlayhead
+    //    / drainContainedVerdicts / releaseContainedChart) ────────────────────
+    // A non-chart consumer (SlopScale, Chord Sprint) runs its OWN exercise
+    // transport — its own generated chart, scored against the player's real
+    // tuning, independent of the host song's playhead. It can't ride the host
+    // setChart slot (that's owned for the host song; overwriting it would
+    // clobber host scoring), so this is an ADDITIVE path that drives the SAME
+    // engine NoteVerifier with the plugin's chart + the plugin's playhead,
+    // SUSPENDING host-song scoring while armed (one engine chart slot).
+    //
+    // Unlike the host path, verdicts are NOT run through recordJudgment / the
+    // HUD / notedetect:* events — they are buffered RAW and the consumer drains
+    // them and owns judgment. This keeps the contained path a thin verdict pipe
+    // that can't pollute the host detector's stats/diagnostics.
+    let _ndContainedActive = false;
+    // Generation token, bumped on every release/disable (and a fresh arm). An
+    // async setContainedChart / pushContainedPlayhead captures it before its
+    // await and bails on resume if it changed — so a release/disable/newer-arm
+    // that ran during the IPC can't resurrect contained mode or write stale
+    // state (the single engine slot stays consistent with the latest intent).
+    let _ndContainedGen = 0;
+    // Cap the raw verdict buffer so a consumer that stalls drainContainedVerdicts()
+    // can't grow it without bound — keep the most recent, drop the oldest.
+    const _ND_CONTAINED_BUF_MAX = 512;
+    // verdict.id -> the caller's note object, so the caller can map a drained
+    // verdict back to its exercise note. The caller supplies the ids.
+    let _ndContainedById = new Map();
+    // Sanitized tuning ctx (_ndSanitizeVerifyCtx output) the contained chart is
+    // scored under, or null when it tracks the host song's live tuning.
+    let _ndContainedCtx = null;
+    // Raw engine verdicts awaiting drainContainedVerdicts().
+    let _ndContainedVerdictBuf = [];
+    // Last playhead the caller pushed (for backward-jump dedup of the buffer).
+    let _ndContainedLastPlayhead = 0;
+    // True while a contained chart is armed: the host detect loop must not
+    // re-push or drain the host chart, and a host song:loaded must not clobber
+    // the engine slot. Cleared on release, which re-pushes the host chart (so
+    // _ndUsingEngineVerifier is re-derived — no saved copy needed).
+    let _ndHostChartSuspended = false;
     // Whether the desktop engine's polyphonic ML detector (Basic Pitch) is
     // actually active this session — queried once at bridge startup via
     // `audio.isMlNoteDetection()`. false on a downlevel addon or when the ML
@@ -2347,6 +2405,17 @@ function createNoteDetector(options = {}) {
                         processingFrame = true;
                         const gen = sessionGen;
                         try {
+                            // A contained-playback verifier (setContainedChart)
+                            // has taken over the single engine chart slot with
+                            // its own chart + playhead. Host-song scoring is
+                            // suspended; the consumer drives the engine from its
+                            // own tick via pushContainedPlayhead — this loop
+                            // must do nothing that touches the chart slot or
+                            // re-pushes the host chart over the contained one.
+                            // _ndHostChartSuspended covers THIS instance when it
+                            // owns the slot; _ndOtherOwnsOurSlot() covers a
+                            // sibling instance on the same engine source.
+                            if (_ndHostChartSuspended || _ndOtherOwnsOurSlot()) return;
                             // Engine-verifier path: the engine scores the
                             // pushed chart on its own background thread, so
                             // this loop just drains finalized verdicts and
@@ -5563,6 +5632,14 @@ function createNoteDetector(options = {}) {
     }
 
     async function _ndPushChartToBridge() {
+        // A contained-playback verifier owns the engine chart slot. A host
+        // event (song:loaded, enable, the per-tick re-push) must NOT push the
+        // host chart over the contained one, nor wipe the host verifier state
+        // we restore on release — so bail before touching anything. The
+        // restore path (_ndRestoreHostChart) clears the flag first, so its own
+        // re-push proceeds normally. Also bail when a SIBLING instance owns the
+        // contained slot on our source (it isn't suspended on our flag).
+        if (_ndHostChartSuspended || _ndOtherOwnsOurSlot()) return;
         _ndUsingEngineVerifier = false;
         _ndVerifierChartById = new Map();
         _ndVerifierChords = new Map();
@@ -5968,6 +6045,261 @@ function createNoteDetector(options = {}) {
             // and `chartNote` are read by _recordPerStringForChord.
             _recordPerStringForChord({ hit: constituentDetected, chartNote: mcn });
         }
+    }
+
+    // ── Contained-playback verifier implementation ───────────────────────────
+    // True when this build can run a contained verifier: the desktop bridge
+    // exposes the continuous chart-verifier API. Browser / downlevel addon →
+    // false, and setContainedChart returns null so the consumer falls back.
+    function _ndContainedVerifierAvailable() {
+        return usingDesktopBridge && _ndBridgeVerifierAvailable();
+    }
+
+    // True when ANOTHER detector instance owns the contained slot on the SAME
+    // engine source this instance pushes to — so we must NOT touch that shared
+    // slot (re-push our host chart, drain host verdicts) or we'd overwrite its
+    // contained chart. _ndHostChartSuspended only covers the OWNING instance;
+    // this covers the others on that source. A different source = a different
+    // slot = no contention.
+    function _ndOtherOwnsOurSlot() {
+        const owner = _ndShared.containedSlotOwners.get(sourceId);
+        return !!owner && owner !== api;
+    }
+
+    // Park host-song scoring while a contained chart owns the engine slot.
+    // Flips the suspend gate BEFORE any await in the caller, so an interleaving
+    // detect tick already sees it.
+    function _ndSuspendHostChart() {
+        if (_ndHostChartSuspended) return;
+        _ndHostChartSuspended = true;
+        // Park the flag so a straggler tick that slipped past the suspend gate
+        // can't drain host verdicts against the contained chart.
+        _ndUsingEngineVerifier = false;
+    }
+
+    // Restore host-song scoring after a contained chart is released. Forces a
+    // fresh host chart push (the engine slot still holds the contained chart),
+    // re-arming _ndUsingEngineVerifier on a live host song.
+    async function _ndRestoreHostChart() {
+        if (!_ndHostChartSuspended) return;
+        _ndHostChartSuspended = false;
+        // If a sibling instance grabbed the contained slot on our source in the
+        // meantime, don't re-push our host chart over its contained chart.
+        if (_ndOtherOwnsOurSlot()) return;
+        // Force a re-push: the signature guard in the detect loop compares
+        // against _ndVerifierChartSig, which _ndPushChartToBridge resets, so a
+        // direct call here re-pushes the host chart over the contained one.
+        try {
+            await _ndPushChartToBridge();
+        } catch (e) {
+            console.warn('[note_detect] host chart restore failed:', e && e.message ? e.message : e);
+        }
+    }
+
+    // Arm a contained-playback chart: take the engine slot, suspend host
+    // scoring, and push the caller's notes (scored against an optional tuning
+    // ctx — see _ndSanitizeVerifyCtx). Returns true on success, false when
+    // another instance already owns the slot, null on browser/downlevel.
+    async function _ndSetContainedChart(notes, ctx) {
+        if (!_ndContainedVerifierAvailable()) return null;
+        if (!Array.isArray(notes) || notes.length === 0) {
+            // Empty/null → treat as a clear, and report NOT ARMED (false). The
+            // return value is uniformly "is a contained chart now armed?", so a
+            // caller that armed with an empty set falls back rather than believing
+            // contained mode is live with nothing on the slot. Release whenever
+            // THIS instance holds contained state in ANY form — active, or merely
+            // claimed/suspended with a setChart IPC still in flight — so the clear
+            // also CANCELS an in-flight arm (release bumps _ndContainedGen, which
+            // makes that arm's resume bail). Checking _ndContainedActive alone
+            // would miss the in-flight window (active is false until success).
+            if (_ndContainedActive || _ndHostChartSuspended || _ndShared.containedSlotOwners.get(sourceId) === api) {
+                await _ndReleaseContainedChart();
+            }
+            return false;
+        }
+        // One chart slot PER engine source. Refuse if a DIFFERENT instance holds
+        // the slot on OUR source (our own re-arm is fine; a different source is a
+        // different slot, so it doesn't contend).
+        if (_ndOtherOwnsOurSlot()) {
+            return false;
+        }
+
+        const vctx = _ndSanitizeVerifyCtx(ctx);   // null → host live tuning
+        const arrangement = vctx ? vctx.arrangement : currentArrangement;
+        const stringCount = vctx ? vctx.stringCount : currentStringCount;
+        const offsets = vctx ? vctx.offsets.slice(0, stringCount)
+            : tuningOffsets.slice(0, currentStringCount);
+        const containedCapo = vctx ? vctx.capo : capo;
+
+        // Sanitize the caller's notes into engine entries. The caller supplies
+        // a stable `id` per note so a drained verdict maps back to its exercise
+        // note; without one we can't return a usable verdict, so skip it.
+        const entries = [];
+        const byId = new Map();
+        for (const n of (notes || [])) {
+            if (!n || typeof n.id !== 'string' || !n.id) continue;
+            if (!Number.isInteger(n.s) || n.s < 0 || n.s >= stringCount) continue;
+            if (!Number.isInteger(n.f) || n.f < 0) continue;
+            if (byId.has(n.id)) continue;
+            const entry = {
+                id: n.id,
+                t: Number.isFinite(n.t) ? n.t : 0,
+                s: n.s,
+                f: n.f,
+                sus: Number.isFinite(n.sus) ? n.sus : 0,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+            };
+            entries.push(entry);
+            byId.set(n.id, { ...n });
+        }
+        // Nothing well-formed to push — DON'T claim the slot or suspend host
+        // scoring (else the caller believes it's armed while the host keeps
+        // running). Return false so the consumer falls back.
+        if (entries.length === 0) return false;
+
+        // Claim the single engine slot SYNCHRONOUSLY — before any await — so a
+        // concurrent arm on another instance is refused (it sees the owner set),
+        // and stamp a generation so a release/disable/newer-arm during the
+        // setChart IPC invalidates this continuation.
+        const myGen = ++_ndContainedGen;
+        _ndShared.containedSlotOwners.set(sourceId, api);   // claim the slot on our source
+        // Re-arm safety: mark NOT-active until the new chart is confirmed. On a
+        // re-arm by the same instance the previous chart was still active, and a
+        // pushContainedPlayhead during the new setChart IPC would otherwise drain
+        // the OLD chart (the engine slot/byId map don't update until the await
+        // resolves). Cleared here, set true only on success below.
+        _ndContainedActive = false;
+        _ndContainedVerdictBuf = [];
+        // Suspend host scoring BEFORE the setChart await so an interleaving
+        // host detect tick already sees the gate.
+        _ndSuspendHostChart();
+
+        const verifyParams = _ndVerifyParamsFor(arrangement);
+        let ok = null;
+        try {
+            ok = await _ndBridgeSetChart({
+                arrangement,
+                stringCount,
+                tuningOffsets: offsets,
+                capo: containedCapo,
+                // A contained consumer has no host Pitch-tolerance slider —
+                // use the arrangement's verify cents (guitar 50 / bass 60).
+                pitchCheckCents: arrangement === 'bass'
+                    ? _ND_VERIFY_PITCH_CENTS_BASS : _ND_VERIFY_PITCH_CENTS,
+                harmonicSnr: verifyParams.harmonicSnr,
+                fundamentalRatio: verifyParams.fundamentalRatio,
+                presenceRatio: verifyParams.presenceRatio,
+                timingTolerance,
+                notes: entries,
+            });
+        } catch (e) {
+            console.warn('[note_detect] setContainedChart failed:', e && e.message ? e.message : e);
+            ok = null;
+        }
+        // Superseded while the setChart IPC was in flight (a release/disable, or
+        // a newer arm)? Don't resurrect contained mode. If a release ran, OUR
+        // chart may have landed on the engine slot AFTER its host re-push — so
+        // force the host chart back, but ONLY when our slot is now unowned: if a
+        // newer arm (ours) or another instance owns it, leave it to them (don't
+        // clobber). A different-source owner doesn't own OUR slot, so we still
+        // restore.
+        //
+        // Note on two arms racing the SAME source within one IPC round-trip: the
+        // newer owner is whoever called setChart last, and `audio:setChart` rides
+        // a single ordered ipcRenderer.invoke channel, so the newer arm's chart
+        // lands last on the slot. We rely on that ordering rather than a per-source
+        // IPC lock — and in practice the only contained consumer is the default
+        // singleton (one source), so two same-source arms don't occur.
+        if (myGen !== _ndContainedGen) {
+            const slotOwnedHere = !!_ndShared.containedSlotOwners.get(sourceId);
+            if (!slotOwnedHere && !_ndHostChartSuspended) {
+                try { _ndVerifierChartSig = ''; await _ndPushChartToBridge(); } catch (_) {}
+            }
+            return false;
+        }
+        if (ok === null || ok === false) {
+            // Push failed (downlevel / error) — release the slot claim and undo
+            // the suspend so host scoring resumes cleanly.
+            if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
+            await _ndRestoreHostChart();
+            return ok;
+        }
+        _ndContainedActive = true;
+        _ndContainedById = byId;
+        _ndContainedCtx = vctx;
+        _ndContainedVerdictBuf = [];
+        _ndContainedLastPlayhead = 0;
+        // (slot ownership was claimed synchronously above)
+        console.log(`[note_detect] contained verifier active — ${entries.length} notes`
+            + ` (${arrangement}, ${stringCount} strings)`);
+        return true;
+    }
+
+    // Drive the engine clock with the consumer's OWN playhead and stash the
+    // finalized verdicts for drainContainedVerdicts(). `t` is the consumer's
+    // already-corrected exercise time — pushed verbatim (no host avOffset /
+    // latency math; the consumer owns its clock).
+    async function _ndPushContainedPlayhead(t, playing) {
+        // Only the slot owner drives the engine, and only while armed — a stale
+        // instance (lost the owner race, or released) must not advance/drain the
+        // shared verifier against another consumer's chart.
+        if (!_ndContainedActive || _ndShared.containedSlotOwners.get(sourceId) !== api) return;
+        const myGen = _ndContainedGen;
+        const songTime = Number.isFinite(t) ? t : 0;
+        // Backward jump (drill loop / restart): drop buffered verdicts for
+        // notes at/after the new position so they can be re-collected.
+        if (songTime < _ndContainedLastPlayhead - 0.25 && _ndContainedVerdictBuf.length) {
+            _ndContainedVerdictBuf = _ndContainedVerdictBuf.filter(v => {
+                const cn = v && _ndContainedById.get(v.id);
+                return !(cn && Number.isFinite(cn.t) && cn.t >= songTime);
+            });
+        }
+        _ndContainedLastPlayhead = songTime;
+        let verdicts = null;
+        try {
+            verdicts = await _ndBridgeGetVerdicts(songTime, !!playing);
+        } catch (e) {
+            console.warn('[note_detect] contained getNoteVerdicts failed:',
+                e && e.message ? e.message : e);
+            return;
+        }
+        // Released / disabled / re-armed while the getNoteVerdicts IPC was in
+        // flight — drop this result rather than buffer it against stale state.
+        if (myGen !== _ndContainedGen || !_ndContainedActive) return;
+        if (Array.isArray(verdicts) && verdicts.length) {
+            for (const v of verdicts) {
+                if (v && typeof v.id === 'string' && _ndContainedById.has(v.id)) {
+                    _ndContainedVerdictBuf.push(v);
+                }
+            }
+            // Bound the buffer (a stalled/forgetful consumer): keep the most
+            // recent, drop the oldest.
+            if (_ndContainedVerdictBuf.length > _ND_CONTAINED_BUF_MAX) {
+                _ndContainedVerdictBuf.splice(0, _ndContainedVerdictBuf.length - _ND_CONTAINED_BUF_MAX);
+            }
+        }
+    }
+
+    // Return + clear the buffered raw engine verdicts. The consumer owns
+    // judgment; we do NOT run these through recordJudgment / the HUD.
+    function _ndDrainContainedVerdicts() {
+        if (!_ndContainedVerdictBuf.length) return [];
+        const out = _ndContainedVerdictBuf;
+        _ndContainedVerdictBuf = [];
+        return out;
+    }
+
+    // Disarm the contained chart and restore host-song scoring.
+    async function _ndReleaseContainedChart() {
+        if (!_ndContainedActive && !_ndHostChartSuspended) return;
+        _ndContainedGen++;   // invalidate any in-flight arm/push so it can't resurrect contained mode
+        _ndContainedActive = false;
+        _ndContainedById = new Map();
+        _ndContainedCtx = null;
+        _ndContainedVerdictBuf = [];
+        _ndContainedLastPlayhead = 0;
+        if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
+        await _ndRestoreHostChart();
     }
 
     let _chartStateSubscribed = false;
@@ -6438,6 +6770,20 @@ function createNoteDetector(options = {}) {
     function disable(disableOptions) {
         if (!enabled) return;
         enabled = false;
+        // A contained-playback chart can't outlive detection. Clear the engine
+        // slot ownership and un-suspend host scoring synchronously so the next
+        // enable() starts clean — the async host re-push is pointless here
+        // (stopAudio() below clears the bridge, so it would no-op anyway).
+        if (_ndContainedActive || _ndHostChartSuspended) {
+            _ndContainedGen++;   // invalidate any in-flight arm/push so it can't resurrect after disable
+            _ndContainedActive = false;
+            _ndContainedById = new Map();
+            _ndContainedCtx = null;
+            _ndContainedVerdictBuf = [];
+            _ndContainedLastPlayhead = 0;
+            _ndHostChartSuspended = false;
+            if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
+        }
         // Invalidate any CREPE inference currently awaited in
         // processFrame — it captured the previous sessionGen and will
         // bail on mismatch rather than apply post-disable detections.
@@ -7887,6 +8233,39 @@ function createNoteDetector(options = {}) {
             ? { arrangement: _verifyTargetCtx.arrangement, stringCount: _verifyTargetCtx.stringCount,
                 offsets: _verifyTargetCtx.offsets.slice(), capo: _verifyTargetCtx.capo }
             : null),
+
+        // ── Contained-playback verifier ─────────────────────────────────────
+        // A non-chart consumer (SlopScale, Chord Sprint) running its own
+        // exercise transport drives the SAME engine harmonic-comb NoteVerifier
+        // the host song uses — its OWN chart + playhead — for timing-aware,
+        // engine-gated (silence / onset / persistence) per-note verdicts,
+        // instead of the timing-free setVerifyTarget. Host-song scoring is
+        // suspended while a contained chart is armed (one engine chart slot).
+        //
+        // Usage (per the consumer's own RAF tick):
+        //   if (await api.setContainedChart(notes, ctx)) { … }      // arm once (async)
+        //   await api.pushContainedPlayhead(exerciseTime, playing); // each tick (async)
+        //   for (const v of api.drainContainedVerdicts()) { … }     // each tick (sync)
+        //   await api.releaseContainedChart();                      // on stop (async)
+        // `notes`: [{ id, t, s, f, sus?, ho?, po?, b?, sl?, hm? }] — `id` is a
+        // caller-chosen stable key echoed back on each verdict. `ctx`: optional
+        // tuning override (see setVerifyTarget / _ndSanitizeVerifyCtx).
+        // Returns true (armed), false (NOT armed — another instance owns the
+        // slot, or empty/no well-formed notes), or null (browser / downlevel
+        // addon — no engine). On anything but true the consumer should fall back.
+        setContainedChart: (notes, ctx) => _ndSetContainedChart(notes, ctx),
+        // Drive the engine clock with the consumer's exercise playhead and
+        // buffer the verdicts the engine finalizes. `t` is pushed verbatim.
+        pushContainedPlayhead: (t, playing) => _ndPushContainedPlayhead(t, playing),
+        // Return + clear the buffered raw verdicts { id, detected,
+        // detectedSongTime, centsError, snr }. The consumer owns judgment.
+        drainContainedVerdicts: () => _ndDrainContainedVerdicts(),
+        // Disarm the contained chart and restore host-song scoring.
+        releaseContainedChart: () => _ndReleaseContainedChart(),
+        // True when this build can run a contained verifier (desktop bridge
+        // with the chart-verifier API). False on browser / downlevel.
+        isContainedVerifierAvailable: () => _ndContainedVerifierAvailable(),
+
         getStats: () => ({
             hits, misses, streak, bestStreak,
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
