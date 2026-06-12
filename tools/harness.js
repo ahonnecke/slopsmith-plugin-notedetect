@@ -198,6 +198,15 @@ try {
             'chord-hit-ratio':       { type: 'string', default: '0.40' },
             'latency':               { type: 'string', default: '0.080' },
             'frame-size':            { type: 'string', default: '1024' },
+            // Overlapping-analysis-window experiment (BASS_DETECTION.md): feed
+            // the detector a window of `win-size` samples that slides by `hop`
+            // each step, instead of non-overlapping frame-size chunks. This
+            // models a rolling long window — long enough to resolve the low
+            // bass fundamental's pitch, hopped often enough to keep timing
+            // resolution. Default win-size = frame-size, hop = frame-size
+            // (exact legacy behaviour).
+            'win-size':              { type: 'string' },
+            'hop':                   { type: 'string' },
             'sample-rate':           { type: 'string', default: '44100' },
             'arrangement':           { type: 'string', default: 'guitar' },
             'string-count':          { type: 'string', default: '6' },
@@ -271,6 +280,9 @@ if (!ALLOWED_METHODS.has(args.method)) {
 const method        = args.method;
 const sampleRate    = POS_INT(args['sample-rate'], 'sample-rate');
 const frameSize     = POS_INT(args['frame-size'], 'frame-size');
+// Overlapping analysis window (default = legacy non-overlapping frame-size).
+const winSize       = args['win-size'] ? POS_INT(args['win-size'], 'win-size') : frameSize;
+const hop           = args['hop'] ? POS_INT(args['hop'], 'hop') : frameSize;
 const arrangement   = args.arrangement;
 const stringCount   = POS_INT(args['string-count'], 'string-count');
 const avOffsetMs    = NUM(args['av-offset-ms'], 'av-offset-ms');
@@ -463,36 +475,31 @@ async function main() {
     // true — schedule the first tick at TICK_INTERVAL_S instead.
     let nextTickT = TICK_INTERVAL_S;
 
-    for (let i = 0; i < totalFrames; i++) {
-        const start = i * frameSize;
-        // Copy the slice — processFrame may keep references through
-        // async detection methods (CREPE), and reusing the typed view
-        // across frames would corrupt the in-flight buffer. The final
-        // frame is zero-padded to frameSize (since totalFrames uses
-        // ceil); Float32Array zeros on construction, so the loop bound
-        // is the only thing that needs to clamp at samples.length.
-        const frame = new Float32Array(frameSize);
-        const stop = Math.min(start + frameSize, samples.length);
-        for (let j = 0; start + j < stop; j++) frame[j] = samples[start + j];
+    // Slide a `winSize` window forward by `hop` each step (default
+    // winSize=hop=frameSize → legacy non-overlapping behaviour). `end` is the
+    // playhead (newest sample in the window); the detector sees the window
+    // ending there, exactly as a live rolling buffer would.
+    let frameIdx = 0;
+    for (let end = Math.min(winSize, samples.length); ; end += hop, frameIdx++) {
+        const stop = Math.min(end, samples.length);
+        const begin = Math.max(0, stop - winSize);
+        // Copy the slice — processFrame may keep references through async
+        // detection (CREPE). Zero-padded to winSize on construction.
+        const frame = new Float32Array(winSize);
+        for (let j = 0; begin + j < stop; j++) frame[j] = samples[begin + j];
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
-        // Advance the playhead to the END of the frame we just fed
-        // BEFORE checking tick boundaries. The earlier formulation used
-        // the start-of-frame time, which delayed any 0.1 s boundary
-        // landing inside the frame by one whole frame — measurably
-        // shifting checkMisses retirement vs production setInterval.
-        currentTimeS = ((i + 1) * frameSize) / sampleRate;
-        // Tick on every 100 ms boundary the playhead has just crossed.
-        // A while-loop handles the (unlikely) case where frameSize is
-        // larger than TICK_INTERVAL_S worth of samples and the playhead
-        // jumps multiple ticks at once.
+        // Playhead = END of the window just fed (newest sample), so timing
+        // arithmetic matches a live rolling buffer.
+        currentTimeS = stop / sampleRate;
         while (currentTimeS >= nextTickT) {
             detector._harness.tick();
             nextTickT += TICK_INTERVAL_S;
         }
-        if (args.verbose && (i % Math.max(1, Math.round(TICK_INTERVAL_S * 10 * sampleRate / frameSize))) === 0) {
+        if (args.verbose && (frameIdx % Math.max(1, Math.round(TICK_INTERVAL_S * 10 * sampleRate / hop))) === 0) {
             process.stderr.write(`  ..${currentTimeS.toFixed(1)}s\r`);
         }
+        if (stop >= samples.length) break;
     }
     // Final tick — advance time past the last note's miss window so any
     // pending judgments retire.

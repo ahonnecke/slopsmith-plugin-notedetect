@@ -55,12 +55,46 @@ The long window recovers real clean-play notes (+10) without inflating the
 bombed take (+5), and WIDENS the clean-vs-bombed gap (24→29 pts). Precision is
 fine and the score becomes more discriminating. Tool: `tools/bass-recall.js`.
 
+### #3 — naive rolling window is timing-limited; rescue is the right shape (2026-06-12)
+Added `--win-size` / `--hop` to the harness (overlapping analysis window). A
+rolling 16384 window hopped 2048 through the FULL pipeline (matchNotes +
+checkMisses + timing) gives only **87%** (vs 85% baseline, best at av=-300) —
+NOT the isolated 95%. A long rolling window detects each note late and at
+variable time (it resolves somewhere between onset and onset+341 ms), so the
+±100 ms timing matcher rejects many. Non-overlapping is even worse (37%).
+
+Key insight: the isolated 95% used a window CENTERED on each note — and we KNOW
+where each note should be (the chart). So the fix is NOT "make the detection
+window longer" (that wrecks timing). It's a **long-window pitch RE-CHECK
+centered on the expected note time**, run as a rescue when a note is about to
+retire as a miss. Timing stays on the short-window path; the centered long
+window only resolves pitch for about-to-miss notes — recovering the 95% with no
+added detection latency.
+
+### #4 — RESCUE BUILT + validated: 85→95% recall (2026-06-12) ✅
+Implemented in screen.js: a rolling raw-audio buffer (`_rescueBuf`, 32k samples,
+bass-only, fed in processFrame) + `_tryBassRescue()`, called in checkMisses
+before a bass single-note retires. It maps the note's chart time to its audio
+position (inverse of the match clock: hwTime = noteTime − avOffset + latency),
+extracts a 16384 window CENTERED there, and re-runs `_ndConstraintCheckString`
+at the 60c bass gate. A pass = an on-time hit.
+
+Harness (full pipeline, why_ref, av=−186, the natural offset):
+- baseline 85% (pure misses 45) → **with rescue 95%** (pure misses 15).
+Precision (bombed Creep): 56–61% → 69% — rose ~the same as clean (+10 vs +8–13),
+so it recovers REAL played notes, NOT hallucinating; clean-vs-bombed gap holds
+(~26 pts). No added detection latency (re-checks buffered audio). Bass-only;
+153 tests pass.
+
 ## NEXT
-1. Validate #1 on a second take (Gasoline — lower tessitura, denser).
-2. Check the cost: does a 341 ms window cause TEMPORAL SMEARING on fast
-   passages (false matches to neighbour notes, false positives)? Measure
-   precision, not just recall, and test on a dense passage.
-3. Find the recall/precision sweet spot (16384 vs an adaptive window).
+1. Validate live: user plays against the proj/bass-detection build.
+2. Validate on a second clean take (Gasoline — lower tessitura, denser).
+3. The last ~5 points: notes that retire before the rescue window is buffered
+   (very start), and genuinely-coarse pitch reads. Consider widening the bass
+   pitchHitThreshold (the 20c hit gate vs the 60c verify gate currently loses
+   notes that verify but don't hit) and harmonic-sum verify.
+4. Tune: rescue window length (16384 vs adaptive), buffer size, CPU on dense
+   passages (one 16k FFT per retiring bass miss).
 4. Design integration: accumulate a longer buffer specifically for the bass
    pitch-verify path (the per-string `constraintCheckString`), without
    lengthening the onset/timing path. The frameSize setting (callback

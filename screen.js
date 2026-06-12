@@ -2062,6 +2062,20 @@ function createNoteDetector(options = {}) {
     const _chordLastResult = new Map();
     let lastChordTime = -Infinity;
 
+    // Rolling raw audio for the bass long-window pitch RESCUE. The per-frame
+    // band check uses a short (~4096) window for precise timing, but sub-60 Hz
+    // fundamentals need a ~16k window to RESOLVE their pitch (one FFT bin is
+    // ~90c at 55 Hz, coarser than the 60c gate). A long DETECTION window wrecks
+    // timing, so instead we buffer recent audio and, when a bass single note is
+    // about to retire as a miss, re-check its pitch on a long window CENTERED on
+    // its expected time (the chart tells us where it should be). Recovers
+    // correctly-played low notes the short window couldn't resolve.
+    // See BASS_DETECTION.md. Bass-only; cleared on resetScoring.
+    const _RESCUE_BUF_MAX = 32768;   // ~680 ms @ 48 kHz — covers retire lag + half-window
+    const _RESCUE_WIN = 16384;       // ~340 ms — resolves a 55 Hz fundamental
+    let _rescueBuf = new Float32Array(0);
+    let _rescueBufEndT = 0;          // hw time (s) of the newest sample in _rescueBuf
+
     // Tuning — per-instance so panels can be on different songs.
     // tuningOffsets is resized to match the actual string count on enable();
     // the initial 6-element array is a safe default for 6-string guitar
@@ -2904,6 +2918,19 @@ function createNoteDetector(options = {}) {
 
     // ── Frame processing ──────────────────────────────────────────────
     async function processFrame(buffer) {
+        // Append to the rolling raw-audio buffer for the bass miss rescue
+        // (checkMisses). Bass only — guitar's higher fundamentals resolve in
+        // the short window, so it doesn't need (or pay for) this.
+        if (currentArrangement === 'bass' && buffer && buffer.length) {
+            const keep = Math.min(_RESCUE_BUF_MAX, _rescueBuf.length + buffer.length);
+            const nb = new Float32Array(keep);
+            const fromBuf = Math.min(buffer.length, keep);
+            nb.set(buffer.subarray(buffer.length - fromBuf), keep - fromBuf);
+            const remain = keep - fromBuf;
+            if (remain > 0) nb.set(_rescueBuf.subarray(_rescueBuf.length - remain), 0);
+            _rescueBuf = nb;
+            if (hw && hw.getTime) _rescueBufEndT = hw.getTime();
+        }
         let result;
         let detectorUsed;
         // Capture the session generation at frame start. disable()
@@ -3988,6 +4015,37 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Bass long-window miss rescue. A correctly-played low note whose pitch
+    // the short detection window couldn't resolve (band energy was there, the
+    // FFT peak was a bin off) gets a second chance: re-check on a 16k window
+    // CENTERED on where the chart says the note should be. Returns an on-time
+    // hit judgment if the note resolves, else null (real miss). Bass single
+    // notes only. See BASS_DETECTION.md.
+    function _tryBassRescue(cn, noteTime, expectedMidi) {
+        if (currentArrangement !== 'bass' || _rescueBuf.length < _RESCUE_WIN) return null;
+        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+        if (!(sr > 0) || !Number.isFinite(expectedMidi)) return null;
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        // The note's audio sits at hw time = noteTime - avOffset + latency
+        // (inverse of the match clock t = hwTime + avOffset - latency).
+        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const center = _rescueBuf.length - samplesBack;
+        const start = center - (_RESCUE_WIN >> 1);
+        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return null;  // not fully buffered
+        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+        const r = _ndConstraintCheckString(
+            win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
+            tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
+        );
+        if (!r || !r.hit) return null;
+        // Found at its expected position: an on-time hit. The 60c band-verify
+        // gate is the bass detection standard, so report it as on-pitch (the
+        // tighter pitchHitThreshold is too fine for coarse low bins).
+        const detMidi = Number.isFinite(r.centsError) ? expectedMidi + r.centsError / 100 : expectedMidi;
+        return makeMatchedJudgment(cn, noteTime, noteTime, expectedMidi, detMidi, 1, { pitchError: 0, rescued: true });
+    }
+
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4027,9 +4085,12 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                // Bass long-window rescue before conceding the miss: re-check
+                // the note's pitch on a window CENTERED on its expected time.
+                const rescued = _tryBassRescue(chartNote, noteTime, expectedMidi);
                 recordJudgment(
                     key,
-                    makeMissJudgment(chartNote, noteTime, t, expectedMidi)
+                    rescued || makeMissJudgment(chartNote, noteTime, t, expectedMidi)
                 );
             }
         };
@@ -5059,6 +5120,8 @@ function createNoteDetector(options = {}) {
         _diagResetCounters();
         sectionStats = [];
         currentSection = null;
+        _rescueBuf = new Float32Array(0);
+        _rescueBufEndT = 0;
         detectedMidi = -1;
         detectedConfidence = 0;
         detectedString = -1;
