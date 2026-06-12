@@ -8851,6 +8851,24 @@ function createNoteDetector(options = {}) {
         }, 0);
     }
 
+    // Re-arm detection on each play if the user has it on. The end-of-song
+    // handler silent-disables (nothing to listen to once the song stops) AND
+    // the summary modal — which carries the Download Diagnostic button — shows
+    // at that same moment, so without this you must re-toggle Detect for every
+    // track / drill loop after viewing it. Persistent (bound at construction,
+    // survives disable); honours a deliberate toggle-off via detectPreference;
+    // no-op when already enabled, so it can't re-acquire the device on a play
+    // where detection is already running.
+    if (isDefault && _hasAudio && window.slopsmith && typeof window.slopsmith.on === 'function') {
+        try {
+            window.slopsmith.on('song:play', () => {
+                if (detectPreference && !enabled) {
+                    enable().catch((e) => console.warn('[note_detect] re-arm on play failed:', e && e.message ? e.message : e));
+                }
+            });
+        } catch (_) { /* event bus unavailable */ }
+    }
+
     _ndInstances.add(api);
     return api;
 }
