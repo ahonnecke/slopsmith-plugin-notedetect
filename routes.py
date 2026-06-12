@@ -162,6 +162,16 @@ _PLAYS_DB_REL = "notedetect_plays.db"
 _PLAYS_KEEP_PER_SONG = 25   # retain the most recent N full plays per song
 _PLAYS_DB_PATH: Optional[str] = None  # resolved lazily in setup()
 
+# Calibration baseline — a single durable, server-side snapshot of the
+# user's known-good detection config (all detector knobs + the A/V
+# offset). Server-side (not localStorage) so it survives a browser
+# cache-clear / new device, which is exactly the regression mode it
+# guards against: the in-app auto-tune / manual drift silently degrades
+# detection and there was previously nothing to snap back to.
+_BASELINE_REL = "calibration_baseline.json"
+_BASELINE_SCHEMA = "note_detect.baseline.v1"
+_BASELINE_MAX_BYTES = 64 * 1024
+
 _PLAYS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS plays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -506,6 +516,63 @@ def setup(app, context):
 
         plays = await anyio.to_thread.run_sync(_work)
         return {"plays": plays}
+
+    # ── Calibration baseline (deterministic-config snapshot) ──────────────
+    # Save/restore one known-good detection config server-side. The
+    # frontend (settings.html) reads the live config via
+    # noteDetect.applySettings({}) + highway.getAvOffset() to build the
+    # snapshot, and re-applies it on restore. Stored as a single JSON
+    # file in the same resolved writable base as recordings/plays so it
+    # is host-visible in Docker and lands in CONFIG_DIR on the desktop
+    # bundle.
+    @app.post("/api/plugins/note_detect/baseline")
+    async def save_baseline(request: Request):
+        import anyio
+        body = await _read_capped_body(request, _BASELINE_MAX_BYTES)
+        try:
+            data = json.loads(body)
+        except ValueError:
+            raise HTTPException(400, "body must be JSON")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        cfg = data.get("config")
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, "config object required")
+        base = _ensure_out_dir()
+        path = base / _BASELINE_REL
+
+        def _work():
+            payload = {
+                "schema": _BASELINE_SCHEMA,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "config": cfg,
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(path)  # atomic — a concurrent GET never sees a torn file
+            return payload["saved_at"]
+
+        saved_at = await anyio.to_thread.run_sync(_work)
+        log.info("note_detect calibration baseline saved: %s", path)
+        return {"ok": True, "saved_at": saved_at}
+
+    @app.get("/api/plugins/note_detect/baseline")
+    async def get_baseline():
+        import anyio
+        base = _ensure_out_dir()
+        path = base / _BASELINE_REL
+
+        def _work():
+            if not path.exists():
+                return None
+            try:
+                payload = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        payload = await anyio.to_thread.run_sync(_work)
+        return {"baseline": payload}
 
     # ── Practice loops (drill loop manager) ───────────────────────────────
     @app.post("/api/plugins/note_detect/practice-loops")

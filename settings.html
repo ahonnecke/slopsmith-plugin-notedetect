@@ -27,26 +27,57 @@
          render tick (~1.5 s) so a setting changed elsewhere — gear
          popover, manual edit, etc. — reflects without a page reload.
 
-         Apply on a row writes the suggestion via noteDetect.applySettings
-         (or window.setAvOffsetMs for A/V), then resets diagnostic
-         counters so the next round measures cleanly. -->
+         ADVISORY ONLY: the panel displays what each suggestion would
+         change but never writes it. Auto-apply was removed because it
+         was non-deterministic (one take's stats) and optimised a
+         matched-note proxy that silently starved low-frequency recall —
+         the documented regression mode. The user moves a slider by hand
+         and snaps to a saved baseline instead (see the baseline panel).
+         The builders' `apply` closures are intentionally left unused so
+         a future deliberate, reversible actuator can reuse them. -->
     <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
         <div class="flex items-center justify-between mb-2">
             <h4 class="text-sm font-semibold text-gray-300">Auto-tune from current session</h4>
             <span id="nd-at-state" class="text-[10px] uppercase tracking-wider text-gray-500">no data yet</span>
         </div>
         <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
-            Play a song with Detect on, then click Apply on any row with a suggestion. Each row reads a different stat from the running diagnostic and proposes a one-click fix. Each Apply resets the counters so the next round measures cleanly — usually takes 2–3 rounds to converge.
+            <strong class="text-gray-300">Advisory only.</strong> Each row reads a stat from the running diagnostic and shows what it <em>would</em> change — nothing is applied automatically. Auto-applied suggestions are non-deterministic (they depend on the take) and optimise a matched-note proxy that can silently starve low-frequency recall. If a suggestion looks right, move the matching gear-popover slider yourself, then save a baseline below.
         </p>
         <div id="nd-at-rows" class="space-y-2"></div>
-        <button id="nd-at-apply-all"
-                class="w-full bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-4 py-2 rounded-lg text-sm font-semibold text-white transition mt-3"
-                disabled>
-            Apply all
-        </button>
         <p class="text-[10px] text-gray-600 mt-2 leading-relaxed">
             Suggestions appear once there's enough data per row (5 hits for A/V Sync; 20 for window sizing; 30 for method-switch). If you've been getting almost no hits, your A/V offset is far off — reset to 0 on the main slider, play a section, then come back here.
         </p>
+    </div>
+
+    <!-- Calibration baseline — deterministic-config safety net. Saves the
+         current known-good detection config (all knobs + A/V offset) to
+         the server so a later drift (manual fiddling, cache clear, new
+         browser) can be undone in one click. This is the durable store
+         the prior design lacked — detection settings otherwise live only
+         in volatile per-browser localStorage. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-semibold text-gray-300">Calibration baseline</h4>
+            <span id="nd-baseline-state" class="text-[10px] uppercase tracking-wider text-gray-500">none saved</span>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed mb-3">
+            Saves your current detection config — method, pitch/timing windows, confidence, latency, and A/V offset — as one server-side snapshot. When detection later drifts, restore it in one click. Survives a browser cache-clear or a new device.
+        </p>
+        <div class="flex gap-2">
+            <button id="nd-baseline-save" type="button"
+                    class="flex-1 bg-accent hover:bg-accent-light px-3 py-2 rounded-lg text-xs font-semibold text-white transition">
+                Save current as baseline
+            </button>
+            <button id="nd-baseline-restore" type="button"
+                    class="flex-1 bg-dark-600 hover:bg-dark-500 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-2 rounded-lg text-xs font-semibold text-gray-200 transition" disabled>
+                Restore baseline
+            </button>
+        </div>
+        <button id="nd-baseline-reset" type="button"
+                class="w-full mt-2 text-[10px] text-gray-500 hover:text-gray-300 underline">
+            Reset detection settings to defaults
+        </button>
+        <p id="nd-baseline-msg" class="text-[10px] text-gray-600 mt-2 leading-relaxed"></p>
     </div>
 
     <!-- Auto-record toggle. A normal user setting (not advanced): every
@@ -643,60 +674,35 @@
     function renderAutoTune(nd) {
         const rowsEl  = _q('nd-at-rows');
         const stateEl = _q('nd-at-state');
-        const allBtn  = _q('nd-at-apply-all');
         if (!rowsEl) return;
         if (!nd || typeof nd.getDiagnostic !== 'function') {
             rowsEl.innerHTML = '<div class="text-[11px] text-gray-600">Plugin not loaded.</div>';
             if (stateEl) stateEl.textContent = 'plugin not loaded';
-            if (allBtn) { allBtn.disabled = true; allBtn.textContent = 'Apply all'; }
             return;
         }
         const d = nd.getDiagnostic();
         const builders = _AUTO_TUNE_BUILDERS;
         const suggestions = builders.map(b => b(d, nd)).filter(s => s != null);
-        // Stash the suggestions on the rowsEl so the Apply-all handler
-        // can call .apply() without rebuilding them — avoids a tick-
-        // boundary race where the user clicks Apply-all just as the
-        // diagnostic changed.
-        rowsEl._suggestions = suggestions;
 
         const total = (d.summary && d.summary.total) || 0;
         if (stateEl) stateEl.textContent = total === 0 ? 'no data yet' : `${total} events`;
 
-        rowsEl.innerHTML = suggestions.map(s => {
-            const showApply = !s.warnOnly;
-            const applyDisabled = !s.sampleSizeOk || !s.actionable;
-            return `
+        // Advisory render: show current → suggested, never an Apply
+        // control. The `actionable` flag now only styles the suggested
+        // value (whether it differs enough to be worth a manual edit).
+        rowsEl.innerHTML = suggestions.map(s => `
                 <div class="bg-dark-700/60 border border-gray-800 rounded-lg p-2.5" data-key="${s.key}">
                     <div class="flex items-center justify-between mb-1">
                         <span class="text-xs font-semibold text-gray-300">${_esc(s.title)}</span>
                         <span class="text-[10px] uppercase tracking-wider ${s.warning ? 'text-amber-400' : 'text-gray-500'}">${_esc(s.state)}</span>
                     </div>
-                    <div class="text-[11px] text-gray-400 leading-snug mb-2 font-mono">
+                    <div class="text-[11px] text-gray-400 leading-snug font-mono">
                         ${_esc(s.current)} <span class="text-gray-600">→</span> <span class="${s.actionable ? 'text-gray-200' : 'text-gray-500'}">${_esc(s.suggested)}</span>
                         ${s.reasoning ? `<div class="text-[10px] text-gray-600 font-sans mt-1">${_esc(s.reasoning)}</div>` : ''}
                         ${s.warning ? `<div class="text-[10px] text-amber-400 font-sans mt-1">${_esc(s.warning)}</div>` : ''}
                     </div>
-                    ${showApply ? `<button class="nd-at-row-apply text-[11px] px-3 py-1 rounded bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 text-white transition" ${applyDisabled ? 'disabled' : ''}>Apply</button>` : ''}
                 </div>
-            `;
-        }).join('');
-
-        // Wire per-row Apply buttons. Each suggestion stashes its own
-        // .apply() closure; the DOM row carries the key for lookup.
-        rowsEl.querySelectorAll('.nd-at-row-apply').forEach((btn, i) => {
-            // Find the matching suggestion by traversing up to the row.
-            const rowDiv = btn.closest('[data-key]');
-            const key = rowDiv && rowDiv.dataset.key;
-            const sug = suggestions.find(s => s.key === key);
-            if (sug) btn.onclick = () => { sug.apply(); render(); };
-        });
-
-        const actionableCount = suggestions.filter(s => !s.warnOnly && s.actionable).length;
-        if (allBtn) {
-            allBtn.disabled = actionableCount === 0;
-            allBtn.textContent = actionableCount > 0 ? `Apply all (${actionableCount})` : 'Apply all';
-        }
+            `).join('');
     }
 
     function render() {
@@ -832,37 +838,97 @@
     const rfBtn = _q('nd-diag-refresh');
     if (rfBtn) rfBtn.onclick = render;
 
-    // Auto-tune "Apply all" footer button — fires every actionable
-    // suggestion in order. We rebuild the suggestions fresh from the
-    // latest diagnostic instead of trusting the rowsEl-stashed list
-    // (one stale tick between display and click is enough for the
-    // values to have drifted; rebuilding is cheap and avoids
-    // surprising the user with a 30-second-old suggestion).
-    const allBtn = _q('nd-at-apply-all');
-    if (allBtn) {
-        allBtn.onclick = () => {
-            if (allBtn.disabled) return;
-            const nd = window.noteDetect;
-            if (!nd || typeof nd.getDiagnostic !== 'function') return;
-            const d = nd.getDiagnostic();
-            // Reuse the canonical builders list (avoids drift between
-            // renderAutoTune's row set and Apply-all's set — a builder
-            // added to one but not the other would otherwise appear
-            // in the panel but be silently skipped by Apply-all).
-            // Apply in the canonical order. A/V Sync first because it
-            // shifts the entire timing distribution; window-sizing
-            // rows would otherwise propose tolerances for the pre-
-            // shift distribution. Method change last because it can
-            // alter both pure-rate AND pitch-error spread, and we
-            // don't want the earlier rows fighting it. The `warnOnly`
-            // filter inside the loop transparently skips Tuning bias.
-            for (const b of _AUTO_TUNE_BUILDERS) {
-                const s = b(d, nd);
-                if (s && !s.warnOnly && s.actionable) s.apply();
-            }
-            render();
-        };
+    // Auto-tune is advisory only — no "Apply all" actuator. See the
+    // panel comment near #nd-at-rows for why auto-apply was removed.
+
+    // ── Calibration baseline (deterministic-config snapshot) ──────────
+    // The detection knobs the snapshot covers. Read back via
+    // applySettings({}) (empty partial = no-op write that returns the
+    // current, clamped values) plus the A/V offset from the highway.
+    const _BASELINE_FIELDS = ['method', 'timingTolerance', 'pitchTolerance',
+        'timingHitThreshold', 'chordTimingHitThreshold', 'pitchHitThreshold',
+        'chordHitRatio', 'detectionConfidenceMin', 'latencyOffset'];
+    // Factory detection-quality defaults — KEEP IN SYNC with the `let`
+    // initialisers in screen.js (createNoteDetector). `method` is omitted
+    // on purpose: Reset shouldn't override a deliberate method choice
+    // (bass auto-HPS covers the default), and A/V offset is rig-specific
+    // calibration, not a quality default — it's preserved across a Reset
+    // and only moved by Save/Restore baseline.
+    const _DETECTION_DEFAULTS = {
+        timingTolerance: 0.150, pitchTolerance: 50, timingHitThreshold: 0.100,
+        chordTimingHitThreshold: 0.150, pitchHitThreshold: 20, chordHitRatio: 0.40,
+        detectionConfidenceMin: 0.20, latencyOffset: 0.080,
+    };
+    function _readLiveConfig() {
+        const nd = window.noteDetect;
+        if (!nd || typeof nd.applySettings !== 'function') return null;
+        const s = nd.applySettings({});  // read-back: empty partial changes nothing
+        const cfg = {};
+        for (const k of _BASELINE_FIELDS) if (s[k] !== undefined) cfg[k] = s[k];
+        if (window.highway && typeof window.highway.getAvOffset === 'function') {
+            cfg.av_offset_ms = Math.round(window.highway.getAvOffset());
+        }
+        return cfg;
     }
+    function _applyConfig(cfg) {
+        const nd = window.noteDetect;
+        if (!nd || typeof nd.applySettings !== 'function' || !cfg) return;
+        nd.applySettings(cfg);  // clamps + persists to localStorage
+        if (typeof cfg.av_offset_ms === 'number' && typeof window.setAvOffsetMs === 'function') {
+            window.setAvOffsetMs(Math.max(-1000, Math.min(1000, cfg.av_offset_ms)));
+        }
+    }
+    const _baselineMsg = (t, cls) => {
+        const e = _q('nd-baseline-msg');
+        if (e) { e.textContent = t; e.className = `text-[10px] mt-2 leading-relaxed ${cls || 'text-gray-600'}`; }
+    };
+    let _baselineSaved = null;
+    async function _refreshBaseline() {
+        const restoreBtn = _q('nd-baseline-restore');
+        const stateEl = _q('nd-baseline-state');
+        try {
+            const r = await fetch('/api/plugins/note_detect/baseline');
+            const j = await r.json();
+            _baselineSaved = (j && j.baseline) ? j.baseline : null;
+        } catch (e) { _baselineSaved = null; }
+        if (restoreBtn) restoreBtn.disabled = !_baselineSaved;
+        if (stateEl) {
+            stateEl.textContent = _baselineSaved
+                ? `saved ${new Date(_baselineSaved.saved_at).toLocaleString()}`
+                : 'none saved';
+        }
+    }
+    (function initBaseline() {
+        const saveBtn = _q('nd-baseline-save');
+        if (!saveBtn) return;
+        const restoreBtn = _q('nd-baseline-restore');
+        const resetBtn = _q('nd-baseline-reset');
+        saveBtn.onclick = async () => {
+            const cfg = _readLiveConfig();
+            if (!cfg) { _baselineMsg('Plugin not loaded — open a song with Detect on first.', 'text-amber-400'); return; }
+            try {
+                const r = await fetch('/api/plugins/note_detect/baseline', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ config: cfg }),
+                });
+                if (!r.ok) throw new Error((await r.text()) || r.status);
+                _baselineMsg('Baseline saved.', 'text-green-400');
+                _refreshBaseline();
+            } catch (e) { _baselineMsg('Save failed: ' + e.message, 'text-amber-400'); }
+        };
+        if (restoreBtn) restoreBtn.onclick = () => {
+            if (!_baselineSaved || !_baselineSaved.config) return;
+            _applyConfig(_baselineSaved.config);
+            _baselineMsg('Baseline restored — reloading to refresh all sliders…', 'text-green-400');
+            setTimeout(() => location.reload(), 600);  // let the debounced A/V POST land
+        };
+        if (resetBtn) resetBtn.onclick = () => {
+            _applyConfig(_DETECTION_DEFAULTS);
+            _baselineMsg('Detection settings reset to defaults (A/V offset unchanged) — reloading…', 'text-green-400');
+            setTimeout(() => location.reload(), 600);
+        };
+        _refreshBaseline();
+    })();
 
     // Tuning-mode toggle — drives whether the panels below show.
     const tuneCb = _q('nd-tuning-mode');
