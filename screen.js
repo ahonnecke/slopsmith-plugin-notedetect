@@ -1789,6 +1789,7 @@ function createNoteDetector(options = {}) {
     let _scoringStalled = false;      // banner state (not scoring while playing)
     let _wdPlayStartT = 0;            // when the current playing+wantsDetect stretch began
     let scoringWatchdog = null;       // persistent setInterval handle (cleared in destroy)
+    let _healthTrack = null;          // the live input MediaStreamTrack (for dropout telemetry)
 
     // Renderer-side silence gate. CREPE on this engine emits high-
     // confidence stuck-pitch output on silence (interference / induced
@@ -2677,6 +2678,7 @@ function createNoteDetector(options = {}) {
         if (!s || typeof s.getAudioTracks !== 'function') return;
         const track = s.getAudioTracks()[0];
         if (!track) return;
+        _healthTrack = track;   // captured for the dropout-telemetry record
         const markLost = (why) => {
             if (_inputLost || !enabled) return;
             _inputLost = true;
@@ -2747,6 +2749,7 @@ function createNoteDetector(options = {}) {
             console.warn(`[note_detect] scoring watchdog: playing + detect wanted, but not scoring (enabled=${enabled}, cbAgeMs=${now - _lastAudioCbT}) — recovering`);
             try { updateButton(); } catch (_) {}
             try { _showScoringStallBanner(); } catch (_) {}
+            try { _logInputDropout(now - _lastAudioCbT); } catch (_) {}
         }
         if (now - _lastInputRecover >= 4000) {
             _lastInputRecover = now;
@@ -2791,8 +2794,53 @@ function createNoteDetector(options = {}) {
         if (banner) banner.remove();
     }
 
+    // Dropout telemetry — see INPUT_DROPOUT.md. Captures the discriminating
+    // state at the moment scoring went dead so a single occurrence settles
+    // rig-vs-program WITHOUT a replay. The key fields:
+    //   audio_ctx_state  'suspended'/'interrupted' → the OS/browser parked the
+    //                    context (rig/OS: backgrounded tab, power mgmt, audio
+    //                    focus). 'running' → the graph is alive but starved or
+    //                    the device dropped — look at the track fields.
+    //   track_ready      'ended'/track_muted true → the device stopped
+    //                    delivering (rig: USB/driver/Scarlett). 'live' + ctx
+    //                    'running' + processing_frame/heap high → main-thread
+    //                    starvation of the deprecated ScriptProcessor (program).
+    // Streamed to the live JSONL (correlates with the session) + console.
+    function _logInputDropout(sinceCbMs) {
+        let heapMb = null;
+        try {
+            if (typeof performance !== 'undefined' && performance.memory) {
+                heapMb = Math.round(performance.memory.usedJSHeapSize / 1048576);
+            }
+        } catch (_) {}
+        const rec = {
+            type: 'input_dropout',
+            schema: 'note_detect.live.input_dropout.v1',
+            ts: new Date().toISOString(),
+            plugin_version: _ND_VERSION,
+            since_last_cb_ms: sinceCbMs,
+            enabled,
+            audio_ctx_state: (audioCtx && audioCtx.state) || null,
+            sample_rate: (audioCtx && audioCtx.sampleRate) || null,
+            frame_size: frameSize,
+            processing_frame: processingFrame,                 // heavy frame in flight?
+            rec_armed: !!(_recArmed || _recArmedForTraining),  // parallel WAV capture running?
+            using_bridge: usingDesktopBridge,
+            arrangement: currentArrangement || null,
+            track_ready: (_healthTrack && _healthTrack.readyState) || null,
+            track_muted: _healthTrack ? !!_healthTrack.muted : null,
+            track_enabled: _healthTrack ? !!_healthTrack.enabled : null,
+            heap_mb: heapMb,
+        };
+        try { console.warn('[note_detect] input_dropout', JSON.stringify(rec)); } catch (_) {}
+        // Persist to the session's JSONL when a live session is active (the
+        // server route just appends the line, so a non-judgment record is fine).
+        try { if (_liveSessionId) _streamLiveJudgment(rec); } catch (_) {}
+    }
+
     function stopAudio() {
         _inputLost = false;
+        _healthTrack = null;
         stopLevelMeter();
         stopBridgeLevelMeter();
         // NB: do NOT clear scoringWatchdog here — it's persistent (bound at
