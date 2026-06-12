@@ -2497,7 +2497,29 @@ function createNoteDetector(options = {}) {
                         : 'Microphone access is not available in this browser. Use Chrome or Edge.';
                     throw new Error(msg);
                 }
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                // Retry transient getUserMedia failures before giving up.
+                // A single failure here makes startAudio() return false,
+                // which the restartAudio chain treats as a hard disable —
+                // silently turning Detect off. Diagnostic logs showed ~1/3
+                // of sessions died this way (session_start written, zero
+                // notes scored): the device is briefly still held while the
+                // PREVIOUS song's stream tears down on a fast switch, or a
+                // settings-slider restartAudio races its own teardown. Those
+                // clear in a few hundred ms. Permission denial
+                // (NotAllowedError) will never recover, so fail fast on it.
+                let _gumErr = null;
+                for (let _attempt = 0; _attempt < 3; _attempt++) {
+                    try {
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                        _gumErr = null;
+                        break;
+                    } catch (_e) {
+                        _gumErr = _e;
+                        if (_e && _e.name === 'NotAllowedError') break;
+                        if (_attempt < 2) await new Promise((r) => setTimeout(r, 250 * (_attempt + 1)));
+                    }
+                }
+                if (_gumErr) throw _gumErr;
             }
 
             // Acquire the context independently — a caller can supply
