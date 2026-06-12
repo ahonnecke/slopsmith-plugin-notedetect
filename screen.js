@@ -2869,7 +2869,18 @@ function createNoteDetector(options = {}) {
         let levelBuf = null;
         let levelBufSize = 0;
         const tick = () => {
-            if (!levelAnalyser) return;
+            if (!levelAnalyser) {
+                // Audio is mid-restart — stopAudio() nulled the analyser (a
+                // settings-slider restartAudio, a device re-acquire, the
+                // getUserMedia retry). Keep the RAF ALIVE and poll: returning
+                // here without rescheduling killed the meter permanently, so
+                // the input-level bar stayed frozen after audio recovered even
+                // though detection was running. stopLevelMeter() still cancels
+                // it on a real disable, and startLevelMeter() cancels-then-
+                // restarts, so this can't leak a second loop.
+                levelRaf = requestAnimationFrame(tick);
+                return;
+            }
             const fftSize = levelAnalyser.fftSize;
             if (!levelBuf || levelBufSize !== fftSize) {
                 levelBuf = new Float32Array(fftSize);
