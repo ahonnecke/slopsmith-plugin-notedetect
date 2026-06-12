@@ -4031,14 +4031,26 @@ function createNoteDetector(options = {}) {
         const noteHwTime = noteTime - avOffsetSec + latencyOffset;
         const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
         const center = _rescueBuf.length - samplesBack;
-        const start = center - (_RESCUE_WIN >> 1);
-        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return null;  // not fully buffered
-        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
-        const r = _ndConstraintCheckString(
-            win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
-            tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
-        );
-        if (!r || !r.hit) return null;
+        // SEARCH a small range around the expected center rather than trusting
+        // a single position: the live audio path has processing latency the
+        // harness doesn't, so the stamp drifts ~50-130 ms, and the per-take
+        // A/V offset is approximate. Scanning ±120 ms makes the rescue robust
+        // to both — it finds the note's true position. The window only matches
+        // the EXPECTED pitch, so scanning doesn't admit wrong notes.
+        const SEARCH = Math.round(0.12 * sr);
+        const STEP = Math.round(0.04 * sr);
+        let r = null;
+        for (let d = -SEARCH; d <= SEARCH; d += STEP) {
+            const start = center + d - (_RESCUE_WIN >> 1);
+            if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) continue;
+            const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+            const cand = _ndConstraintCheckString(
+                win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
+                tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
+            );
+            if (cand && cand.hit) { r = cand; break; }
+        }
+        if (!r) return null;
         // Found at its expected position: an on-time hit. The 60c band-verify
         // gate is the bass detection standard, so report it as on-pitch (the
         // tighter pitchHitThreshold is too fine for coarse low bins).
