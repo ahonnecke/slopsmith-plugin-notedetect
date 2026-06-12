@@ -5475,11 +5475,16 @@ function createNoteDetector(options = {}) {
         if (audio) {
             try { await audio.play(); } catch (_) { /* autoplay may reject; the loop still runs once playing */ }
         }
+
+        // Drill is pointless without detection running — and the count-in
+        // click is scheduled on the detection AudioContext, so enable BEFORE
+        // playing it. On a cold start (detection off, e.g. right after the
+        // song-end auto-disable) the context doesn't exist yet, so a count-in
+        // here would be silently dropped — the "lead not there" bug.
+        if (!enabled) { try { await enable(); } catch (_) {} }
+
         // Count-in click over the first entry's lead-in too (not just on wraps).
         _drillPlayCountIn();
-
-        // Drill is pointless without detection running.
-        if (!enabled) { try { await enable(); } catch (_) {} }
 
         // Bind our OWN loop:restart listener so each pass is scored even if
         // the foundation's drillEnabled sync doesn't flip for a plugin loop.
@@ -8275,10 +8280,22 @@ function createNoteDetector(options = {}) {
         const total = hits + misses;
         if (total < 5) return false;
 
+        const accuracy = Math.round((hits / total) * 100);
+
+        // A downstream consumer (the coaching plugin) owns the post-play
+        // surface. When it sets window.slopsmithSuppressNoteDetectSummary,
+        // skip our full-screen modal entirely but STILL publish the session
+        // so the consumer gets the data. The one affordance worth keeping —
+        // the diagnostic download — moves into that panel, reachable via the
+        // exposed window.noteDetect.downloadDiagnostic(). Read live so load
+        // order between the two plugins doesn't matter.
+        if (typeof window !== 'undefined' && window.slopsmithSuppressNoteDetectSummary === true) {
+            publishToJournal(accuracy);
+            return false;
+        }
+
         const existing = instanceRoot.querySelector('.nd-summary-overlay');
         if (existing) existing.remove();
-
-        const accuracy = Math.round((hits / total) * 100);
 
         let sectionHtml = '';
         if (sectionStats.length > 0) {
