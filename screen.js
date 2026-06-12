@@ -1775,6 +1775,21 @@ function createNoteDetector(options = {}) {
     let _inputLost = false;
     let _lastInputRecover = 0;
 
+    // Scoring watchdog. The `mute`/`ended` track events above don't fire for
+    // every dead-input case — a USB interface (Scarlett) can keep the track
+    // "live" while the AudioContext stalls and the ScriptProcessor stops
+    // calling back, so the detector logs a session_start and then scores
+    // NOTHING (not even misses, since the whole judgment path is driven by
+    // the audio callback). That's the "played a whole song into the void"
+    // failure. This watchdog catches it directly: it stamps every audio
+    // callback and, while detection is on and the song is playing, alerts +
+    // auto-reconnects within ~2s if the callbacks stop — so a dead input is
+    // visible in seconds, not at the end-of-song summary.
+    let _lastAudioCbT = 0;            // Date.now() of the last onaudioprocess
+    let _scoringStalled = false;      // banner state (not scoring while playing)
+    let _wdPlayStartT = 0;            // when the current playing+wantsDetect stretch began
+    let scoringWatchdog = null;       // persistent setInterval handle (cleared in destroy)
+
     // Renderer-side silence gate. CREPE on this engine emits high-
     // confidence stuck-pitch output on silence (interference / induced
     // signal even with the guitar muted); the engine's verifier accepts
@@ -2586,6 +2601,10 @@ function createNoteDetector(options = {}) {
             pendingBuffer = null;
 
             processor.onaudioprocess = (e) => {
+                // Heartbeat: stamp every callback (even when disabled) so the
+                // scoring watchdog can tell a stalled audio graph from a quiet
+                // instrument. Cheap; runs ~20×/s.
+                _lastAudioCbT = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
                 if (!enabled) return;
                 const input = e.inputBuffer.getChannelData(0);
                 const prev = accumBuffer;
@@ -2686,10 +2705,99 @@ function createNoteDetector(options = {}) {
         } catch (_) { /* track event API unavailable */ }
     }
 
+    // Scoring watchdog — see the `_lastAudioCbT` declaration for the why.
+    // Bound ONCE at construction (default singleton), NOT inside startAudio:
+    // the worst failure (a getUserMedia race that makes startAudio return
+    // false and silently turns Detect off — screen.js comment near line 2541,
+    // "~1/3 of sessions died this way: session_start written, zero scored")
+    // happens precisely when startAudio never succeeds, so a watchdog created
+    // there would never run for it. Instead this keys on intent: the user
+    // wants detection (detectPreference) and the song is playing, but nothing
+    // is scoring. That single condition covers BOTH a never-started detector
+    // and a mid-play input drop, and recovers each the right way.
+    function _bindScoringWatchdog() {
+        if (!isDefault || scoringWatchdog) return;
+        scoringWatchdog = setInterval(_scoringWatchdogTick, 1000);
+        // Don't pin the Node event loop open in tests (no-op in the browser).
+        if (scoringWatchdog && typeof scoringWatchdog.unref === 'function') scoringWatchdog.unref();
+    }
+
+    function _scoringWatchdogTick() {
+        const now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+        const playing = !!(window.slopsmith && window.slopsmith.isPlaying);
+        // Only meaningful while the song is playing AND the user wants
+        // detection on. Otherwise reset the play-stretch clock and clear.
+        if (!playing || !detectPreference) { _wdPlayStartT = 0; _clearScoringStall(); return; }
+        if (!_wdPlayStartT) _wdPlayStartT = now;
+        // Grace: let enable()/startAudio come up after Play before judging.
+        if (now - _wdPlayStartT < 2500) return;
+        // Healthy = detection enabled AND the audio callback fired recently
+        // (covers "running and frames flowing"). The bridge path doesn't use
+        // onaudioprocess, so treat enabled-on-bridge as healthy — its own
+        // input handling owns that case.
+        const cbFresh = (now - _lastAudioCbT) < 1800;
+        if (enabled && (usingDesktopBridge || cbFresh)) { _clearScoringStall(); return; }
+        // The user wants detection, the song is playing, but we're not
+        // scoring. Surface it loudly NOW (seconds in, not at song end) and
+        // auto-recover the right way: re-enable if Detect fell off, or
+        // re-acquire the input if it's enabled-but-dead. Throttled.
+        if (!_scoringStalled) {
+            _scoringStalled = true;
+            _inputLost = true;
+            console.warn(`[note_detect] scoring watchdog: playing + detect wanted, but not scoring (enabled=${enabled}, cbAgeMs=${now - _lastAudioCbT}) — recovering`);
+            try { updateButton(); } catch (_) {}
+            try { _showScoringStallBanner(); } catch (_) {}
+        }
+        if (now - _lastInputRecover >= 4000) {
+            _lastInputRecover = now;
+            if (!enabled) {
+                console.warn('[note_detect] scoring watchdog: re-enabling detection');
+                try { Promise.resolve(enable()).catch(() => {}); } catch (_) {}
+            } else {
+                console.warn('[note_detect] scoring watchdog: re-acquiring input');
+                try { restartAudio(); } catch (_) {}
+            }
+        }
+    }
+
+    function _clearScoringStall() {
+        if (!_scoringStalled) return;
+        _scoringStalled = false;
+        _inputLost = false;
+        try { updateButton(); } catch (_) {}
+        try { _hideScoringStallBanner(); } catch (_) {}
+    }
+
+    // A loud, unmissable banner the moment scoring goes dead mid-play — so a
+    // dropped input is caught in seconds instead of at the end-of-song
+    // summary. Self-heals (auto-reconnect above); a manual button is offered
+    // too in case the device needs a kick.
+    function _showScoringStallBanner() {
+        let banner = instanceRoot.querySelector('.nd-scoring-stall');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.className = 'nd-scoring-stall fixed top-3 left-1/2 -translate-x-1/2 z-[300] flex items-center gap-3 bg-red-900/95 border-2 border-red-500 rounded-xl px-4 py-2.5 shadow-2xl text-sm';
+            banner.innerHTML = '<span class="text-red-100 font-semibold">⚠ Detect is ON but not hearing your instrument — input dropped. Reconnecting…</span>'
+                + '<button class="nd-scoring-stall-retry px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs text-white">Reconnect now</button>';
+            instanceRoot.appendChild(banner);
+            const retry = banner.querySelector('.nd-scoring-stall-retry');
+            if (retry) retry.onclick = () => { try { restartAudio(); } catch (_) {} };
+        }
+        banner.style.display = '';
+    }
+
+    function _hideScoringStallBanner() {
+        const banner = instanceRoot.querySelector('.nd-scoring-stall');
+        if (banner) banner.remove();
+    }
+
     function stopAudio() {
         _inputLost = false;
         stopLevelMeter();
         stopBridgeLevelMeter();
+        // NB: do NOT clear scoringWatchdog here — it's persistent (bound at
+        // construction, cleared in destroy). restartAudio() routes through
+        // stopAudio, and the watchdog is exactly what drives that recovery.
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
         pendingBuffer = null;
         // Bridge path doesn't own the JUCE engine — leave audio
@@ -6940,6 +7048,8 @@ function createNoteDetector(options = {}) {
         _unbindAutoRecord();
         _calUnbindEvents();
         _liveUnbindEvents();
+        if (scoringWatchdog) { clearInterval(scoringWatchdog); scoringWatchdog = null; }
+        try { _clearScoringStall(); } catch (_) {}
         // Discard any unsaved recording state — destroying the instance
         // shouldn't write a half-captured WAV (or fire off an upload).
         _recArmed = false;
@@ -8737,6 +8847,19 @@ function createNoteDetector(options = {}) {
         // bind from enableImpl() and unbind from destroy().
         _bindEndOfSongEvents: _endOfSongBindEvents,
         _unbindEndOfSongEvents: _endOfSongUnbindEvents,
+        // Scoring-watchdog test hooks. Drive one tick under controlled
+        // timing and read the stall flag, so the "playing + detect wanted
+        // but not scoring" alarm is verifiable without a real audio graph
+        // or wall-clock waits. Production never calls these.
+        _scoringWatchdogTick,
+        _isScoringStalled: () => _scoringStalled,
+        _wdProbe: (o) => {
+            o = o || {};
+            if (o.playStartT != null) _wdPlayStartT = o.playStartT;
+            if (o.lastCbT != null) _lastAudioCbT = o.lastCbT;
+            if (o.lastRecover != null) _lastInputRecover = o.lastRecover;
+            if (o.detectPref != null) detectPreference = !!o.detectPref;
+        },
         // Chart-state sync test hooks — same rationale as the drill
         // hooks. _getChartState lets tests assert the closure-private
         // currentArrangement/currentStringCount/tuningOffsets/capo
@@ -8885,6 +9008,12 @@ function createNoteDetector(options = {}) {
             });
         } catch (_) { /* event bus unavailable */ }
     }
+
+    // Persistent scoring watchdog: surface "playing + detect wanted but not
+    // scoring" within seconds instead of at the end-of-song summary. Bound
+    // here (not in startAudio) so it also catches a detector that never came
+    // up. Default singleton only.
+    try { _bindScoringWatchdog(); } catch (_) {}
 
     _ndInstances.add(api);
     return api;
