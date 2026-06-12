@@ -5006,11 +5006,23 @@ function createNoteDetector(options = {}) {
         } else if (enabled) {
             detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
             detectBtn.textContent = 'Detect \u2713';
+        } else if (detectPreference) {
+            // Detection is the user's active preference but momentarily
+            // idle \u2014 no audio flowing (between songs, or the song just
+            // ended and the end-of-song handler called disable() to
+            // finalize the session). Distinct dim-green "armed" state so
+            // the grey off-button isn't misread as "detection turned
+            // itself off mid-play" \u2014 it re-enables on the next play.
+            detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-green-900/20 rounded-lg text-xs text-green-400/60 transition';
+            detectBtn.textContent = 'Detect \u2713 idle';
         } else {
+            // Truly off \u2014 the user toggled detection off.
             detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
             detectBtn.textContent = 'Detect';
         }
-        if (gearBtn) gearBtn.classList.toggle('hidden', !enabled);
+        // Keep the gear reachable while armed-idle too, so settings are
+        // adjustable between songs without forcing a re-enable.
+        if (gearBtn) gearBtn.classList.toggle('hidden', !(enabled || detectPreference));
     }
 
     // ── Reset / enable / disable / destroy ────────────────────────────
@@ -6851,6 +6863,14 @@ function createNoteDetector(options = {}) {
                 latency_offset_s: latencyOffset,
                 input_gain: inputGain,
                 channel: selectedChannel,
+                // The A/V offset is owned by the highway, not this
+                // closure — read it live, same as the streamed
+                // session_start row (see `avOffsetMs` near line 1859).
+                // It was previously omitted here, so the downloaded
+                // diagnostic JSON reported `av_offset_ms: null` while the
+                // live log had the real value — masking offset drift in
+                // exactly the artifact used to debug it.
+                av_offset_ms: (hw && hw.getAvOffset) ? Math.round(hw.getAvOffset()) : null,
             },
             summary: {
                 hits, misses, total,
@@ -7601,7 +7621,12 @@ function createNoteDetector(options = {}) {
                     },
                     settings: {
                         detection_method:        detectionMethod,
-                        av_offset_ms:            Math.round(latencyOffset * 1000),
+                        // Real A/V offset from the highway. This previously
+                        // read `latencyOffset * 1000` — mislabelling the
+                        // detection-latency knob as the A/V offset in the
+                        // recording sidecar.
+                        av_offset_ms:            (hw && hw.getAvOffset) ? Math.round(hw.getAvOffset()) : null,
+                        latency_offset_ms:       Math.round(latencyOffset * 1000),
                         timing_tolerance_ms:     Math.round(timingTolerance * 1000),
                         timing_hit_threshold_ms: Math.round(timingHitThreshold * 1000),
                         pitch_tolerance_cents:   pitchTolerance,
