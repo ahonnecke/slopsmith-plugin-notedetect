@@ -3988,21 +3988,6 @@ function createNoteDetector(options = {}) {
         }
     }
 
-    // Clean accuracy: hits over (hits + PLAYER faults). Player faults are
-    // notes you played wrong — late/early/sharp/flat. Unheard notes (`pure`
-    // — the detector couldn't resolve the pitch, dominant on bass) and
-    // partial chords are NOT counted against you: a note the tool never
-    // heard isn't a note you missed. So a clean play scores 100 even though
-    // raw hits/total sits at ~70 on bass. The raw rate is still surfaced as
-    // "detector heard" in the coaching panel.
-    function _cleanAccuracyPct() {
-        const playerFaults = _diagBreakdown.early + _diagBreakdown.late
-            + _diagBreakdown.sharp + _diagBreakdown.flat;
-        const denom = hits + playerFaults;
-        if (denom <= 0) return hits > 0 ? 100 : 0;
-        return Math.round((hits / denom) * 100);
-    }
-
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4734,7 +4719,7 @@ function createNoteDetector(options = {}) {
         const flashEl = instanceRoot.querySelector('.nd-flash-overlay');
 
         if (accEl && total > 0) {
-            const accuracy = _cleanAccuracyPct();
+            const accuracy = Math.round((hits / total) * 100);
             const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
             accEl.textContent = accuracy + '%';
             accEl.style.color = color;
@@ -8152,7 +8137,7 @@ function createNoteDetector(options = {}) {
         const existing = instanceRoot.querySelector('.nd-summary-overlay');
         if (existing) existing.remove();
 
-        const accuracy = _cleanAccuracyPct();
+        const accuracy = Math.round((hits / total) * 100);
 
         let sectionHtml = '';
         if (sectionStats.length > 0) {
@@ -8304,7 +8289,7 @@ function createNoteDetector(options = {}) {
         isEnabled: () => enabled,
         getStats: () => ({
             hits, misses, streak, bestStreak,
-            accuracy: _cleanAccuracyPct(),
+            accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
             sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
         }),
         // The user's most-recently-expressed preference: did they last
