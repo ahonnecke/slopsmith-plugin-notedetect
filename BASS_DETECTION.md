@@ -86,8 +86,23 @@ so it recovers REAL played notes, NOT hallucinating; clean-vs-bombed gap holds
 (~26 pts). No added detection latency (re-checks buffered audio). Bass-only;
 153 tests pass.
 
+### #5 — rescue searches ±120 ms: robust to live drift (2026-06-12) ✅
+First live play of the rescue scored 81% on a denser take, vs 95% in the
+harness on the SAME audio/settings — the live audio path has processing latency
+the harness lacks, so the buffer time-stamp drifts ~50-130 ms and the rescue
+window lands on the neighbour in fast passages. Fix: the rescue now SCANS
+±120 ms (40 ms steps) around the computed center and rescues if the expected
+pitch resolves anywhere — absorbing the drift and the approximate per-take A/V
+offset. Each window only checks the CHARTED pitch, so scanning can't admit a
+wrong note. Harness: this take 95→99% and now offset-robust (99% at av -150
+AND -240); why_ref 95→97%; bombed Creep 69→72% (rose less than clean, so still
+recovering real notes). The build correctly surfaced the user's one real miss
+(A-string fret 7, first instance miss / second hit) — which is the point:
+removing the detector's ~30% false misses makes a REAL miss stand out instead
+of drowning in noise.
+
 ## NEXT
-1. Validate live: user plays against the proj/bass-detection build.
+1. Validate live: user plays against the proj/bass-detection build (expect ~97%+).
 2. Validate on a second clean take (Gasoline — lower tessitura, denser).
 3. The last ~5 points: notes that retire before the rescue window is buffered
    (very start), and genuinely-coarse pitch reads. Consider widening the bass
