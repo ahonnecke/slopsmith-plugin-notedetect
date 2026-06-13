@@ -107,4 +107,10 @@ Record findings below as they come in.
 
 ## Findings
 
-_(none yet — awaiting the first captured `input_dropout` record)_
+- **2026-06-12 — USB autosuspend RULED OUT.** The Scarlett Solo USB is node
+  `1-2` (vendor `1235`, product `8211`) and its `power/control` is **`on`**, not
+  `auto` — the kernel is not autosuspending it. (Consistent with the prior:
+  autosuspend drops at idle, not mid-stream.) The `auto` nodes in the bare list
+  are other devices. → Rig power-management is not the cause; the remaining
+  forks are OS audio-focus/context-suspend, a device-level drop, or our own
+  main-thread stall — all of which the `input_dropout` record distinguishes.
