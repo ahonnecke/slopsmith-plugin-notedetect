@@ -5765,9 +5765,10 @@ function createNoteDetector(options = {}) {
         // here would be silently dropped — the "lead not there" bug.
         if (!enabled) { try { await enable(); } catch (_) {} }
 
-        // Beat-locked click across the first loop iteration (lead-in included),
-        // same as on each wrap.
-        _drillScheduleClicks();
+        // Compute the loop's beat grid; the HUD tick fires a click on each beat
+        // the playhead crosses (lead-in included). Playhead-driven so a pause
+        // silences it and there's no stutter from re-scheduling.
+        _drillInitBeats();
 
         // Bind our OWN loop:restart listener so each pass is scored even if
         // the foundation's drillEnabled sync doesn't flip for a plugin loop.
@@ -5829,10 +5830,8 @@ function createNoteDetector(options = {}) {
             // Held below the goal — show WHICH notes were missed this pass and HOW.
             _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
         }
-        // New loop iteration begins — (re)schedule the beat-locked click across
-        // the whole loop at the CURRENT speed (after any rung change above), so
-        // the player has the pulse through the lead-in and the drilled bars.
-        _drillScheduleClicks();
+        // Click cursor resets in _drillConductorTick on the playhead's backward
+        // jump — no scheduling here (the tick owns the metronome now).
     }
 
     // Detect a loop wrap from the chart clock (a backward jump) — the
@@ -5846,46 +5845,64 @@ function createNoteDetector(options = {}) {
         if (!_hw || !_hw.getTime) return;
         const ct = _hw.getTime();
         if (_ndDrillLastChartT > 0 && ct >= 0 && ct < _ndDrillLastChartT - 1.0) {
-            // Backward jump = wrap. Skip if a loop:restart already scored it.
+            // Backward jump = wrap. Reset the click cursor to the loop start so
+            // the metronome re-fires across the new iteration.
+            _drillBeatIdx = 0;
+            // Skip if a loop:restart already scored it.
             if (_ndPerfNow() - _ndDrillLastScoredPerf > 1200) _drillConductorOnWrap();
+        } else {
+            // Steady playback (incl. lead-in): fire any beats now due. On pause
+            // the playhead freezes → nothing crosses → no click (no backlog).
+            const speed = (drillConductorLadder && drillConductorLadder[drillConductorRung]) || 1;
+            _drillScheduleDueClicks(ct, speed);
         }
         _ndDrillLastChartT = ct;
     }
 
-    // Beat-locked click for the WHOLE drill loop (lead-in included), scheduled
-    // on the detection AudioContext at each loop start. Best-effort — silent
-    // if no context. Prefers the song's real beat grid (highway.getBeats) so
-    // the click stays on the song's pulse; falls back to evenly-spaced at the
-    // local tempo. Beat wall-clock positions are stretched by the current
-    // drill speed so they line up with slowed playback. Re-scheduled every
-    // wrap (after any rung speed change) so it tracks the current tempo.
-    function _drillScheduleClicks() {
-        if (!audioCtx || !drillConductorRange) return;
-        try {
-            const _hw = resolveHw();
-            const { loopStart, loopEnd, judgeStart } = drillConductorRange;
-            const speed = (drillConductorLadder && drillConductorLadder[drillConductorRung]) || 1;
-            const t0 = audioCtx.currentTime + 0.06;          // ≈ when loop audio restarts at loopStart
-            const toWall = (bt) => t0 + (bt - loopStart) / (speed || 1);
+    // ── Beat-locked drill metronome (PLAYHEAD-DRIVEN) ──────────────────
+    // A click on every beat across the whole loop (lead-in included). Driven
+    // by the chart playhead via _drillConductorTick, NOT pre-scheduled on the
+    // audio clock — the previous schedule-ahead version kept clicking through
+    // a pause (audio clock runs while playback is stopped) and stuttered when
+    // re-scheduled each wrap (overlapping click trains). Playhead-driven fixes
+    // both: when playback pauses the playhead freezes, so no beat is crossed
+    // and no click fires; each beat is scheduled exactly once via a cursor.
+    let _drillBeatTimes = [];     // beat chart-times within [loopStart, loopEnd]
+    let _drillBeatIdx = 0;        // cursor: next beat not yet scheduled
+    const _CLICK_LOOKAHEAD_S = 0.12;  // chart-seconds to schedule ahead (covers the 33ms HUD tick)
 
-            let beatTimes = [];
-            const beats = (_hw && _hw.getBeats) ? _hw.getBeats() : null;
-            if (Array.isArray(beats) && beats.length) {
-                for (const b of beats) {
-                    const bt = (typeof b === 'number') ? b : (b && Number.isFinite(b.time) ? b.time : null);
-                    if (bt != null && bt >= loopStart - 1e-6 && bt <= loopEnd) beatTimes.push(bt);
-                }
+    function _drillInitBeats() {
+        _drillBeatTimes = [];
+        _drillBeatIdx = 0;
+        if (!drillConductorRange) return;
+        const _hw = resolveHw();
+        const { loopStart, loopEnd, judgeStart } = drillConductorRange;
+        const beats = (_hw && _hw.getBeats) ? _hw.getBeats() : null;
+        if (Array.isArray(beats) && beats.length) {
+            for (const b of beats) {
+                const bt = (typeof b === 'number') ? b : (b && Number.isFinite(b.time) ? b.time : null);
+                if (bt != null && bt >= loopStart - 1e-6 && bt <= loopEnd) _drillBeatTimes.push(bt);
             }
-            if (!beatTimes.length) {
-                const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(judgeStart) : 100;
-                const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
-                for (let bt = loopStart; bt <= loopEnd; bt += beat) beatTimes.push(bt);
-            }
-            beatTimes = beatTimes.slice(0, 512);             // cap: never schedule an absurd oscillator count
-            for (let i = 0; i < beatTimes.length; i++) {
-                const at = toWall(beatTimes[i]);
-                if (at < audioCtx.currentTime) continue;
-                const accent = (i % 4 === 0);                 // approximate downbeat (4/4)
+        }
+        if (!_drillBeatTimes.length) {   // no beat grid — fall back to even spacing at the local tempo
+            const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(judgeStart) : 100;
+            const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
+            for (let bt = loopStart; bt <= loopEnd; bt += beat) _drillBeatTimes.push(bt);
+        }
+    }
+
+    // Schedule any beats now due (within the look-ahead) as single clicks at
+    // their exact future audio time = now + (beatChartTime − playhead)/speed.
+    // Called every HUD tick with the current playhead + drill speed.
+    function _drillScheduleDueClicks(ct, speed) {
+        if (!audioCtx || !_drillBeatTimes.length) return;
+        const sp = (Number.isFinite(speed) && speed > 0) ? speed : 1;
+        while (_drillBeatIdx < _drillBeatTimes.length
+               && _drillBeatTimes[_drillBeatIdx] <= ct + _CLICK_LOOKAHEAD_S) {
+            const bt = _drillBeatTimes[_drillBeatIdx];
+            const at = audioCtx.currentTime + Math.max(0, (bt - ct) / sp);
+            const accent = (_drillBeatIdx % 4 === 0);   // approximate downbeat (4/4)
+            try {
                 const osc = audioCtx.createOscillator();
                 const g = audioCtx.createGain();
                 osc.frequency.value = accent ? 1320 : 880;
@@ -5894,8 +5911,9 @@ function createNoteDetector(options = {}) {
                 g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
                 osc.connect(g); g.connect(audioCtx.destination);
                 osc.start(at); osc.stop(at + 0.06);
-            }
-        } catch (_) { /* click is best-effort */ }
+            } catch (_) { /* click is best-effort */ }
+            _drillBeatIdx++;
+        }
     }
 
     function endDrill(reason = 'user') {
