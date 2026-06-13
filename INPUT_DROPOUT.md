@@ -86,6 +86,17 @@ One real occurrence with this record settles the fork.
       user's machine — but we keep the watchdog + auto-recover so it degrades
       gracefully instead of silently.
 
+- **2026-06-13 ~05:30 UTC — no repro under full load.** Four complete plays
+  (One For The Road ×2, Why'd You Only Call, Creep) all scored (307–374
+  judgments each) with **auto-record ON** (WAVs written per play) — i.e. the
+  full DSP + parallel-capture load. Zero dropouts, zero `input_dropout` records.
+  → The failure is **intermittent**, not every-play. The 14:50 zero-note session
+  did not recur this session. Mechanism still UNCONFIRMED — watchdog + telemetry
+  are armed; we need the bug to recur to capture `max_cb_gap_ms` / `audio_ctx_
+  state`. (Caveat: can't confirm from logs alone that the browser was running
+  the telemetry build — `plugin_version` unchanged at 1.24.0. A hard reload
+  ensures the next drop is captured.)
+
 ## NEXT
 
 Play a couple of songs on the current build. When a dropout happens (the red
