@@ -6059,13 +6059,45 @@ function createNoteDetector(options = {}) {
             missList = `<div class="mt-1.5 pt-1.5 border-t border-gray-700 text-[11px] font-mono leading-tight">`
                 + `<div class="text-gray-500 text-[10px] uppercase tracking-wide mb-0.5">Missed this pass</div>${shown}${more}</div>`;
         }
+        // Editable loop bounds — nudge start/end ±2s to carve exactly the
+        // passage you want (e.g. trim past a note in the detector's blind
+        // spot). Each nudge re-arms the drill on the new region.
+        const _mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+        const rng = drillConductorRange || {};
+        const nb = (edge, d, t) => `<button class="nd-loop-nudge px-2 py-0.5 bg-dark-600 hover:bg-dark-500 rounded text-gray-300" data-edge="${edge}" data-d="${d}" title="${t}">${d < 0 ? '−' : '+'}</button>`;
+        const loopRow = (Number.isFinite(rng.judgeStart) && Number.isFinite(rng.judgeEnd))
+            ? `<div class="flex items-center gap-2 mt-1.5 pt-1.5 border-t border-gray-700 text-[11px]">
+                   <span class="text-gray-500">Loop</span>
+                   ${nb('start', -2, 'Start 2s earlier')}<span class="text-gray-300 font-mono">${_mmss(rng.judgeStart)}</span>${nb('start', 2, 'Start 2s later')}
+                   <span class="text-gray-600">–</span>
+                   ${nb('end', -2, 'End 2s earlier')}<span class="text-gray-300 font-mono">${_mmss(rng.judgeEnd)}</span>${nb('end', 2, 'End 2s later')}
+               </div>`
+            : '';
         hud.innerHTML = `
             <div class="flex items-start gap-3">
-                <div class="flex-1">${banner}${sub}${missList}</div>
+                <div class="flex-1">${banner}${sub}${missList}${loopRow}</div>
                 <button id="nd-drill-end" class="px-2.5 py-1 bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg text-xs font-semibold whitespace-nowrap" title="End drill">✕ End</button>
             </div>`;
         const endBtn = hud.querySelector('#nd-drill-end');
         if (endBtn) endBtn.onclick = () => endDrill('user');
+        hud.querySelectorAll('.nd-loop-nudge').forEach((b) => {
+            b.onclick = () => _drillAdjustLoop(b.dataset.edge, Number(b.dataset.d));
+        });
+    }
+
+    // Re-arm the current drill with the loop edge nudged by `d` seconds. Lets
+    // the player carve the loop (the original auto-bounds are just a starting
+    // point) — e.g. trim a low note the detector can't hear out of the region.
+    function _drillAdjustLoop(edge, d) {
+        if (!drillConductorActive || !drillConductorRange || !Number.isFinite(d)) return;
+        let start = drillConductorRange.judgeStart;
+        let end = drillConductorRange.judgeEnd;
+        if (edge === 'start') start = Math.max(0, start + d);
+        else end = end + d;
+        if (!(end - start >= 0.5)) return;   // keep a sane minimum span
+        // Fresh drill on the new region (resets the speed ladder — a new loop
+        // earns its speed-up again); preserve the goal.
+        startDrill(start, end, { goal: drillConductorGoal }).catch(() => {});
     }
 
     function _drillConductorHideHud(graduated) {
