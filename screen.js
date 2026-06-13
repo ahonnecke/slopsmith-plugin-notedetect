@@ -1171,6 +1171,30 @@ function _ndTotalEnergy(magnitudes) {
     return total;
 }
 
+// Per-string band energy at a moment — the fraction of total spectral energy
+// in each string's playable band (open..fret24, ±10% margin via
+// _ndStringBandHz), for ALL strings including non-charted ones. This is the
+// raw signal that lets downstream coaching tell apart, for a charted note:
+//   • clean hit          — the charted string's band carries the energy;
+//   • wrong string / bleed — a non-charted string's band lights up instead;
+//   • ambient / unmuted   — energy smeared broadly with no clear winner;
+//   • silence/ambient     — totalEnergy near zero (nothing played).
+// Bands OVERLAP (adjacent strings share fret ranges), so this is a fractional
+// distribution, not one-hot — interpretation (and the wrong-string call) is
+// left to the coach/LLM, which is exactly what this unlocks. Pure; reuses the
+// same FFT + band primitives the chord scorer uses, so it's consistent with
+// how hits are judged. Returns { perString: number[stringCount], totalEnergy }.
+function _ndPerStringEnergy(buffer, sampleRate, arrangement, stringCount, offsets, capo) {
+    const spectrum = _ndFftMagnitude(buffer, sampleRate);
+    const total = _ndTotalEnergy(spectrum.magnitudes);
+    const perString = new Array(stringCount);
+    for (let s = 0; s < stringCount; s++) {
+        const [loHz, hiHz] = _ndStringBandHz(s, arrangement, stringCount, offsets, capo);
+        perString[s] = Math.round(_ndBandEnergy(spectrum.magnitudes, spectrum.binHz, loHz, hiHz, total) * 1000) / 1000;
+    }
+    return { perString, totalEnergy: total };
+}
+
 // Check whether a specific string+fret is audible in the current audio frame.
 //
 // Returns { hit: bool, bandEnergy: float, centsDiff: float|null, centsError: float|null }
@@ -3611,6 +3635,10 @@ function createNoteDetector(options = {}) {
             tt:  Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : undefined,
             sc:  Number.isFinite(judgment.score) ? +judgment.score.toFixed(3) : undefined,
             tf:  _diagTechFlags(nn),
+            // Per-string energy fractions at the matching frame (diagnostic;
+            // present on matched single notes) — raw signal for coaching to
+            // tell bleed / wrong-string / unmuted ring apart from a clean hit.
+            se:  Array.isArray(judgment.stringEnergy) ? judgment.stringEnergy : undefined,
         };
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
             _diagEvents.push(eventObj);
@@ -3964,6 +3992,17 @@ function createNoteDetector(options = {}) {
                     { pitchError }
                 );
                 if (judgment.hit) {
+                    // Per-string energy of the matching frame — raw signal for
+                    // coaching to spot bleed / wrong-string / unmuted ringing
+                    // even on a HIT. Diagnostic-only and bounded (a single note
+                    // matches at most once; noteResults guards re-entry), and
+                    // never allowed to block the judgment.
+                    try {
+                        const _sr = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || 44100);
+                        judgment.stringEnergy = _ndPerStringEnergy(
+                            frameBuffer, _sr, currentArrangement, currentStringCount, tuningOffsets, capo
+                        ).perString;
+                    } catch (_) { /* energy is diagnostic-only */ }
                     recordJudgment(key, judgment);
                 }
             } else {

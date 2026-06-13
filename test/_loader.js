@@ -174,7 +174,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering', '_ndNearestOctaveCents',
         '_ndCalibrateOffsetMs',
-        '_ndStringBandHz', '_ndBandEnergy',
+        '_ndStringBandHz', '_ndBandEnergy', '_ndPerStringEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
         '_ndDrillRampDecision', '_ndDescribeMiss', '_ndSummarizeWindowMisses',
@@ -249,6 +249,12 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         nearestOctaveCents: sandbox._ndNearestOctaveCents,
         stringBandHz: sandbox._ndStringBandHz,
         bandEnergy: sandbox._ndBandEnergy,
+        // Rewrap the sandbox-realm array into a main-realm one so node:assert
+        // deep-equals it cleanly.
+        perStringEnergy: (...args) => {
+            const r = sandbox._ndPerStringEnergy(...args);
+            return { perString: Array.from(r.perString), totalEnergy: r.totalEnergy };
+        },
         constraintCheckString: sandbox._ndConstraintCheckString,
         classifyTiming: sandbox._ndClassifyTiming,
         classifyPitch: sandbox._ndClassifyPitch,
