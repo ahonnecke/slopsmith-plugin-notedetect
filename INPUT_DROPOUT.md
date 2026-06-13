@@ -114,3 +114,21 @@ Record findings below as they come in.
   are other devices. → Rig power-management is not the cause; the remaining
   forks are OS audio-focus/context-suspend, a device-level drop, or our own
   main-thread stall — all of which the `input_dropout` record distinguishes.
+
+- **2026-06-12 — NEW LEAD: four USB audio inputs on the bus.** `arecord -l`
+  shows `card 4 Blue Snowball`, `card 5 USB Audio`, `card 6 Rocksmith USB Guitar
+  Adapter`, `card 7 Scarlett Solo USB`. A **Rocksmith Real Tone adapter is
+  co-present with the Scarlett.** Two implications worth testing:
+  1. **Browser device-selection drift** — with several `getUserMedia` inputs,
+     the default device (or the device the browser holds) can change on any
+     device event, dropping the held stream mid-play. The `track_ready: "ended"`
+     field in `input_dropout` is the tell for this.
+  2. **USB bus contention** — multiple active USB-audio endpoints can starve a
+     shared controller. Lower-probability, but it's a *new* variable that could
+     explain "it wasn't happening before."
+  - The Scarlett opens natively at **44100** under ALSA (`arecord` negotiated
+    44100); the browser AudioContext usually requests **48000** — capture the
+    actual `sample_rate` in the dropout record to check for a re-clock glitch.
+  - ALSA capture confirmed the Scarlett *delivers* audio (meter moved), but the
+    test was aborted at ~6% so it does NOT yet rule the device in or out — needs
+    a full ~2–3 min run while playing, watching for `overrun`.
