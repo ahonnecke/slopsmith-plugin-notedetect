@@ -4364,6 +4364,30 @@ function createNoteDetector(options = {}) {
         return makeMatchedJudgment(cn, noteTime, noteTime, expectedMidi, detMidi, 1, { pitchError: 0, rescued: true });
     }
 
+    // Per-string energy at a MISSED note's expected time — the wrong-string /
+    // ambient signal where it matters most: a note you whiffed. Reuses the
+    // rescue buffer (the rolling raw audio centered on the note's expected
+    // position) and the same hw-time mapping as _tryBassRescue, so it reports
+    // what actually rang when the chart wanted this note: the charted string's
+    // band quiet + a NEIGHBOUR's band lit = wrong string; broad low energy =
+    // ambient / unmuted; ~nothing = simply not played. Bass only (the rescue
+    // buffer is bass-only); returns null when unavailable.
+    function _perStringEnergyAtNote(noteTime) {
+        if (currentArrangement !== 'bass' || _rescueBuf.length < _RESCUE_WIN) return null;
+        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+        if (!(sr > 0)) return null;
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const center = _rescueBuf.length - samplesBack;
+        const start = center - (_RESCUE_WIN >> 1);
+        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return null;
+        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+        try {
+            return _ndPerStringEnergy(win, sr, currentArrangement, currentStringCount, tuningOffsets, capo).perString;
+        } catch (_) { return null; }
+    }
+
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4405,11 +4429,15 @@ function createNoteDetector(options = {}) {
                 );
                 // Bass long-window rescue before conceding the miss: re-check
                 // the note's pitch on a window CENTERED on its expected time.
-                const rescued = _tryBassRescue(chartNote, noteTime, expectedMidi);
-                recordJudgment(
-                    key,
-                    rescued || makeMissJudgment(chartNote, noteTime, t, expectedMidi)
-                );
+                let judgment = _tryBassRescue(chartNote, noteTime, expectedMidi);
+                if (!judgment) {
+                    judgment = makeMissJudgment(chartNote, noteTime, t, expectedMidi);
+                    // Attach what rang at the note's expected time so coaching
+                    // can call wrong-string vs ambient vs not-played on the miss.
+                    const se = _perStringEnergyAtNote(noteTime);
+                    if (se) judgment.stringEnergy = se;
+                }
+                recordJudgment(key, judgment);
             }
         };
 
