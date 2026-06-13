@@ -97,6 +97,27 @@ One real occurrence with this record settles the fork.
   the telemetry build — `plugin_version` unchanged at 1.24.0. A hard reload
   ensures the next drop is captured.)
 
+- **2026-06-13 ~08:55 — a zero-note play was Detect-OFF, not a dropout.** The
+  `08:55` "One For The Road" session logged a `session_start` then ZERO
+  judgments AND wrote NO WAV (auto-record only arms when Detect is armed) —
+  while `08:48` scored 279 and `08:53` recorded a WAV. So Detect was simply not
+  running for that play (`detectPreference` off, or it didn't come up), not a
+  mid-play USB dropout. The watchdog didn't fire because we couldn't confirm the
+  served build (`plugin_version` was frozen at 1.24.0). Fixed two ways:
+  bumped to **1.25.0** (logs now self-identify the build) and added
+  `detect_preference` + `enabled` to the `session_start` header (a zero-note
+  play is now unambiguous: off vs wanted-but-failed). Also de-duped the
+  end-of-play "no notes scored" double-alarm in the coaching panel.
+- **2026-06-13 — A/V offset drives BOTH visuals AND detection matching.** User
+  re-synced A/V to fix the visual highway and detection accuracy improved
+  unexpectedly. Expected, in hindsight: the same `av_offset` maps detected-note
+  time → chart time for matching, so a miscalibrated offset (the log showed
+  `av_offset_ms: -343`) mismatches real hits into misses/no_detection. Lesson:
+  visual A/V calibration *is* detection calibration — keep them coupled. (This
+  is a matching-quality effect, separate from the zero-note dropout above:
+  a bad offset still produces judgments, just wrong ones; a dropout produces
+  none.)
+
 ## NEXT
 
 Play a couple of songs on the current build. When a dropout happens (the red

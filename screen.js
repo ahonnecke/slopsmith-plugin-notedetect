@@ -1914,6 +1914,13 @@ function createNoteDetector(options = {}) {
                 channel: selectedChannel,
                 av_offset_ms: avOffsetMs,
             },
+            // Detect state at play start — so a zero-scored session is
+            // unambiguous in the log: detect_preference=false means Detect was
+            // OFF (not a failure); detect_preference=true + enabled=false means
+            // it was wanted but didn't come up (a real failure the watchdog
+            // should have caught). Resolves "was Detect even on?" offline.
+            detect_preference: detectPreference,
+            enabled: enabled,
         };
     }
     function _streamLiveJudgment(eventObj) {
