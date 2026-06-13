@@ -3363,6 +3363,15 @@ function createNoteDetector(options = {}) {
     // cheap: called per note per renderer per frame.
     function noteStateFor(note, chartTime) {
         if (!enabled || !note || !Number.isFinite(chartTime)) return null;
+        // Drill lead-in: notes in [loopStart, judgeStart) play as a run-in but
+        // are NOT scored. Render them dim/grey (RS-style) so the player sees
+        // what's coming and knows it isn't being graded. Checked first so a
+        // lead-in note that matchNotes happened to judge still reads as lead-in.
+        if (drillConductorActive && drillConductorRange
+            && chartTime >= drillConductorRange.loopStart
+            && chartTime < drillConductorRange.judgeStart) {
+            return { state: 'leadin', alpha: 0.4 };
+        }
         const key = noteKey(note, chartTime);
         const j = noteResults.get(key);
         if (!j) return null;  // not judged yet — render normally
