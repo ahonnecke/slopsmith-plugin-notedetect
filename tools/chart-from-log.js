@@ -33,9 +33,14 @@ if (!lines.length) { process.stderr.write('empty log\n'); process.exit(1); }
 
 let header = {};
 try { header = JSON.parse(lines[0]); } catch (_) { /* not a session_start; treat all as rows */ }
-const rows = lines
-    .map((l) => { try { return JSON.parse(l); } catch (_) { return null; } })
-    .filter((r) => r && r.type !== 'session_start' && Number.isFinite(r.t));
+const parsed = lines.map((l) => { try { return JSON.parse(l); } catch (_) { return null; } });
+// The WAV's chart-start offset (recording arms after song:play), stamped by
+// auto-record as a rec_start row — replay-take.sh passes it to the harness so
+// the audio aligns to the chart deterministically. Null if the take predates
+// the stamp (then replay falls back to a coarse offset sweep).
+const recStart = parsed.find((r) => r && r.type === 'rec_start');
+const chartStartS = recStart && Number.isFinite(recStart.chart_start_s) ? recStart.chart_start_s : null;
+const rows = parsed.filter((r) => r && r.type !== 'session_start' && r.type !== 'rec_start' && Number.isFinite(r.t));
 
 // Dedup by chart key (a note may be re-judged across a drill loop) — keep the
 // first occurrence. Single notes only: a chord logs one aggregate row, which
@@ -60,7 +65,8 @@ const chart = {
     notes,
     chords: [],
     sections: [],
+    chartStartS,   // chart time of the WAV's first sample (null if un-stamped)
     _source: { from: 'chart-from-log', log: logPath.split('/').pop(), song: header.song && header.song.title },
 };
 process.stdout.write(JSON.stringify(chart, null, 2));
-process.stderr.write(`[chart-from-log] ${notes.length} notes, ${arrangement} tuning ${JSON.stringify(tuning)}, song=${(header.song && header.song.title) || '?'}\n`);
+process.stderr.write(`[chart-from-log] ${notes.length} notes, ${arrangement} tuning ${JSON.stringify(tuning)}, song=${(header.song && header.song.title) || '?'}, chartStartS=${chartStartS}\n`);

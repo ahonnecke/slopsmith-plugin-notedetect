@@ -188,12 +188,26 @@ Worked the gap systematically on the One For The Road 085553 take (live 80%):
   live yet.
 
 **Conclusion:** the replay LOOP is sound (it runs the real pipeline headless and
-relative iteration works), but absolute live-fidelity is blocked on **recording
-the WAV's chart-start offset**. NEXT: stamp auto-record's WAV with its
-`song:play`-relative start (and/or the live av_offset) into the take metadata,
-so `replay-take.sh` aligns the WAV to the reconstructed chart exactly instead of
-guessing via a coarse offset sweep. Until then, treat replay numbers as relative,
-not absolute.
+relative iteration works), but absolute live-fidelity was blocked on **recording
+the WAV's chart-start offset**.
+
+### Chart-start stamping IMPLEMENTED 2026-06-13
+
+Auto-record now stamps the chart playhead time of the WAV's first captured
+sample (`_recStampStart`, both the auto-record and training capture paths) and
+streams it as a `rec_start` row (`note_detect.live.rec_start.v1`,
+`chart_start_s`) into the live JSONL. `chart-from-log.js` surfaces it as
+`chartStartS`; `harness.js` gained `--chart-start-s` (offsets the playhead so
+WAV sample 0 = that chart time); `replay-take.sh` reads it and, when present,
+aligns the WAV to the chart and sweeps only a TIGHT ±ms range for residual
+latency (wide sweep + "relative only" warning when un-stamped). 157 tests pass;
+the arg is validated to shift alignment.
+
+**One play needed to validate:** existing takes predate the stamp, so confirming
+that an aligned replay reproduces the live score requires ONE recording on the
+1.25.x build — after which that take (and every future one) replays faithfully
+with zero further playing. That single play unblocks indefinite no-play
+iteration.
 
 ## Rig-side checklist (cheap tests the user can run)
 

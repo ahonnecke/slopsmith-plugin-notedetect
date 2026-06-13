@@ -42,13 +42,28 @@ CHART="$(mktemp /tmp/nd-replay-chart.XXXX.json)"
 node "$HERE/tools/chart-from-log.js" "$LOG" --arrangement "$ARR" > "$CHART"
 SR="$(ffprobe -v error -show_entries stream=sample_rate -of default=nk=1:nw=1 "$WAV" 2>/dev/null || echo 48000)"
 
+# Chart-start offset stamped by auto-record (rec_start row). When present the
+# WAV is aligned to the chart deterministically, so we only sweep a TIGHT ms
+# range for residual latency. When absent (un-stamped take) we fall back to a
+# WIDE sweep — the WAV start vs chart is unknown.
+CSS="$(python3 -c "import json,sys;v=json.load(open('$CHART')).get('chartStartS');print('' if v is None else v)" 2>/dev/null || echo '')"
+if [ -n "$CSS" ]; then
+    echo "chart-start: ${CSS}s (stamped — WAV aligned to chart; tight sweep)"
+    OFFSETS="-60 -40 -20 0 20 40 60 80 100"
+    CSARG="--chart-start-s=$CSS"
+else
+    echo "chart-start: UNSTAMPED (take predates rec_start) — wide sweep, numbers are relative"
+    OFFSETS="-150 -100 -50 0 50 100 150 200 250 300 350"
+    CSARG=""
+fi
+
 echo "WAV:   $(basename "$WAV")  (sample_rate=$SR)"
 echo "LOG:   $(basename "$LOG")"
 echo "sweeping av-offset (hits = scored; recall = detector fired at all):"
 cd "$HERE"
-for off in -150 -100 -50 0 50 100 150 200 250 300 350; do
+for off in $OFFSETS; do
     node tools/harness.js --audio "$WAV" --chart "$CHART" --arrangement "$ARR" \
-        --string-count "$SC" --method "$METHOD" --sample-rate "$SR" \
+        --string-count "$SC" --method "$METHOD" --sample-rate "$SR" $CSARG \
         --av-offset-ms="$off" --out /tmp/nd-replay.json 2>/dev/null || { echo "  off=${off}ms ERROR"; continue; }
     python3 - "$off" <<'PY'
 import json,sys

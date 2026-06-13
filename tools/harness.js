@@ -211,6 +211,12 @@ try {
             'arrangement':           { type: 'string', default: 'guitar' },
             'string-count':          { type: 'string', default: '6' },
             'av-offset-ms':          { type: 'string', default: '0' },
+            // Chart time (s) of the WAV's first sample. The recording arms
+            // after song:play, so WAV t=0 ≠ chart t=0; auto-record stamps this
+            // as a `rec_start` row in the live log (chart-from-log.js surfaces
+            // it). Aligns the audio to the chart deterministically instead of
+            // a coarse offset sweep. Default 0 = WAV starts at chart t=0.
+            'chart-start-s':         { type: 'string', default: '0' },
             verbose:                 { type: 'boolean', default: false },
             help:                    { type: 'boolean', default: false },
         },
@@ -285,6 +291,7 @@ const winSize       = args['win-size'] ? POS_INT(args['win-size'], 'win-size') :
 const hop           = args['hop'] ? POS_INT(args['hop'], 'hop') : frameSize;
 const arrangement   = args.arrangement;
 const stringCount   = POS_INT(args['string-count'], 'string-count');
+const chartStartS   = Number(args['chart-start-s']) || 0;   // chart time of WAV sample 0
 const avOffsetMs    = NUM(args['av-offset-ms'], 'av-offset-ms');
 // In-app slider ranges (screen.js createNoteDetector settings loader):
 //   pitchTolerance      10..100 cents
@@ -473,7 +480,7 @@ async function main() {
     // (setInterval starts the clock on enable). Starting at 0 would
     // tick at t=0 because `currentTimeS >= nextTickT` is immediately
     // true — schedule the first tick at TICK_INTERVAL_S instead.
-    let nextTickT = TICK_INTERVAL_S;
+    let nextTickT = chartStartS + TICK_INTERVAL_S;
 
     // Slide a `winSize` window forward by `hop` each step (default
     // winSize=hop=frameSize → legacy non-overlapping behaviour). `end` is the
@@ -493,7 +500,8 @@ async function main() {
         // latency, so a stale (one-hop-behind) clock here shifts every
         // detection earlier by `hop` and tanks recall (and made smaller hop
         // look artificially better). This aligns the harness clock with live.
-        currentTimeS = stop / sampleRate;
+        // chartStartS offsets WAV-time → chart-time (WAV sample 0 = chartStartS).
+        currentTimeS = chartStartS + stop / sampleRate;
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
         while (currentTimeS >= nextTickT) {
@@ -507,7 +515,7 @@ async function main() {
     }
     // Final tick — advance time past the last note's miss window so any
     // pending judgments retire.
-    currentTimeS = totalDuration + 2.0;
+    currentTimeS = chartStartS + totalDuration + 2.0;
     detector._harness.tick();
     if (args.verbose) process.stderr.write('\n');
 

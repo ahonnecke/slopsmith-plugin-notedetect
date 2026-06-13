@@ -1977,6 +1977,30 @@ function createNoteDetector(options = {}) {
     let _recSaveInFlight = false;     // de-dupe rapid saves
     let _recCappedAt = null;          // seconds into the take where the client-side cap kicked in (null = no cap hit)
     let _recTotalSamples = 0;         // running sum of _recChunks lengths — avoids O(n²) reduce on the detection hot path
+    let _recStartChartT = null;       // chart playhead (s) of the WAV's FIRST sample — lets a headless
+                                      // replay align the recording to the chart deterministically
+                                      // (the recording arms after song:play, so WAV t=0 ≠ chart t=0)
+    // Stamp the take's chart-start time on its first captured sample and
+    // stream it to the live JSONL so tools/replay-take.sh can align the WAV to
+    // the reconstructed chart instead of guessing via a coarse offset sweep.
+    // Re-fires per take (gated on _recTotalSamples === 0 at the call site).
+    function _recStampStart(copy) {
+        const sr = _recSampleRate || 44100;
+        const nowT = (hw && hw.getTime) ? hw.getTime() : 0;
+        // WAV sample 0 ≈ the just-captured window's START = now − window length.
+        _recStartChartT = nowT - (copy.length / sr);
+        if (_liveSessionId) {
+            try {
+                _streamLiveJudgment({
+                    type: 'rec_start',
+                    schema: 'note_detect.live.rec_start.v1',
+                    ts: new Date().toISOString(),
+                    chart_start_s: +_recStartChartT.toFixed(4),
+                    sample_rate: sr,
+                });
+            } catch (_) { /* fire-and-forget */ }
+        }
+    }
     // Training-upload tracking — surfaced in the gear popover so the
     // user knows whether the bundle made it to the curated dataset.
     let _recTrainingUploadInFlight = false;
@@ -3276,6 +3300,7 @@ function createNoteDetector(options = {}) {
                 // slice() because the analyser may overwrite the buffer the
                 // next time processFrame fires.
                 const copy = buffer.slice();
+                if (_recTotalSamples === 0) _recStampStart(copy);   // first sample of this take
                 _recChunks.push(copy);
                 _recTotalSamples += copy.length;
             }
@@ -7356,6 +7381,7 @@ function createNoteDetector(options = {}) {
                 _recSampleRate = ctx.sampleRate || _recSampleRate;
                 // slice() — the underlying buffer is reused next callback.
                 const copy = input.slice();
+                if (_recTotalSamples === 0) _recStampStart(copy);   // first sample of this take
                 _recChunks.push(copy);
                 _recTotalSamples += copy.length;
             };
