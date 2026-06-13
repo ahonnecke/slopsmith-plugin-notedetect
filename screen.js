@@ -1786,6 +1786,10 @@ function createNoteDetector(options = {}) {
     // auto-reconnects within ~2s if the callbacks stop — so a dead input is
     // visible in seconds, not at the end-of-song summary.
     let _lastAudioCbT = 0;            // Date.now() of the last onaudioprocess
+    let _maxCbGapMs = 0;             // worst gap between audio callbacks this play —
+                                     // the direct measure of main-thread starvation
+                                     // (expected ~frameSize/sampleRate ≈ 46ms; a
+                                     // large value = heavy DSP blocked the audio cb)
     let _scoringStalled = false;      // banner state (not scoring while playing)
     let _wdPlayStartT = 0;            // when the current playing+wantsDetect stretch began
     let scoringWatchdog = null;       // persistent setInterval handle (cleared in destroy)
@@ -2604,8 +2608,15 @@ function createNoteDetector(options = {}) {
             processor.onaudioprocess = (e) => {
                 // Heartbeat: stamp every callback (even when disabled) so the
                 // scoring watchdog can tell a stalled audio graph from a quiet
-                // instrument. Cheap; runs ~20×/s.
-                _lastAudioCbT = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                // instrument. Also track the worst inter-callback gap — the
+                // direct measure of main-thread starvation (heavy per-frame DSP
+                // blocking the audio thread). Cheap; runs ~20×/s.
+                const _cbNow = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                if (_lastAudioCbT) {
+                    const gap = _cbNow - _lastAudioCbT;
+                    if (gap > _maxCbGapMs) _maxCbGapMs = gap;
+                }
+                _lastAudioCbT = _cbNow;
                 if (!enabled) return;
                 const input = e.inputBuffer.getChannelData(0);
                 const prev = accumBuffer;
@@ -2730,7 +2741,7 @@ function createNoteDetector(options = {}) {
         // Only meaningful while the song is playing AND the user wants
         // detection on. Otherwise reset the play-stretch clock and clear.
         if (!playing || !detectPreference) { _wdPlayStartT = 0; _clearScoringStall(); return; }
-        if (!_wdPlayStartT) _wdPlayStartT = now;
+        if (!_wdPlayStartT) { _wdPlayStartT = now; _maxCbGapMs = 0; }  // fresh play: reset starvation gauge
         // Grace: let enable()/startAudio come up after Play before judging.
         if (now - _wdPlayStartT < 2500) return;
         // Healthy = detection enabled AND the audio callback fired recently
@@ -2824,6 +2835,7 @@ function createNoteDetector(options = {}) {
             sample_rate: (audioCtx && audioCtx.sampleRate) || null,
             frame_size: frameSize,
             processing_frame: processingFrame,                 // heavy frame in flight?
+            max_cb_gap_ms: _maxCbGapMs,                        // worst audio-cb gap this play (starvation gauge)
             rec_armed: !!(_recArmed || _recArmedForTraining),  // parallel WAV capture running?
             using_bridge: usingDesktopBridge,
             arrangement: currentArrangement || null,

@@ -31,19 +31,29 @@ Guessing wrong wastes the user's time. So step 1 is **measurement, not a fix.**
   stops delivering audio does NOT fire those — so it went unseen until the
   end-of-song summary.
 
-## Prime hypothesis (program-side, testable)
+## Prime hypothesis (program-side — now corroborated by the user)
 
-The dropouts are **new**, which correlates with the `proj/bass-detection`
-rollout (~2026-06-12): the rolling raw-audio **rescue buffer** (32768 samples),
-**longer bass analysis windows**, and the always-on **parallel WAV capture**
-all add main-thread work around the **deprecated `createScriptProcessor`** path
-(`screen.js:2583`) — which runs on the main thread and is notorious for
-underrunning (and silently stopping `onaudioprocess`) when the main thread is
-busy. If true, this is ours to fix (move capture to an `AudioWorklet`, or shed
-main-thread load), and it would be NEW because the load is new.
+**The user reports the dropouts began when DSP work started, on an unchanged
+device set.** That's a direct correlation with the `proj/bass-detection` rollout
+(~2026-06-12): the bigger bass FFT window, the per-string band-energy scorer,
+the rolling raw-audio **rescue buffer** (32768 samples), and the always-on
+**parallel WAV capture** all add per-frame work to the **deprecated
+`createScriptProcessor`** path (`screen.js:2583`), which runs on the **main
+thread**. When `processFrame` (the 50 ms detect tick) runs long, the audio
+callback can't be serviced in time, `onaudioprocess` stalls, and the capture
+goes dead — a NEW failure because the load is new.
 
-This is a hypothesis, not a conclusion. The telemetry below will confirm or
-kill it.
+**Smoking-gun signal:** `max_cb_gap_ms` in the `input_dropout` record — the
+worst gap between audio callbacks this play. Expected ≈ `frameSize/sampleRate`
+(~46 ms at 2048/44100). A value in the hundreds–thousands of ms, with
+`audio_ctx_state: "running"` and `track_ready: "live"`, **confirms main-thread
+starvation** — the device and OS are fine; our DSP is blocking the audio thread.
+
+If confirmed, the fix is to get detection off the main thread (an `AudioWorklet`
+for capture and/or a `Worker` for the FFT/scoring), or to shed per-frame cost
+(smaller/again-shorter windows, throttle the scorer). The device-drift and
+bus-contention leads below drop in priority unless the telemetry points back to
+`track_ready: "ended"`.
 
 ## Telemetry (shipped — read this to discriminate)
 
