@@ -487,11 +487,15 @@ async function main() {
         // detection (CREPE). Zero-padded to winSize on construction.
         const frame = new Float32Array(winSize);
         for (let j = 0; begin + j < stop; j++) frame[j] = samples[begin + j];
+        // Playhead = END of the window (newest sample). Set it BEFORE feeding
+        // so getTime() DURING processFrame returns this window's end time —
+        // live's detector timestamps each detection at hw.getTime()+avOffset-
+        // latency, so a stale (one-hop-behind) clock here shifts every
+        // detection earlier by `hop` and tanks recall (and made smaller hop
+        // look artificially better). This aligns the harness clock with live.
+        currentTimeS = stop / sampleRate;
         // eslint-disable-next-line no-await-in-loop
         await detector._harness.feedFrame(frame, sampleRate);
-        // Playhead = END of the window just fed (newest sample), so timing
-        // arithmetic matches a live rolling buffer.
-        currentTimeS = stop / sampleRate;
         while (currentTimeS >= nextTickT) {
             detector._harness.tick();
             nextTickT += TICK_INTERVAL_S;

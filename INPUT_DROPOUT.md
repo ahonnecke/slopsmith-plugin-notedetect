@@ -159,6 +159,42 @@ miss-rescue path (the 85→95% booster — does it run/populate `_rescueBuf` the
 same off discrete frames?), the silence gate, or a signal-level/normalization
 difference between the recorded WAV and the live-processed signal.
 
+### Fidelity investigation 2026-06-13 — ruled out a lot; the real blocker is WAV↔chart alignment
+
+Worked the gap systematically on the One For The Road 085553 take (live 80%):
+
+- **NOT the A/V offset (ms range).** Flat ~38% across −100…+200 ms.
+- **NOT the analysis window.** win=4096 (the live `_ND_MIN_YIN_SAMPLES` bass
+  window) scored *worse* (29%) than win=1024 (38%); bigger windows monotonically
+  worse. So feeding the live-sized window directly doesn't reproduce live.
+- **NOT a one-hop `getTime` lag.** `harness.js` set `currentTimeS` *after*
+  `feedFrame`, so `getTime()` during `processFrame` returned the previous
+  window's time — fixed (set the playhead before feeding; correct regardless),
+  but recall was unchanged (38%/28%). Kept the fix; it wasn't the cause.
+- **NOT sustain crediting.** 91/298 live hits were `SUS` (held note rings into
+  the next chart note); the replay *also* credits SUS (39/86), proportionally
+  similar. Note (user): RS counts a sustain hit if the player hits the note at
+  ANY point during the sustain — so credit-on-any-hit is the intended behavior;
+  worth aligning note_detect's sustain crediting to that.
+- **The actual blocker: the recorded WAV is misaligned from the chart by
+  SECONDS, not ms.** The take's notes run to 205 s but the WAV is 174.8 s, and a
+  WIDE offset sweep (−3000…+3000 ms) does NOT show a clean single peak (−3000 ms
+  → 46 %, a valley ~25 % around 0, a second bump +2000 ms → 38 %). A clean
+  constant shift would peak once; the multi-peak shape is consistent with a
+  multi-second start-latency PLUS spurious matches against One For The Road's
+  repeating riff at large shifts. **Auto-record does not capture the WAV's start
+  time relative to song:play / chart t=0**, so the replay can't align the audio
+  to the chart deterministically — which is why headless scores can't match
+  live yet.
+
+**Conclusion:** the replay LOOP is sound (it runs the real pipeline headless and
+relative iteration works), but absolute live-fidelity is blocked on **recording
+the WAV's chart-start offset**. NEXT: stamp auto-record's WAV with its
+`song:play`-relative start (and/or the live av_offset) into the take metadata,
+so `replay-take.sh` aligns the WAV to the reconstructed chart exactly instead of
+guessing via a coarse offset sweep. Until then, treat replay numbers as relative,
+not absolute.
+
 ## Rig-side checklist (cheap tests the user can run)
 
 These isolate the device from slopsmith. Each has a clear pass/fail:
