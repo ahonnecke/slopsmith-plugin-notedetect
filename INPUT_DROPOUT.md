@@ -125,6 +125,30 @@ banner appears), grab the `input_dropout` line — from the browser console, or
 from the session's `static/note_detect_recordings/live_*.jsonl`. Its
 `audio_ctx_state` + `track_ready` decide rig-vs-program in one shot.
 
+## Iterate WITHOUT playing — replay recorded takes (2026-06-13)
+
+Playing a full song to test a change costs ~5 min of human time. We don't need
+it: a take is a `(WAV, live_<id>.jsonl)` pair, and the log records every charted
+note (`t`/`s`/`f`/`sus`). So:
+
+- `tools/chart-from-log.js <live_*.jsonl>` reconstructs the sloppak-wire chart
+  the take played against (no need to locate the original sloppak).
+- `tools/replay-take.sh [<wav> <log>]` reconstructs the chart, then sweeps the
+  WAV through `tools/harness.js` (the SAME processFrame/matchNotes/checkMisses
+  pipeline) across A/V offsets, printing hits + recall per offset. Auto-pairs
+  the newest WAV with the newest same-song log if args omitted.
+
+**Open caveat — replay underscores vs live.** On `One For The Road` 085553 the
+LIVE take scored 80% (298/372) but headless replay peaks well below that at the
+live's av-offset (≈39% at 0–100 ms). The pipeline is identical, so the gap is in
+the *conditions*: candidate causes to bisect WITH this loop — (a) the A/V offset
+that aligns in replay differs from live (no real-time input latency), so the
+sweep must find replay's own peak; (b) analysis-window / frame-size differs
+(bass needs a long window — confirm the harness applies `_ndMinAnalysisSamples`);
+(c) continuous live AudioContext vs discrete frame feed. Relative iteration
+(does change X raise hits?) works today; absolute fidelity is the next target —
+and closing it is itself done via this loop, not by playing.
+
 ## Rig-side checklist (cheap tests the user can run)
 
 These isolate the device from slopsmith. Each has a clear pass/fail:
