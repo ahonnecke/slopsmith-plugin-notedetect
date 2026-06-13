@@ -25,8 +25,25 @@ function runIteration(core, det, hits) {
         const hit = i < hits;
         det._recordJudgment(`${t.toFixed(3)}_1_0`, {
             hit, note: { s: 1, f: 0 }, noteTime: t,
-            detectedMidi: hit ? 45 : null,
-            timingState: hit ? 'OK' : null,
+            detectedMidi: 45,                       // detector HEARD the note either way
+            timingState: hit ? 'OK' : 'LATE',       // a miss here = heard-but-late (player error) → counts
+        });
+    });
+    core.slopsmith._fire('loop:restart', { loopA: 28, loopB: 50, time: 28 });
+}
+
+// Same shape, but the misses are no_detection (the detector heard nothing —
+// a bass low-string blind spot). Used to verify the conductor EXCLUDES those
+// from the pass score so an unhearable note can't make the loop un-passable.
+function runIterationUnheard(core, det, hits, unheard) {
+    WINDOW_TS.forEach((t, i) => {
+        const hit = i < hits;
+        const heard = i < hits + (WINDOW_TS.length - hits - unheard);  // remaining misses are "heard but late"
+        det._recordJudgment(`${t.toFixed(3)}_1_0`, {
+            hit, note: { s: 1, f: 0 }, noteTime: t,
+            detectedMidi: (hit || heard) ? 45 : null,
+            timingState: hit ? 'OK' : (heard ? 'LATE' : null),
+            pitchState: null,
         });
     });
     core.slopsmith._fire('loop:restart', { loopA: 28, loopB: 50, time: 28 });
@@ -170,6 +187,18 @@ test('clearing the goal steps the speed up one rung per iteration, then graduate
     assert.equal(grad[1].graduated, true);
     // Speed restored to the pre-drill 1.0× (slider was 100 at startDrill).
     assert.equal(spies.speed[spies.speed.length - 1], 1.0, 'restored pre-drill speed');
+    det.destroy();
+});
+
+test('drill conductor: no_detection notes are EXCLUDED from the pass score (unhearable bass)', async () => {
+    const { core } = loadConductorCore();
+    const det = core.createNoteDetector();
+    await det.startDrill(30, 50, { goal: 0.8, speedLadder: [0.7, 0.85, 1.0] });
+    // 6 clean hits + 4 no_detection (detector heard NOTHING — low-string blind
+    // spot). Counting the 4 would be 60% → never clears the 80% goal → the
+    // auto-slowdown would crawl forever. Excluding them → 6/6 = 100% → advance.
+    runIterationUnheard(core, det, 6, 4);
+    assert.equal(det.getConductorState().rung, 1, 'unhearable notes excluded → loop still passes and advances');
     det.destroy();
 });
 

@@ -5804,11 +5804,19 @@ function createNoteDetector(options = {}) {
         for (const j of arr) {
             const t = Number.isFinite(j && j.noteTime) ? j.noteTime : null;
             if (t == null || t < judgeStart || t > judgeEnd) continue;
-            total++;
-            if (j.hit) hits++;
+            if (j.hit) { hits++; total++; continue; }
+            // Count a miss against the player ONLY if the detector actually
+            // heard the note (late/early/sharp/flat). A no_detection on bass is
+            // the detector's low-string blind spot, not a flub — counting it
+            // would make a loop containing an unhearable note (e.g. low-E
+            // fret 7/8) IMPOSSIBLE to pass, so the auto-slowdown would crawl
+            // toward zero forever. Score only on notes the detector can verify.
+            const heard = j.timingState != null || j.pitchState != null || j.detectedMidi != null;
+            if (heard) total++;
         }
-        // An empty pass (nothing judged in the window yet — e.g. the first
-        // wrap before any note crossed) isn't a real attempt. Skip it.
+        // No verifiable notes this pass (nothing crossed yet, or the whole
+        // window is in the detector's blind spot) — not a real attempt. Skip:
+        // no score, so no spurious slowdown.
         if (total === 0) return;
         const score = hits / total;
         if (score > drillConductorBest) drillConductorBest = score;
