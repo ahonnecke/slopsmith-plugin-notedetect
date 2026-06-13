@@ -149,6 +149,16 @@ sweep must find replay's own peak; (b) analysis-window / frame-size differs
 (does change X raise hits?) works today; absolute fidelity is the next target —
 and closing it is itself done via this loop, not by playing.
 
+**Measured (One For The Road 085553, live 80%):** av-offset sweep is FLAT at
+~38% recall across −100…+200 ms — so it's NOT an alignment problem (offset
+doesn't move recall). Bigger `--frame-size` makes it WORSE (1024→38%, 2048→28%,
+4096→24%, 8192→21%), so the internal bass windowing already works and the feed
+chunk shouldn't be enlarged. The replay simply *detects* ~half the notes live
+did, offset- and frame-independent. Remaining suspects to bisect next: the
+miss-rescue path (the 85→95% booster — does it run/populate `_rescueBuf` the
+same off discrete frames?), the silence gate, or a signal-level/normalization
+difference between the recorded WAV and the live-processed signal.
+
 ## Rig-side checklist (cheap tests the user can run)
 
 These isolate the device from slopsmith. Each has a clear pass/fail:
