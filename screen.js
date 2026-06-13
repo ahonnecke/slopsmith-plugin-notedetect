@@ -516,7 +516,7 @@ const _ND_MIN_DETECTABLE_HZ = 30;
 // loop:restart iteration scoring. Defaults recovered from the prior
 // deliberate-practice loop: drill slow, step the speed up only when an
 // iteration clears the accuracy goal, graduate at full speed.
-const _ND_DRILL_LEAD_IN_SEC = 3.0;            // audible pre-roll before the judged window (the host adds a 4-beat count-in on each wrap; this covers the first entry)
+const _ND_DRILL_LEAD_IN_SEC = 5.0;            // audible pre-roll before the judged window — enough runway to find the groove before the drilled notes (RS-style). A beat-locked click runs across the whole loop, lead-in included.
 const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
 const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
 const _ND_DRILL_DEFAULT_LADDER = [0.8, 0.9, 1.0];  // playback-speed rungs, slow → full (0.8 floor: slower time-stretches sound distorted)
@@ -5756,8 +5756,9 @@ function createNoteDetector(options = {}) {
         // here would be silently dropped — the "lead not there" bug.
         if (!enabled) { try { await enable(); } catch (_) {} }
 
-        // Count-in click over the first entry's lead-in too (not just on wraps).
-        _drillPlayCountIn();
+        // Beat-locked click across the first loop iteration (lead-in included),
+        // same as on each wrap.
+        _drillScheduleClicks();
 
         // Bind our OWN loop:restart listener so each pass is scored even if
         // the foundation's drillEnabled sync doesn't flip for a plugin loop.
@@ -5807,10 +5808,6 @@ function createNoteDetector(options = {}) {
             endDrill('graduated');
             return;
         }
-        // The loop is restarting — play a count-in click over the lead-in so
-        // the player can come in on the beat (the host's own count-in doesn't
-        // fire on this loop path).
-        _drillPlayCountIn();
         if (decision.action === 'advance') {
             // Step up one rung: faster playback, fresh best for the new
             // speed (the goal must be re-earned at the harder tempo).
@@ -5819,10 +5816,14 @@ function createNoteDetector(options = {}) {
             const toPct = Math.round((drillConductorLadder[drillConductorRung] || 1) * 100);
             _hostSetSpeed(drillConductorLadder[drillConductorRung]);
             _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
-            return;
+        } else {
+            // Held below the goal — show WHICH notes were missed this pass and HOW.
+            _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
         }
-        // Held below the goal — show WHICH notes were missed this pass and HOW.
-        _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
+        // New loop iteration begins — (re)schedule the beat-locked click across
+        // the whole loop at the CURRENT speed (after any rung change above), so
+        // the player has the pulse through the lead-in and the drilled bars.
+        _drillScheduleClicks();
     }
 
     // Detect a loop wrap from the chart clock (a backward jump) — the
@@ -5842,26 +5843,45 @@ function createNoteDetector(options = {}) {
         _ndDrillLastChartT = ct;
     }
 
-    // A short 4-beat count-in click over the lead-in, scheduled on the
-    // detection AudioContext. Best-effort — silent if no context. Beats are
-    // stretched by the current drill speed so they line up with the slowed
-    // playback's pulse.
-    function _drillPlayCountIn() {
+    // Beat-locked click for the WHOLE drill loop (lead-in included), scheduled
+    // on the detection AudioContext at each loop start. Best-effort — silent
+    // if no context. Prefers the song's real beat grid (highway.getBeats) so
+    // the click stays on the song's pulse; falls back to evenly-spaced at the
+    // local tempo. Beat wall-clock positions are stretched by the current
+    // drill speed so they line up with slowed playback. Re-scheduled every
+    // wrap (after any rung speed change) so it tracks the current tempo.
+    function _drillScheduleClicks() {
         if (!audioCtx || !drillConductorRange) return;
         try {
             const _hw = resolveHw();
-            const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(drillConductorRange.judgeStart) : 100;
-            const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
+            const { loopStart, loopEnd, judgeStart } = drillConductorRange;
             const speed = (drillConductorLadder && drillConductorLadder[drillConductorRung]) || 1;
-            const interval = beat / (speed || 1);
-            const t0 = audioCtx.currentTime + 0.06;
-            for (let i = 0; i < 4; i++) {
-                const at = t0 + i * interval;
+            const t0 = audioCtx.currentTime + 0.06;          // ≈ when loop audio restarts at loopStart
+            const toWall = (bt) => t0 + (bt - loopStart) / (speed || 1);
+
+            let beatTimes = [];
+            const beats = (_hw && _hw.getBeats) ? _hw.getBeats() : null;
+            if (Array.isArray(beats) && beats.length) {
+                for (const b of beats) {
+                    const bt = (typeof b === 'number') ? b : (b && Number.isFinite(b.time) ? b.time : null);
+                    if (bt != null && bt >= loopStart - 1e-6 && bt <= loopEnd) beatTimes.push(bt);
+                }
+            }
+            if (!beatTimes.length) {
+                const bpm = (_hw && _hw.getBPM) ? _hw.getBPM(judgeStart) : 100;
+                const beat = 60 / (Number.isFinite(bpm) && bpm > 0 ? bpm : 100);
+                for (let bt = loopStart; bt <= loopEnd; bt += beat) beatTimes.push(bt);
+            }
+            beatTimes = beatTimes.slice(0, 512);             // cap: never schedule an absurd oscillator count
+            for (let i = 0; i < beatTimes.length; i++) {
+                const at = toWall(beatTimes[i]);
+                if (at < audioCtx.currentTime) continue;
+                const accent = (i % 4 === 0);                 // approximate downbeat (4/4)
                 const osc = audioCtx.createOscillator();
                 const g = audioCtx.createGain();
-                osc.frequency.value = i === 0 ? 1320 : 880;  // accent the downbeat
+                osc.frequency.value = accent ? 1320 : 880;
                 g.gain.setValueAtTime(0.0001, at);
-                g.gain.exponentialRampToValueAtTime(0.35, at + 0.004);
+                g.gain.exponentialRampToValueAtTime(accent ? 0.34 : 0.26, at + 0.004);
                 g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
                 osc.connect(g); g.connect(audioCtx.destination);
                 osc.start(at); osc.stop(at + 0.06);
