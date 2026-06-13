@@ -750,10 +750,16 @@ function _ndRenderLoopPanelHtml(loops) {
         const badge = lp.passed
             ? `<span class="text-green-400 text-[10px] font-bold">✓ passed</span>`
             : `<span class="text-amber-300 text-[10px]">to drill</span>`;
+        // Recurrence badge — a hotspot that came back across plays is rolled
+        // into one loop and its hit_count bumped (it sorts to the top too).
+        const recur = (lp.hitCount > 1)
+            ? `<span class="text-[10px] text-amber-300 font-bold" title="recurred across ${lp.hitCount} plays">×${lp.hitCount}</span>`
+            : '';
         const range = lp.label ? esc(lp.label) : `${mmss(lp.loopA)}–${mmss(lp.loopB)}`;
         return `<li class="bg-dark-700/60 border border-gray-800 rounded-lg p-2 mb-1.5">
             <div class="flex items-center justify-between gap-2">
-                <span class="text-sm font-semibold text-gray-200">${range}</span>${badge}
+                <span class="text-sm font-semibold text-gray-200">${range}</span>
+                <span class="flex items-center gap-2">${recur}${badge}</span>
             </div>
             <div class="text-[11px] text-gray-400 mt-0.5">${reasons}</div>
             <div class="flex gap-2 mt-1.5">

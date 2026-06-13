@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS practice_loops (
   loop_b REAL NOT NULL,
   reasons_json TEXT,
   passed INTEGER DEFAULT 0,
+  hit_count INTEGER DEFAULT 1,   -- # of plays this hotspot recurred on (priority)
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_practice_loops_song ON practice_loops(song_id, loop_a);
@@ -460,6 +461,11 @@ def setup(app, context):
                 conn.execute("ALTER TABLE play_notes ADD COLUMN miss_kind TEXT")
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # Migrate practice_loops created before the recurrence counter.
+            try:
+                conn.execute("ALTER TABLE practice_loops ADD COLUMN hit_count INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         log.info("note_detect plays DB: %s", _PLAYS_DB_PATH)
         return _PLAYS_DB_PATH
 
@@ -590,26 +596,44 @@ def setup(app, context):
             raise HTTPException(400, "songId and loopA<loopB required")
         _ensure_plays_db()
 
+        a_f, b_f = float(a), float(b)
+
         def _work():
             with _plays_db() as conn:
-                # De-dupe: a loop within 0.25s of an existing one for this song
-                # is the same hotspot — update its label/reasons instead of
-                # piling up near-identical rows across replays.
-                existing = conn.execute(
-                    "SELECT id FROM practice_loops WHERE song_id = ? AND ABS(loop_a - ?) < 0.25 AND ABS(loop_b - ?) < 0.25",
-                    (song_id, float(a), float(b)),
-                ).fetchone()
                 reasons = json.dumps(data.get("reasons")) if data.get("reasons") is not None else None
-                if existing:
+                # De-dupe by RANGE OVERLAP, not near-identical endpoints. A
+                # recurring hotspot shows up with slightly shifted bounds each
+                # play (e.g. 20.0–21.5 then 19.8–21.8); the old ±0.25s endpoint
+                # match missed those and piled up duplicates. Match any existing
+                # loop whose range overlaps the new one by at least half the
+                # shorter span — that's "the same spot". On a match, ROLL IN:
+                # bump hit_count (priority), refresh reasons, and clear `passed`
+                # (the spot came back, so it's active again). Range is kept as-is
+                # so the loop doesn't creep wider every replay. Distinct adjacent
+                # spots (little overlap) still get their own loop.
+                cands = conn.execute(
+                    "SELECT id, loop_a, loop_b, hit_count FROM practice_loops "
+                    "WHERE song_id = ? AND loop_a < ? AND loop_b > ?",
+                    (song_id, b_f, a_f),
+                ).fetchall()
+                match = None
+                for r in cands:
+                    overlap = min(b_f, r["loop_b"]) - max(a_f, r["loop_a"])
+                    shorter = min(b_f - a_f, r["loop_b"] - r["loop_a"])
+                    if shorter > 0 and overlap >= 0.5 * shorter:
+                        match = r
+                        break
+                if match:
                     conn.execute(
-                        "UPDATE practice_loops SET label = ?, reasons_json = ? WHERE id = ?",
-                        (data.get("label"), reasons, existing["id"]),
+                        "UPDATE practice_loops SET label = ?, reasons_json = ?, "
+                        "hit_count = ?, passed = 0 WHERE id = ?",
+                        (data.get("label"), reasons, (match["hit_count"] or 1) + 1, match["id"]),
                     )
-                    return existing["id"]
+                    return match["id"]
                 cur = conn.execute(
-                    "INSERT INTO practice_loops (song_id, label, loop_a, loop_b, reasons_json, passed, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 0, ?)",
-                    (song_id, data.get("label"), float(a), float(b), reasons,
+                    "INSERT INTO practice_loops (song_id, label, loop_a, loop_b, reasons_json, passed, hit_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
+                    (song_id, data.get("label"), a_f, b_f, reasons,
                      datetime.now(timezone.utc).isoformat()),
                 )
                 return cur.lastrowid
@@ -627,16 +651,18 @@ def setup(app, context):
 
         def _work():
             with _plays_db() as conn:
+                # Priority order: most-recurring hotspots first, then by time.
                 rows = conn.execute(
-                    "SELECT id, song_id, label, loop_a, loop_b, reasons_json, passed, created_at "
-                    "FROM practice_loops WHERE song_id = ? ORDER BY loop_a",
+                    "SELECT id, song_id, label, loop_a, loop_b, reasons_json, passed, "
+                    "COALESCE(hit_count, 1) AS hit_count, created_at "
+                    "FROM practice_loops WHERE song_id = ? ORDER BY hit_count DESC, loop_a",
                     (song_id,),
                 ).fetchall()
                 return [{
                     "id": r["id"], "songId": r["song_id"], "label": r["label"],
                     "loopA": r["loop_a"], "loopB": r["loop_b"],
                     "reasons": json.loads(r["reasons_json"]) if r["reasons_json"] else [],
-                    "passed": bool(r["passed"]), "createdAt": r["created_at"],
+                    "passed": bool(r["passed"]), "hitCount": r["hit_count"], "createdAt": r["created_at"],
                 } for r in rows]
 
         loops = await anyio.to_thread.run_sync(_work)
