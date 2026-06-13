@@ -2113,6 +2113,7 @@ function createNoteDetector(options = {}) {
     let drillConductorRung = 0;             // index into the ladder
     let drillConductorGoal = _ND_DRILL_DEFAULT_GOAL;  // 0..1 iteration accuracy to advance
     let drillConductorBest = 0;             // best iteration accuracy (0..1) at the current rung
+    let drillConductorFailStreak = 0;       // consecutive sub-goal passes at the current rung → auto-slowdown at 3
     let drillConductorFocus = null;         // coaching string shown in the HUD ("Late by 30ms")
     let drillConductorLabel = null;
     let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
@@ -5724,6 +5725,7 @@ function createNoteDetector(options = {}) {
         drillConductorRung = 0;
         drillConductorGoal = Number.isFinite(goal) ? Math.max(0, Math.min(1, goal)) : _ND_DRILL_DEFAULT_GOAL;
         drillConductorBest = 0;
+        drillConductorFailStreak = 0;
         drillConductorFocus = focus;
         drillConductorLabel = label || `${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s`;
         drillConductorRange = { loopStart, loopEnd, judgeStart, judgeEnd };
@@ -5823,12 +5825,33 @@ function createNoteDetector(options = {}) {
             // speed (the goal must be re-earned at the harder tempo).
             drillConductorRung = decision.nextRung;
             drillConductorBest = 0;
+            drillConductorFailStreak = 0;
             const toPct = Math.round((drillConductorLadder[drillConductorRung] || 1) * 100);
             _hostSetSpeed(drillConductorLadder[drillConductorRung]);
             _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
         } else {
-            // Held below the goal — show WHICH notes were missed this pass and HOW.
-            _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
+            // Held below the goal. Struggling for 3 straight passes → SLOW DOWN
+            // (the user asked for this): step back to a slower rung if we
+            // advanced too soon, or extend the ladder below the floor (down to
+            // 40%) if already at the slowest. Meet the player where they are.
+            drillConductorFailStreak++;
+            if (drillConductorFailStreak >= 3) {
+                if (drillConductorRung > 0) {
+                    drillConductorRung--;                       // back off a premature advance
+                } else {
+                    const cur = drillConductorLadder[0] || 1;
+                    const slower = Math.max(0.4, Math.round((cur - 0.15) * 100) / 100);
+                    if (slower < cur - 1e-6) drillConductorLadder.unshift(slower);  // rung stays 0 → now slower
+                }
+                const sp = drillConductorLadder[drillConductorRung] || 1;
+                drillConductorBest = 0;
+                drillConductorFailStreak = 0;
+                _hostSetSpeed(sp);
+                _drillConductorUpdateHud({ lastScore: score, slowedToPct: Math.round(sp * 100) });
+            } else {
+                // Show WHICH notes were missed this pass and HOW.
+                _drillConductorUpdateHud({ lastScore: score, misses: _ndSummarizeWindowMisses(arr, judgeStart, judgeEnd) });
+            }
         }
         // Click cursor resets in _drillConductorTick on the playhead's backward
         // jump — no scheduling here (the tick owns the metronome now).
@@ -5991,7 +6014,7 @@ function createNoteDetector(options = {}) {
     function _drillConductorUpdateHud(extra = {}) {
         const hud = document.getElementById('nd-drill-hud');
         if (!hud) return;
-        const { lastScore = null, graduated = false, advanced = false, toPct = null, misses = null } = extra;
+        const { lastScore = null, graduated = false, advanced = false, toPct = null, slowedToPct = null, misses = null } = extra;
         const speedPct = drillConductorLadder
             ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
         const goalPct = Math.round((drillConductorGoal || 0) * 100);
@@ -6005,6 +6028,8 @@ function createNoteDetector(options = {}) {
             banner = `<div class="text-green-300 font-bold text-sm">✓ Nailed it at full speed — drill complete!</div>`;
         } else if (advanced) {
             banner = `<div class="text-green-300 font-bold text-sm">▲ Time to go faster — now ${toPct != null ? toPct : speedPct}% speed</div>`;
+        } else if (slowedToPct != null) {
+            banner = `<div class="text-blue-300 font-bold text-sm">▼ Slowing to ${slowedToPct}% — get it solid here first</div>`;
         } else if (lastPct != null) {
             const ok = lastPct >= goalPct;
             banner = ok
