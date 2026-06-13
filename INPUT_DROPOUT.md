@@ -209,6 +209,20 @@ that an aligned replay reproduces the live score requires ONE recording on the
 with zero further playing. That single play unblocks indefinite no-play
 iteration.
 
+### VALIDATED 2026-06-13 — harness is faithful
+
+The user played a near-perfect Gasoline take on 1.25.0: live 304/305 = 100%,
+stamped `rec_start = -0.0853s` (recording started ~85ms before chart t=0).
+`replay-take.sh` on that (WAV, log) pair, with the stamp aligning the audio,
+scored **96–99% headless** (tight ±ms sweep, peak 99% at +60–100ms) vs 100%
+live. The old ~38% was ENTIRELY the WAV↔chart misalignment, NOT a detection
+gap — the stamp closed it. The replay loop now reproduces live scoring, so
+detection/tuning iteration is fully play-free. Residual 1–2 notes is
+frame-timing granularity. **Harness fidelity: CLOSED.**
+
+(A partial take the same session stamped `rec_start = 62.36s` — the recording
+armed 62s in — confirming the stamp captures large offsets correctly too.)
+
 ## Rig-side checklist (cheap tests the user can run)
 
 These isolate the device from slopsmith. Each has a clear pass/fail:
