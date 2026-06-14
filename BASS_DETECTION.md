@@ -176,11 +176,19 @@ on the real take (fires on 64.5 s — open A rang where the chart wanted B1 fret
 NO audio ever leaves the device — pure local FFT/comb; only the verdict reaches
 the LLM. Refactored `_ndHarmonicCombCount` out of `_ndHarmonicCoherenceLow`.
 
+### #8 — rescue-window scan: center-outward + widened (2026-06-14, 1.29.0) ✅
+The live D2-fret-5 drops (#7) PASS the centered primitive — a rescue-alignment
+problem. `_tryBassRescue` scanned ±120 ms left-to-right and broke on the FIRST
+hit, so on a REPEATED note (the same fret three bars running) it could lock onto
+the PREVIOUS instance's audio, and live A/V drift on dense low passages was
+landing just outside ±120 ms. Fix: scan CENTER-OUTWARD (0, +STEP, −STEP, …) so
+the on-time position wins, and widen to ±160 ms. End-to-end on the clean WYOC
+take (`replay-take.sh`): best recall **75% → 80%**, up at nearly every offset;
+171/171 tests green. Only the EXPECTED pitch is matched, so the wider scan can't
+admit a wrong note; center-outward bounds the same-pitch-neighbour risk.
+
 ## NEXT
-1. The live D2-fret-5 drops are a RESCUE-WINDOW alignment problem (they pass the
-   centered primitive). Investigate the rescue center (`noteHwTime`) / live A/V
-   offset estimate — widen or re-center the ±120 ms scan, don't lower thresholds.
-2. Cut rescue CPU now that the primitive is stronger — fewer notes should need
+1. Cut rescue CPU now that the primitive is stronger — fewer notes should need
    the ±120 ms 16k-FFT scan (it correlates with the main-thread DSP-starvation
    dropout, see INPUT_DROPOUT.md). Measure rescue invocation count before/after.
 3. Validate live: user plays against the 1.26.0 build (expect the drill's

@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.28.0';
+const _ND_VERSION = '1.29.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -4460,24 +4460,34 @@ function createNoteDetector(options = {}) {
         const noteHwTime = noteTime - avOffsetSec + latencyOffset;
         const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
         const center = _rescueBuf.length - samplesBack;
-        // SEARCH a small range around the expected center rather than trusting
-        // a single position: the live audio path has processing latency the
-        // harness doesn't, so the stamp drifts ~50-130 ms, and the per-take
-        // A/V offset is approximate. Scanning ±120 ms makes the rescue robust
-        // to both — it finds the note's true position. The window only matches
-        // the EXPECTED pitch, so scanning doesn't admit wrong notes.
-        const SEARCH = Math.round(0.12 * sr);
+        // SEARCH a range around the expected center rather than trusting a
+        // single position: the live audio path has processing latency the
+        // harness doesn't, so the stamp drifts ~50-160 ms, and the per-take
+        // A/V offset is approximate. The window only matches the EXPECTED
+        // pitch, so scanning doesn't admit wrong notes.
+        //
+        // Scan CENTER-OUTWARD (0, +STEP, -STEP, +2·STEP, …) and take the first
+        // hit. On a REPEATED note (e.g. the same fret played three bars running)
+        // a left-to-right scan that broke on the earliest hit could lock onto
+        // the PREVIOUS instance's audio; center-outward prefers the on-time
+        // position, so a rescued note is credited at roughly its real moment.
+        // Widened to ±160 ms (was ±120) — live drift on dense low passages was
+        // landing just outside the old window and conceding present notes.
+        const SEARCH = Math.round(0.16 * sr);
         const STEP = Math.round(0.04 * sr);
+        const maxK = Math.floor(SEARCH / STEP);
         let r = null;
-        for (let d = -SEARCH; d <= SEARCH; d += STEP) {
-            const start = center + d - (_RESCUE_WIN >> 1);
-            if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) continue;
-            const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
-            const cand = _ndConstraintCheckString(
-                win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
-                tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
-            );
-            if (cand && cand.hit) { r = cand; break; }
+        for (let k = 0; k <= maxK && !r; k++) {
+            for (const d of (k === 0 ? [0] : [k * STEP, -k * STEP])) {
+                const start = center + d - (_RESCUE_WIN >> 1);
+                if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) continue;
+                const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+                const cand = _ndConstraintCheckString(
+                    win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
+                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
+                );
+                if (cand && cand.hit) { r = cand; break; }
+            }
         }
         if (!r) return null;
         // Found at its expected position: an on-time hit. The 60c band-verify
