@@ -187,25 +187,34 @@ take (`replay-take.sh`): best recall **75% → 80%**, up at nearly every offset;
 171/171 tests green. Only the EXPECTED pitch is matched, so the wider scan can't
 admit a wrong note; center-outward bounds the same-pitch-neighbour risk.
 
+### #9 — rescue CPU: silent-region early-out (2026-06-14, 1.30.0) ✅
+The ±160 ms rescue scan is up to 9 × 16384-pt FFTs per conceded miss — the main-
+thread load suspected in the input-dropout starvation (INPUT_DROPOUT.md). Measured
+(instrumented `summary.rescue` in the diagnostic): clean WYOC take = 150 calls /
+**534 FFTs** / 106 recovered. The true misses (~44) each burned the full 9-window
+scan (~74% of the FFTs) finding nothing. Worse on a sparse/poor play — exactly
+when dropouts were reported.
+
+Fix: the center window is 340 ms wide and the search only ±160 ms, so a note
+anywhere in range lights the CENTER window's string band. After the center FFT,
+if its band energy is below a silent floor (0.008, under the 0.015 hit gate),
+skip the remaining ≤8 FFTs — the note simply wasn't played here. A bleed-masked
+real miss keeps HIGH band energy, so it's never skipped (gate is conservative).
+Validated: clean take UNCHANGED (534 FFTs, 84% recall — nothing gated); a
+silenced-half WAV (135 true gaps) dropped from ~1290 → **207 FFTs (~84% fewer)**
+with recall on the played half unchanged. 171/171 tests green. `summary.rescue`
+{calls,windows,hits,skipped_silent} now rides the diagnostic for live telemetry.
+
 ## NEXT
-1. Cut rescue CPU now that the primitive is stronger — fewer notes should need
-   the ±120 ms 16k-FFT scan (it correlates with the main-thread DSP-starvation
-   dropout, see INPUT_DROPOUT.md). Measure rescue invocation count before/after.
-3. Validate live: user plays against the 1.26.0 build (expect the drill's
-   "impossible" low-E frets to become hittable).
-4. Port the harmonic-coherence idea into the desktop native verifier
-   (`harmonicVerify` path) for parity with the browser path.
-5. Validate live: user plays against the proj/bass-detection build (expect ~97%+).
-2. Validate on a second clean take (Gasoline — lower tessitura, denser).
-3. The last ~5 points: notes that retire before the rescue window is buffered
-   (very start), and genuinely-coarse pitch reads. Consider widening the bass
-   pitchHitThreshold (the 20c hit gate vs the 60c verify gate currently loses
-   notes that verify but don't hit) and harmonic-sum verify.
-4. Tune: rescue window length (16384 vs adaptive), buffer size, CPU on dense
-   passages (one 16k FFT per retiring bass miss).
-4. Design integration: accumulate a longer buffer specifically for the bass
-   pitch-verify path (the per-string `constraintCheckString`), without
-   lengthening the onset/timing path. The frameSize setting (callback
-   granularity) is separate and already tuned (2048).
-5. Consider harmonic-sum pitch verification (sum f0+2f0+3f0…) as a
-   complementary robustness win on weak fundamentals.
+1. Live validation (needs the user): on 1.30.0, expect (a) the WYOC low notes to
+   keep scoring high, (b) the drill's previously-"impossible" low-E frets to be
+   hittable, (c) mute-fails labelled, (d) the dropout NOT to fire on a poor play
+   (rescue FFTs now short-circuit on silence — watch `summary.rescue` telemetry).
+2. The remaining live drops are rescue-window alignment, not threshold — the
+   center-outward+widen (#8) helped; if drops persist, investigate the live A/V
+   offset estimate feeding `noteHwTime` rather than widening further.
+3. Port the harmonic-coherence fallback (#6) + mute-fail into the DESKTOP native
+   verifier (`harmonicVerify` path) for parity with the browser/web-app path.
+4. If still chasing the last points: notes that retire before `_rescueBuf` fills
+   (very start of a song), and a possible wider bass pitchHitThreshold (the 20c
+   hit gate vs the 60c verify gate loses notes that verify but don't hit).

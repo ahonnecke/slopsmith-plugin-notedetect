@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.29.0';
+const _ND_VERSION = '1.30.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -2276,6 +2276,11 @@ function createNoteDetector(options = {}) {
     const _RESCUE_WIN = 16384;       // ~340 ms — resolves a 55 Hz fundamental
     let _rescueBuf = new Float32Array(0);
     let _rescueBufEndT = 0;          // hw time (s) of the newest sample in _rescueBuf
+    // Rescue cost telemetry (the 16k-FFT scan is the main-thread load suspected
+    // in the input-dropout starvation — INPUT_DROPOUT.md). _rescueWindows counts
+    // 16384-pt FFTs; _rescueSkippedSilent counts scans short-circuited by the
+    // cheap RMS pre-gate (a true no-play has nothing to rescue).
+    let _rescueCalls = 0, _rescueWindows = 0, _rescueHits = 0, _rescueSkippedSilent = 0;
 
     // Tuning — per-instance so panels can be on different songs.
     // tuningOffsets is resized to match the actual string count on enable();
@@ -4454,6 +4459,7 @@ function createNoteDetector(options = {}) {
         if (currentArrangement !== 'bass' || _rescueBuf.length < _RESCUE_WIN) return null;
         const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
         if (!(sr > 0) || !Number.isFinite(expectedMidi)) return null;
+        _rescueCalls++;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         // The note's audio sits at hw time = noteTime - avOffset + latency
         // (inverse of the match clock t = hwTime + avOffset - latency).
@@ -4476,20 +4482,37 @@ function createNoteDetector(options = {}) {
         const SEARCH = Math.round(0.16 * sr);
         const STEP = Math.round(0.04 * sr);
         const maxK = Math.floor(SEARCH / STEP);
+        // Cheap early-out: the center window is 340 ms wide and the search only
+        // ±160 ms, so a note anywhere in range contributes energy to the CENTER
+        // window. If the center has essentially no energy in this string's band,
+        // the note simply wasn't played here — the ±offset windows can't conjure
+        // it, so skip the remaining (up to 8) 16384-pt FFTs. This is the win for
+        // the input-dropout case (a poor/sparse play = many silent misses, each
+        // otherwise burning a full 9-window scan on the main thread). The gate
+        // floor sits below the 0.015 hit gate, so a bleed-masked note (band
+        // energy stays HIGH on a real miss) is never skipped — only true gaps.
+        const _RESCUE_SILENT_BAND = 0.008;
         let r = null;
         for (let k = 0; k <= maxK && !r; k++) {
             for (const d of (k === 0 ? [0] : [k * STEP, -k * STEP])) {
                 const start = center + d - (_RESCUE_WIN >> 1);
                 if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) continue;
                 const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+                _rescueWindows++;
                 const cand = _ndConstraintCheckString(
                     win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
                     tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
                 );
                 if (cand && cand.hit) { r = cand; break; }
+                // After the center window, bail the whole scan if the region is silent.
+                if (k === 0 && cand && cand.bandEnergy < _RESCUE_SILENT_BAND) {
+                    _rescueSkippedSilent++;
+                    return null;
+                }
             }
         }
         if (!r) return null;
+        _rescueHits++;
         // Found at its expected position: an on-time hit. The 60c band-verify
         // gate is the bass detection standard, so report it as on-pitch (the
         // tighter pitchHitThreshold is too fine for coarse low bins).
@@ -7608,6 +7631,9 @@ function createNoteDetector(options = {}) {
                 best_streak: bestStreak,
                 singles: { hits: _diagSingles.hits, misses: _diagSingles.misses, accuracy: sAcc },
                 chords:  { hits: _diagChords.hits,  misses: _diagChords.misses,  accuracy: cAcc },
+                // Bass-rescue cost: 16384-pt FFTs are the main-thread load
+                // suspected in the input-dropout starvation (INPUT_DROPOUT.md).
+                rescue: { calls: _rescueCalls, windows: _rescueWindows, hits: _rescueHits, skipped_silent: _rescueSkippedSilent },
             },
             miss_breakdown: { ..._diagBreakdown },
             per_string: _diagPerString.map((slot, s) => ({
