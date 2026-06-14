@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.25.0';
+const _ND_VERSION = '1.26.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -277,6 +277,30 @@ const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
 // passages. Rides the IPC — no native rebuild to recalibrate.
 const _ND_VERIFY_PRESENCE_RATIO = 0.0;
 const _ND_VERIFY_PRESENCE_RATIO_BASS = 0.3;
+
+// Low-fundamental harmonic-coherence fallback for the BROWSER pitch-verify
+// (_ndConstraintCheckString). The browser path picks the single loudest bin in
+// the whole [open..fret24] string band and asks "what pitch is this" — but on
+// bass you fret without muting, so an open string or a neighbour rings LOUDER
+// than the fretted note and the peak lands on the wrong (lower) frequency. The
+// cents gate then rejects a note that is plainly present (BASS_DETECTION.md:
+// measured on a clean Why'd-You-Only-Call take the single-peak primitive scored
+// only 59%, with A1/G#1 0% and C#2/D2 ~50% — all bleed-masked). The cure is to
+// stop trusting the loudest bin and instead confirm the EXPECTED note's own
+// harmonic series: harmonics 2f0,3f0,4f0,5f0 sit at higher frequencies where
+// the FFT bins are fine, and a coincidental bleed/neighbour collision rarely
+// reproduces the whole ratio-locked comb. This runs ONLY as an additive
+// fallback when the cents check fails AND the fundamental is low (≤ this Hz),
+// so it can never drop a note guitar/higher-bass already passes — it only
+// rescues the low blind spot. Restored the same clean take 59%→72% at the
+// primitive level (A1 0/9→9/9, C#2 30/60→59/60) while a cross-song control
+// (this chart vs unrelated bass audio) held false-accepts near the single-peak
+// floor. See tools/probe-bleed.js for the frontier sweep these were tuned on.
+const _ND_HARMONIC_FALLBACK_MAX_HZ = 140;   // ~C#3; covers the whole 4-string bass blind spot
+const _ND_HARMONIC_FALLBACK_RATIOS = [1, 2, 3, 4, 5];
+const _ND_HARMONIC_FALLBACK_HALF_CENTS = 80; // ±half-window around each harmonic (≈1.5 coarse low bins)
+const _ND_HARMONIC_FALLBACK_PEAK_FRAC = 0.40; // each counted harmonic ≥ this fraction of the band peak
+const _ND_HARMONIC_FALLBACK_MIN_HARMONICS = 3; // need this many coherent harmonics to accept
 
 // Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
 // `fundamentalRatio` feed both the setChart payload and the scoreChord
@@ -1255,7 +1279,53 @@ function _ndConstraintCheckString(
     const centsError = _ndFoldOctaveCents(rawCentsError);
     const centsDiff = Math.abs(centsError);
 
-    return { hit: centsDiff <= pitchCheckCents, bandEnergy, centsDiff, centsError };
+    let hit = centsDiff <= pitchCheckCents;
+    // Bleed rescue for the low blind spot: the single-peak read above grabbed
+    // the loudest bin in the whole band, which on bass is often an open string
+    // or neighbour ringing under the fretted note — so a present low note gets
+    // rejected. When the cents check fails AND the expected fundamental is low,
+    // fall back to confirming the EXPECTED note's harmonic comb directly. Purely
+    // additive: it can only turn a miss into a hit, never the reverse, so guitar
+    // and higher-bass behaviour is byte-identical. See _ND_HARMONIC_FALLBACK_*.
+    if (!hit && expectedHz <= _ND_HARMONIC_FALLBACK_MAX_HZ
+        && _ndHarmonicCoherenceLow(magnitudes, binHz, expectedHz, peakVal)) {
+        hit = true;
+    }
+    return { hit, bandEnergy, centsDiff, centsError };
+}
+
+// Count how many of the expected note's harmonics (k·f0 for the configured
+// ratios) appear as a genuine LOCAL-MAXIMUM spectral peak whose magnitude is at
+// least _ND_HARMONIC_FALLBACK_PEAK_FRAC of the band's peak, within
+// ±_ND_HARMONIC_FALLBACK_HALF_CENTS of the ideal harmonic frequency; accept the
+// note when at least _ND_HARMONIC_FALLBACK_MIN_HARMONICS line up. Keying on the
+// upper harmonics (well-resolved at higher Hz) and requiring ratio-locked
+// peaks is what separates a genuinely-ringing low note from open-string bleed
+// or a coincidental neighbour — see the note on _ND_HARMONIC_FALLBACK_MAX_HZ.
+function _ndHarmonicCoherenceLow(magnitudes, binHz, expectedHz, bandPeakMag) {
+    if (!(bandPeakMag > 0) || !(expectedHz > 0) || !(binHz > 0)) return false;
+    const widen = Math.pow(2, _ND_HARMONIC_FALLBACK_HALF_CENTS / 1200);
+    const floor = _ND_HARMONIC_FALLBACK_PEAK_FRAC * bandPeakMag;
+    const nBins = magnitudes.length;
+    let coherent = 0;
+    for (const k of _ND_HARMONIC_FALLBACK_RATIOS) {
+        const f = expectedHz * k;
+        const lo = Math.max(1, Math.floor((f / widen) / binHz));
+        const hi = Math.min(nBins - 2, Math.ceil((f * widen) / binHz));
+        let bestBin = -1;
+        let bestVal = -Infinity;
+        for (let b = lo; b <= hi; b++) {
+            if (magnitudes[b] > bestVal) { bestVal = magnitudes[b]; bestBin = b; }
+        }
+        if (bestBin < 0 || bestVal < floor) continue;
+        // Require a true local maximum — a bleed/neighbour harmonic leaking into
+        // the window is a shoulder, not a peak.
+        if (magnitudes[bestBin] >= magnitudes[bestBin - 1] && magnitudes[bestBin] >= magnitudes[bestBin + 1]) {
+            coherent++;
+            if (coherent >= _ND_HARMONIC_FALLBACK_MIN_HARMONICS) return true;
+        }
+    }
+    return false;
 }
 
 // Score a chord by checking each of its constituent notes against their

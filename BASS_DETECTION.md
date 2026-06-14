@@ -101,8 +101,59 @@ recovering real notes). The build correctly surfaced the user's one real miss
 removing the detector's ~30% false misses makes a REAL miss stand out instead
 of drowning in noise.
 
+### #6 — open-string BLEED is the primitive's core failure; harmonic-coherence fallback (2026-06-13) ✅
+The rescue (#4) hides the problem at the *matcher* level, but the underlying
+pitch-verify primitive (`_ndConstraintCheckString`, the browser/web-app path)
+is itself only ~59% on a clean take — and the rescue, the chord scorer, and the
+drill's "unhearable low E" all call it, so its weakness leaks everywhere.
+
+REPRO (faithful harness, `tools/bass-recall.js`): clean Why'd-You-Only-Call take
+(`live_20260613_123140` ↔ WAV `…183425`, stamped chart-start −0.0853), 16384
+window — **59% primitive recall**, jagged per-pitch: A1(55) 0/9, G#1(52) 0/3,
+E2(82) 2/11, C#2(69) 30/60, D2(73) 39/70, yet E1(41) 21/26 and B1(62) 38/47.
+
+DIAGNOSIS (refines the baseline): not bin-resolution — it's BLEED. The pitch
+check picks the single loudest bin across the WHOLE `[open..fret24]` string band
+(2+ octaves) and asks "what note is this". On bass you fret without muting, so
+an open string / neighbour rings LOUDER than the fretted note; the peak lands on
+the wrong, lower frequency and the cents gate rejects a present note. That's why
+A1-on-E-string (open-E bleed) is 0% while E1 (the open E itself) is 81%, and why
+E1(41) beats A1(55) — the opposite of a bin-resolution story.
+
+FIX (`_ndHarmonicCoherenceLow`, additive): when the cents check fails AND the
+expected fundamental ≤ 140 Hz, confirm the EXPECTED note's own harmonic comb —
+≥3 of harmonics 1–5 present as local-max peaks ≥40% of the band peak within
+±80 ¢. Upper harmonics sit where bins are fine and are ratio-locked, so a bleed
+/ neighbour collision rarely reproduces the whole comb. Purely additive — can
+only flip a miss to a hit, so guitar / higher-bass behaviour is byte-identical.
+
+RESULTS (`tools/probe-bleed.js` swept the frontier these thresholds sit on):
+- Primitive recall (bass-recall, clean take): **59% → 73%** (G#1 0→100%, C#2
+  30→44, D2 39→54, B1 38→41, E1 21→23). A1(55) still 0/9 — the open-A bleed peak
+  is so dominant that 40%-of-band-peak excludes the real comb there; residual.
+- End-to-end (full rescue+matcher, `replay-take.sh`, same take): **68% → 75%**
+  best (191→210/281), +6–7 pts at every A/V offset.
+- Precision held: cross-song control (this chart vs unrelated Creep bass audio,
+  every hit a false positive) 5% → 10% — and that 10% is a harsh bound (only 8
+  bass pitches share the 40–90 Hz range). 165/165 node tests green, incl. new
+  bleed-rescue + bleed-precision + low-freq-gating tests.
+
+Shipped 1.26.0. Tooling added: `tools/probe-bleed.js` (verifier frontier sweep),
+`test/_loader` now exposes `fftMagnitude`.
+
 ## NEXT
-1. Validate live: user plays against the proj/bass-detection build (expect ~97%+).
+1. Recover A1(55) and lift E2(82)/F#1(46): the open-string-bleed peak dominates
+   the band, so 40%-of-band-peak is too high a bar there. Try ranking the
+   fallback's harmonic floor off the LOCAL spectral floor (median) instead of
+   the band peak, or down-weighting the open-string bin when it's the band peak.
+2. Cut rescue CPU now that the primitive is stronger — fewer notes should need
+   the ±120 ms 16k-FFT scan (it correlates with the main-thread DSP-starvation
+   dropout, see INPUT_DROPOUT.md). Measure rescue invocation count before/after.
+3. Validate live: user plays against the 1.26.0 build (expect the drill's
+   "impossible" low-E frets to become hittable).
+4. Port the harmonic-coherence idea into the desktop native verifier
+   (`harmonicVerify` path) for parity with the browser path.
+5. Validate live: user plays against the proj/bass-detection build (expect ~97%+).
 2. Validate on a second clean take (Gasoline — lower tessitura, denser).
 3. The last ~5 points: notes that retire before the rescue window is buffered
    (very start), and genuinely-coarse pitch reads. Consider widening the bass

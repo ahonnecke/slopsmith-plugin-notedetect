@@ -249,6 +249,11 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         nearestOctaveCents: sandbox._ndNearestOctaveCents,
         stringBandHz: sandbox._ndStringBandHz,
         bandEnergy: sandbox._ndBandEnergy,
+        // Raw magnitude spectrum — exposed for the bass-recall DSP tooling
+        // (BASS_DETECTION.md) so harness scripts can probe peak vs harmonic-comb
+        // behaviour without re-implementing the FFT. Returns sandbox-realm
+        // typed arrays; copy if you need main-realm deep-equal.
+        fftMagnitude: sandbox._ndFftMagnitude,
         // Rewrap the sandbox-realm array into a main-realm one so node:assert
         // deep-equals it cleanly.
         perStringEnergy: (...args) => {

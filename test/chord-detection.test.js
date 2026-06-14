@@ -143,6 +143,74 @@ test('constraintCheckString: pitch check accepts octave-up detector peak', () =>
     assert.ok(r.centsDiff < 50, `centsDiff ${r.centsDiff} should be < 50`);
 });
 
+// ── low-fundamental harmonic-coherence fallback (open-string BLEED) ──────────
+//
+// On bass you fret without muting the lower strings, so an open string rings
+// LOUDER than the fretted note. The single-peak pitch check then grabs the loud
+// open-string bin and rejects a note that is plainly present (BASS_DETECTION.md
+// bleed diagnosis). The additive harmonic-coherence fallback confirms the
+// EXPECTED note's own harmonic comb instead — see _ndHarmonicCoherenceLow.
+
+// Mix raw components at independent amplitudes (no global normalize — we WANT
+// the open-string component to dominate the band peak).
+function mixComponents(comps, sr, durSec) {
+    const n = Math.round(sr * durSec);
+    const buf = new Float32Array(n);
+    for (const [freq, amp] of comps) {
+        const omega = 2 * Math.PI * freq;
+        for (let i = 0; i < n; i++) buf[i] += amp * Math.sin(omega * i / sr);
+    }
+    return buf;
+}
+
+const BASS_4 = { arrangement: 'bass', stringCount: 4, offsets: [0, 0, 0, 0], capo: 0 };
+
+test('constraintCheckString: low-bass bleed — loud open-A masks fretted C#2, fallback rescues it', () => {
+    // String 1 (A1, MIDI 33 = 55 Hz), fret 4 → C#2 (MIDI 37 = 69.30 Hz). The
+    // open A rings louder (amp 0.6) than the fretted note's components, so the
+    // single-peak read lands on 55 Hz (~393 cents off the expected 69 Hz) and
+    // the cents gate alone would reject. The fretted C#2 IS present, with strong
+    // upper harmonics (138/208/277 Hz) → the harmonic-coherence fallback accepts.
+    const longDur = 16384 / SR;
+    const buf = mixComponents([
+        [55.00, 0.60],   // open-A bleed — the loudest single component (band peak)
+        [69.30, 0.30],   // C#2 fundamental (weak, as on a real DI)
+        [138.59, 0.50],  // 2nd harmonic
+        [207.89, 0.50],  // 3rd harmonic
+        [277.18, 0.50],  // 4th harmonic
+    ], SR, longDur);
+    const r = core.constraintCheckString(buf, SR, /*string*/ 1, /*fret*/ 4,
+        'bass', 4, BASS_4.offsets, 0, /*pitchCheckCents*/ 60);
+    // The single-peak read genuinely missed (proves the bleed bug is present)…
+    assert.ok(r.centsDiff > 60, `single-peak centsDiff ${r.centsDiff} should exceed the 60c gate (grabbed open-A bleed)`);
+    // …yet the note counts, rescued by the harmonic-coherence fallback.
+    assert.equal(r.hit, true, 'harmonic-coherence fallback should rescue the bleed-masked C#2');
+});
+
+test('constraintCheckString: low-bass bleed precision — open A alone does NOT credit fretted C#2', () => {
+    // Only the open A (55 Hz + its own harmonics) rings; the C#2 was never
+    // played. Its harmonics (110/165/220) do not line up with C#2's comb
+    // (69/139/208/277), so the fallback must NOT false-credit the fretted note.
+    const longDur = 16384 / SR;
+    const buf = mixComponents([
+        [55.00, 0.60], [110.0, 0.45], [165.0, 0.40], [220.0, 0.30],
+    ], SR, longDur);
+    const r = core.constraintCheckString(buf, SR, 1, 4,
+        'bass', 4, BASS_4.offsets, 0, /*pitchCheckCents*/ 60);
+    assert.equal(r.hit, false, 'open-A ring must not be mistaken for a fretted C#2');
+});
+
+test('constraintCheckString: harmonic fallback is gated to low fundamentals only', () => {
+    // A high in-band sine far off the expected pitch must still miss — the
+    // fallback only applies below _ND_HARMONIC_FALLBACK_MAX_HZ (~140 Hz), so it
+    // can never loosen guitar / higher-bass behaviour. 305 Hz vs E2 (82 Hz) on a
+    // guitar low-E string: in band, ~2266 cents off, no low-freq rescue.
+    const buf = sine(305, SR, DURATION);
+    const r = core.constraintCheckString(buf, SR, 0, 0,
+        'guitar', 6, GUITAR_6.offsets, 0, /*pitchCheckCents*/ 50);
+    assert.equal(r.hit, false, 'high-frequency off-pitch signal must not be rescued by the low-bass fallback');
+});
+
 // ── _ndScoreChord ──────────────────────────────────────────────────────────
 
 test('scoreChord: full chord with all bands ringing → 6/6 hit, isHit:true', () => {
