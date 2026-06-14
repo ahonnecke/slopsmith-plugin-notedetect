@@ -93,7 +93,74 @@ const VARIANTS = {
     'ADD_v0||lo.up2.35': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCount(x, [2, 3, 4], 60, 0.35) >= 2),
     'ADD_v0||lo.up2.30': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCount(x, [2, 3, 4], 60, 0.30) >= 2),
     'ADD_v0||lo.1of5.40>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCount(x, [1, 2, 3, 4, 5], 80, 0.40) >= 3),
+    // NOISE-FLOOR relative: count harmonics that stand SNR× above the local
+    // spectral median — decoupled from the dominant open-string bleed peak,
+    // which is what the band-peak-fraction bar was losing (the D2 drops).
+    'ADD_v0||lo.snr3>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountSnr(x, [1, 2, 3, 4, 5], 80, 3) >= 3),
+    'ADD_v0||lo.snr4>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountSnr(x, [1, 2, 3, 4, 5], 80, 4) >= 3),
+    'ADD_v0||lo.snr6>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountSnr(x, [1, 2, 3, 4, 5], 80, 6) >= 3),
+    'ADD_v0||lo.snr4>=4': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountSnr(x, [1, 2, 3, 4, 5], 80, 4) >= 4),
+    // Union of the two floors — band-peak-frac OR snr — most permissive recall.
+    'ADD_v0||lo.fracORsnr': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && (harmCount(x, [1, 2, 3, 4, 5], 80, 0.40) >= 3 || harmCountSnr(x, [1, 2, 3, 4, 5], 80, 4) >= 3)),
+    // EXCL-OPEN: keep the band-peak-fraction floor (precision), but compute the
+    // reference peak EXCLUDING the open-string fundamental — so open-string
+    // bleed dominating the band no longer raises the bar on the fretted note.
+    'ADD_v0||lo.exclOpen.40>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountRef(x, [1, 2, 3, 4, 5], 80, 0.40, x.bandPkExclOpen) >= 3),
+    'ADD_v0||lo.exclOpen.35>=3': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountRef(x, [1, 2, 3, 4, 5], 80, 0.35, x.bandPkExclOpen) >= 3),
+    'ADD_v0||lo.exclOpen.40>=2': (x) => VARIANTS.v0_singlepeak(x) || (x.expHz < 140 && harmCountRef(x, [1, 2, 3, 4, 5], 80, 0.40, x.bandPkExclOpen) >= 2),
 };
+// harmCount against an arbitrary reference magnitude (not necessarily the band peak).
+function harmCountRef(x, ks, halfCents, frac, refMag) {
+    const floor = frac * refMag;
+    let n = 0;
+    for (const k of ks) {
+        const f = x.expHz * k;
+        const pk = peakInRange(x.mag, x.binHz, f / SEMI(halfCents), f * SEMI(halfCents));
+        const b = pk.bin;
+        const localMax = b > 0 && b < x.mag.length - 1 && x.mag[b] >= x.mag[b - 1] && x.mag[b] >= x.mag[b + 1];
+        if (pk.mag >= floor && localMax) n++;
+    }
+    return n;
+}
+// Band peak excluding a ±80¢ window around the open-string fundamental (the
+// usual bleed source). If the expected note IS near the open string, fall back
+// to the full band peak (nothing to exclude).
+function bandMaxMagExclOpen(mag, binHz, loHz, hiHz, openHz, expHz) {
+    if (Math.abs(1200 * Math.log2(expHz / openHz)) < 120) return bandMaxMag(mag, binHz, loHz, hiHz);
+    const w = SEMI(80), xlo = openHz / w, xhi = openHz * w;
+    const lo = Math.max(1, Math.floor(loHz / binHz)), hi = Math.min(mag.length - 1, Math.ceil(hiHz / binHz));
+    let pk = 0;
+    for (let b = lo; b <= hi; b++) {
+        const hz = b * binHz;
+        if (hz >= xlo && hz <= xhi) continue;
+        if (mag[b] > pk) pk = mag[b];
+    }
+    return pk;
+}
+// Same as harmCount but the floor is SNR× the local spectral median (noise
+// floor) rather than a fraction of the band peak — so a tall open-string bleed
+// peak no longer raises the bar on the fretted note's own harmonics.
+function harmCountSnr(x, ks, halfCents, snr) {
+    const floor = snr * x.noiseFloor;
+    let n = 0;
+    for (const k of ks) {
+        const f = x.expHz * k;
+        const pk = peakInRange(x.mag, x.binHz, f / SEMI(halfCents), f * SEMI(halfCents));
+        const b = pk.bin;
+        const localMax = b > 0 && b < x.mag.length - 1 && x.mag[b] >= x.mag[b - 1] && x.mag[b] >= x.mag[b + 1];
+        if (pk.mag >= floor && localMax) n++;
+    }
+    return n;
+}
+// Median magnitude over the bass harmonic region [30..900] Hz — a content-
+// independent noise-floor estimate (robust to a few tall peaks).
+function noiseFloorMedian(mag, binHz) {
+    const lo = Math.max(1, Math.floor(30 / binHz)), hi = Math.min(mag.length - 1, Math.ceil(900 / binHz));
+    const vals = [];
+    for (let b = lo; b <= hi; b++) vals.push(mag[b]);
+    vals.sort((a, b) => a - b);
+    return vals.length ? vals[vals.length >> 1] : 0;
+}
 // How many of the given harmonics k*f0 appear as a LOCAL-MAX peak whose
 // magnitude is >= frac of the band peak, within ±halfCents of the ideal ratio.
 function harmCount(x, ks, halfCents, frac) {
@@ -140,7 +207,9 @@ function evalAt(offMs) {
         const [loHz, hiHz] = core.stringBandHz(nt.s, 'bass', 4, [0, 0, 0, 0], 0);
         const band = core.bandEnergy(mag, binHz, loHz, hiHz);
         const bandPk = bandMaxMag(mag, binHz, loHz, hiHz);
-        const x = { mag, binHz, expHz, openHz, loHz, hiHz, band, bandPk };
+        const noiseFloor = noiseFloorMedian(mag, binHz);
+        const bandPkExclOpen = bandMaxMagExclOpen(mag, binHz, loHz, hiHz, openHz, expHz);
+        const x = { mag, binHz, expHz, openHz, loHz, hiHz, band, bandPk, noiseFloor, bandPkExclOpen };
         const gate = band >= 0.015;
         for (const [k, fn] of Object.entries(VARIANTS)) {
             const hit = gate && fn(x);

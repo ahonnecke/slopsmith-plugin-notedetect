@@ -261,6 +261,8 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
             return { perString: Array.from(r.perString), totalEnergy: r.totalEnergy };
         },
         constraintCheckString: sandbox._ndConstraintCheckString,
+        harmonicCombCount: sandbox._ndHarmonicCombCount,
+        detectMuteFail: sandbox._ndDetectMuteFail,
         classifyTiming: sandbox._ndClassifyTiming,
         classifyPitch: sandbox._ndClassifyPitch,
         makeJudgment: (opts) => {

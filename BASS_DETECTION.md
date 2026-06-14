@@ -141,11 +141,45 @@ RESULTS (`tools/probe-bleed.js` swept the frontier these thresholds sit on):
 Shipped 1.26.0. Tooling added: `tools/probe-bleed.js` (verifier frontier sweep),
 `test/_loader` now exposes `fftMagnitude`.
 
+### #7 — live confirmation + mute-fail classification; primitive at its frontier (2026-06-14)
+LIVE on 1.26.0: a real WYOC play (`live_20260614_084452`, 306 notes) scored
+**98%** (vs ~92% on comparable 1.25.0 takes), misses 23→6 — and the dead pitches
+are clean live (A1 10/10, F#1 59/59, E2 14/14; the rescue+improved primitive
+catch A1 in the full pipeline even though the centered primitive still drops it).
+
+PER-NOTE forensics on that take's 6 misses (`tools/probe-bleed.js` alignment +
+a centered harmonic-comb probe; WAV armed 2.22 s late, unstamped): 2 genuine
+detector drops (D2 fret-5 — comb 3/5 present), 2 real flubs (C#2 fret-4 — comb
+absent; at 92.9 s the OPEN A was ringing instead), 2 marginal. So the leftover
+misses are mostly honest player misses, which is the goal.
+
+NEGATIVE result on NEXT #1: tried ranking the harmonic floor off the local
+spectral median (SNR×) and off a band-peak-excluding-the-open-string reference.
+- SNR/noise-floor: WRECKS precision — cross-song FP 5%→36% (bass harmonics tower
+  over the noise floor regardless of song, so any bass content passes). Dead end.
+- exclude-open-string band peak: ~0 real gain (the +2 pts came from lowering the
+  fraction to 0.35, not the exclusion). The masked notes' harmonics are GENUINELY
+  weak, not merely under an inflated reference.
+Conclusion: the band-peak-fraction floor is load-bearing for precision; the
+primitive is at its recall/precision frontier (~72–74%). The remaining live D2
+drops *pass* the primitive at a centered window — they're a RESCUE-window
+alignment issue, not a threshold issue. Don't chase the primitive harder.
+
+MUTE-FAIL (`_ndDetectMuteFail`, shipped 1.27.0): user confirmed "mute fail" is a
+valid miss reason. On a conceded fretted-note miss, compare the harmonic comb at
+the fretted pitch vs the open-string pitch (same `_rescueBuf` window the per-
+string energy uses); flag `muteFail` when the open string's comb is clearly
+present (≥3 harmonics) AND beats the fretted comb. Surfaced end-to-end: judgment
+`muteFail` → diag `mf` → coaching `failureType:'mute_fail'` (`player_error`, NOT
+detector_suspect) → `_ndDescribeMiss` how:'mute' + a COACH_SYSTEM rule. Validated
+on the real take (fires on 64.5 s — open A rang where the chart wanted B1 fret-2).
+NO audio ever leaves the device — pure local FFT/comb; only the verdict reaches
+the LLM. Refactored `_ndHarmonicCombCount` out of `_ndHarmonicCoherenceLow`.
+
 ## NEXT
-1. Recover A1(55) and lift E2(82)/F#1(46): the open-string-bleed peak dominates
-   the band, so 40%-of-band-peak is too high a bar there. Try ranking the
-   fallback's harmonic floor off the LOCAL spectral floor (median) instead of
-   the band peak, or down-weighting the open-string bin when it's the band peak.
+1. The live D2-fret-5 drops are a RESCUE-WINDOW alignment problem (they pass the
+   centered primitive). Investigate the rescue center (`noteHwTime`) / live A/V
+   offset estimate — widen or re-center the ±120 ms scan, don't lower thresholds.
 2. Cut rescue CPU now that the primitive is stronger — fewer notes should need
    the ±120 ms 16k-FFT scan (it correlates with the main-thread DSP-starvation
    dropout, see INPUT_DROPOUT.md). Measure rescue invocation count before/after.

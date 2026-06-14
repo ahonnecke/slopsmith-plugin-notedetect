@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.26.0';
+const _ND_VERSION = '1.27.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -566,6 +566,11 @@ function _ndDrillRampDecision(score, goal, rung, ladderLength) {
 // phrase shown per note in the drill HUD.
 function _ndDescribeMiss(j) {
     if (!j) return { how: 'missed', detail: 'no note' };
+    // Open string rang in place of the charted fretted note — a real play
+    // error (failed to fret/mute), distinct from "played nothing". Checked
+    // before the detected-pitch branches: the fretted note itself wasn't
+    // detected (detectedMidi is null), but the open string sounded.
+    if (j.muteFail) return { how: 'mute', detail: 'open string rang — fret/mute fail' };
     const dm = j.detectedMidi;
     if (dm == null || !Number.isFinite(dm)) return { how: 'missed', detail: 'not played / not detected' };
     if (j.timingState === 'LATE') return { how: 'late', detail: Number.isFinite(j.timingError) ? `${Math.round(Math.abs(j.timingError))}ms late` : 'late' };
@@ -1303,7 +1308,16 @@ function _ndConstraintCheckString(
 // peaks is what separates a genuinely-ringing low note from open-string bleed
 // or a coincidental neighbour — see the note on _ND_HARMONIC_FALLBACK_MAX_HZ.
 function _ndHarmonicCoherenceLow(magnitudes, binHz, expectedHz, bandPeakMag) {
-    if (!(bandPeakMag > 0) || !(expectedHz > 0) || !(binHz > 0)) return false;
+    return _ndHarmonicCombCount(magnitudes, binHz, expectedHz, bandPeakMag) >= _ND_HARMONIC_FALLBACK_MIN_HARMONICS;
+}
+
+// How many of `expectedHz`'s harmonics (ratios 1..5) appear as a genuine
+// local-maximum peak ≥ _ND_HARMONIC_FALLBACK_PEAK_FRAC of bandPeakMag, within
+// ±_ND_HARMONIC_FALLBACK_HALF_CENTS of the ideal harmonic frequency. The raw
+// count powers both the bleed-rescue gate (≥ MIN_HARMONICS) and the mute-fail
+// classifier (compare the comb at the fretted pitch vs the open-string pitch).
+function _ndHarmonicCombCount(magnitudes, binHz, expectedHz, bandPeakMag) {
+    if (!(bandPeakMag > 0) || !(expectedHz > 0) || !(binHz > 0)) return 0;
     const widen = Math.pow(2, _ND_HARMONIC_FALLBACK_HALF_CENTS / 1200);
     const floor = _ND_HARMONIC_FALLBACK_PEAK_FRAC * bandPeakMag;
     const nBins = magnitudes.length;
@@ -1322,10 +1336,26 @@ function _ndHarmonicCoherenceLow(magnitudes, binHz, expectedHz, bandPeakMag) {
         // the window is a shoulder, not a peak.
         if (magnitudes[bestBin] >= magnitudes[bestBin - 1] && magnitudes[bestBin] >= magnitudes[bestBin + 1]) {
             coherent++;
-            if (coherent >= _ND_HARMONIC_FALLBACK_MIN_HARMONICS) return true;
         }
     }
-    return false;
+    return coherent;
+}
+
+// Mute-fail check for a conceded miss: did the OPEN string ring in place of the
+// charted FRETTED note? (You fingered the wrong fret or failed to fret/mute, so
+// the open string sounded instead.) A genuinely valid reason to miss — distinct
+// from "played nothing" (no comb anywhere) and "detector dropped a note you
+// played" (the fretted comb IS present). Returns true only for a fretted note
+// whose open-string comb is clearly present AND stronger than the fretted
+// comb. `bandPeakMag` is the max magnitude in the string's band.
+function _ndDetectMuteFail(magnitudes, binHz, expectedHz, openHz, bandPeakMag) {
+    if (!(openHz > 0) || !(expectedHz > 0)) return false;
+    // Open note and fretted note must be meaningfully different pitches.
+    if (Math.abs(1200 * Math.log2(expectedHz / openHz)) < 120) return false;
+    const openComb = _ndHarmonicCombCount(magnitudes, binHz, openHz, bandPeakMag);
+    if (openComb < _ND_HARMONIC_FALLBACK_MIN_HARMONICS) return false;
+    const frettedComb = _ndHarmonicCombCount(magnitudes, binHz, expectedHz, bandPeakMag);
+    return openComb > frettedComb;
 }
 
 // Score a chord by checking each of its constituent notes against their
@@ -3719,6 +3749,9 @@ function createNoteDetector(options = {}) {
             // present on matched single notes) — raw signal for coaching to
             // tell bleed / wrong-string / unmuted ring apart from a clean hit.
             se:  Array.isArray(judgment.stringEnergy) ? judgment.stringEnergy : undefined,
+            // Open string rang in place of the charted fretted note (fret/mute
+            // fail) — a specific, valid miss reason for coaching to surface.
+            mf:  judgment.muteFail ? true : undefined,
         };
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
             _diagEvents.push(eventObj);
@@ -4468,6 +4501,38 @@ function createNoteDetector(options = {}) {
         } catch (_) { return null; }
     }
 
+    // Did the open string ring instead of the charted fretted note? Runs the
+    // same _rescueBuf window the per-string energy uses, comparing the harmonic
+    // comb at the fretted pitch vs the open-string pitch. Bass + fretted notes
+    // only. Surfaces the "mute/fret fail" coaching reason (see _ndDetectMuteFail).
+    function _muteFailAtNote(chartNote, noteTime) {
+        if (currentArrangement !== 'bass') return false;
+        if (!(Number.isFinite(chartNote.f) && chartNote.f > 0)) return false;
+        if (_rescueBuf.length < _RESCUE_WIN) return false;
+        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+        if (!(sr > 0)) return false;
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const center = _rescueBuf.length - samplesBack;
+        const start = center - (_RESCUE_WIN >> 1);
+        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return false;
+        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+        try {
+            const { magnitudes, binHz } = _ndFftMagnitude(win, sr);
+            const expectedMidi = _ndMidiFromStringFret(chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const openMidi = _ndMidiFromStringFret(chartNote.s, 0, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+            const openHz = 440 * Math.pow(2, (openMidi - 69) / 12);
+            const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const loBin = Math.max(0, Math.floor(loHz / binHz));
+            const hiBin = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
+            let bandPk = 0;
+            for (let k = loBin; k <= hiBin; k++) if (magnitudes[k] > bandPk) bandPk = magnitudes[k];
+            return _ndDetectMuteFail(magnitudes, binHz, expHz, openHz, bandPk);
+        } catch (_) { return false; }
+    }
+
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4516,6 +4581,9 @@ function createNoteDetector(options = {}) {
                     // can call wrong-string vs ambient vs not-played on the miss.
                     const se = _perStringEnergyAtNote(noteTime);
                     if (se) judgment.stringEnergy = se;
+                    // Open string rang in place of the fretted note? → mute/fret
+                    // fail (a valid, specific miss reason), surfaced to coaching.
+                    if (_muteFailAtNote(chartNote, noteTime)) judgment.muteFail = true;
                 }
                 recordJudgment(key, judgment);
             }

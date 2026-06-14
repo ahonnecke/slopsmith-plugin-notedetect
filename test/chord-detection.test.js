@@ -200,6 +200,47 @@ test('constraintCheckString: low-bass bleed precision — open A alone does NOT 
     assert.equal(r.hit, false, 'open-A ring must not be mistaken for a fretted C#2');
 });
 
+// helper: band-peak magnitude for a string, from a buffer
+function bandPeakOf(buf, s, arr, sc, offs) {
+    const { magnitudes, binHz } = core.fftMagnitude(buf, SR);
+    const [loHz, hiHz] = core.stringBandHz(s, arr, sc, offs, 0);
+    const lo = Math.max(0, Math.floor(loHz / binHz)), hi = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
+    let pk = 0; for (let b = lo; b <= hi; b++) if (magnitudes[b] > pk) pk = magnitudes[b];
+    return { magnitudes, binHz, bandPk: pk };
+}
+const C2_HZ = 69.30, A1_HZ = 55.00; // string 1 fret 4 (C#2) vs open A1
+
+test('detectMuteFail: open A rings, fretted C#2 absent → mute fail', () => {
+    const longDur = 16384 / SR;
+    // Only the open A and its harmonics — the player let the open string ring
+    // instead of fretting C#2.
+    const buf = mixComponents([[A1_HZ, 0.6], [A1_HZ * 2, 0.5], [A1_HZ * 3, 0.45], [A1_HZ * 4, 0.4]], SR, longDur);
+    const { magnitudes, binHz, bandPk } = bandPeakOf(buf, 1, 'bass', 4, BASS_4.offsets);
+    assert.equal(core.detectMuteFail(magnitudes, binHz, C2_HZ, A1_HZ, bandPk), true);
+});
+
+test('detectMuteFail: fretted C#2 actually played → NOT a mute fail', () => {
+    const longDur = 16384 / SR;
+    // C#2 with strong harmonics (plus a little open-A bleed) — the note IS there.
+    const buf = mixComponents([
+        [A1_HZ, 0.3], [C2_HZ, 0.4], [C2_HZ * 2, 0.5], [C2_HZ * 3, 0.5], [C2_HZ * 4, 0.5],
+    ], SR, longDur);
+    const { magnitudes, binHz, bandPk } = bandPeakOf(buf, 1, 'bass', 4, BASS_4.offsets);
+    assert.equal(core.detectMuteFail(magnitudes, binHz, C2_HZ, A1_HZ, bandPk), false);
+});
+
+test('detectMuteFail: nothing played (silence) → NOT a mute fail', () => {
+    const buf = new Float32Array(16384); // silence
+    const { magnitudes, binHz, bandPk } = bandPeakOf(buf, 1, 'bass', 4, BASS_4.offsets);
+    assert.equal(core.detectMuteFail(magnitudes, binHz, C2_HZ, A1_HZ, bandPk), false);
+});
+
+test('describeMiss: a mute-fail judgment reports the open-string-rang reason', () => {
+    const d = core.describeMiss({ muteFail: true, detectedMidi: null });
+    assert.equal(d.how, 'mute');
+    assert.match(d.detail, /open string|mute|fret/i);
+});
+
 test('constraintCheckString: harmonic fallback is gated to low fundamentals only', () => {
     // A high in-band sine far off the expected pitch must still miss — the
     // fallback only applies below _ND_HARMONIC_FALLBACK_MAX_HZ (~140 Hz), so it
