@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.27.0';
+const _ND_VERSION = '1.28.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -544,20 +544,29 @@ const _ND_DRILL_LEAD_IN_SEC = 5.0;            // audible pre-roll before the jud
 const _ND_DRILL_FIRST_NOTE_RUNWAY_SEC = 1.0;  // min reaction time before the first scored note
 const _ND_DRILL_DEFAULT_GOAL = 0.85;          // iteration accuracy (0..1) needed to step up a rung
 const _ND_DRILL_DEFAULT_LADDER = [0.8, 0.9, 1.0];  // playback-speed rungs, slow → full (0.8 floor: slower time-stretches sound distorted)
+const _ND_DRILL_FULLSPEED_REPS = 3;           // consecutive full-speed clears required to graduate — the user often doesn't KNOW the hotspot until the drill, so reinforce it a few times at tempo before returning to the song instead of bailing on the first clean pass
 
 // Pure goal-gate decision for one finished drill iteration. Given the
 // iteration's accuracy `score` (0..1), the `goal` (0..1), the current
 // ladder `rung`, and the ladder `length`, decide whether to hold at this
 // speed, step up a rung, or graduate. No DOM/audio — unit-testable; the
 // conductor's _drillConductorOnIteration applies the result.
-//   - miss the goal            → { action: 'hold',     nextRung: rung }
-//   - clear it below full speed → { action: 'advance',  nextRung: rung+1 }
-//   - clear it at the top rung  → { action: 'graduate', nextRung: rung }
-function _ndDrillRampDecision(score, goal, rung, ladderLength) {
+//   - miss the goal                       → { action: 'hold',        nextRung: rung }
+//   - clear it below full speed           → { action: 'advance',     nextRung: rung+1 }
+//   - clear it at the top, more reps to go → { action: 'consolidate', nextRung: rung }
+//   - clear it at the top for the Nth time → { action: 'graduate',    nextRung: rung }
+// `topClears` = full-speed clears banked so far; `reps` = clears required to
+// graduate (1 = old behaviour: graduate on the first full-speed clear).
+function _ndDrillRampDecision(score, goal, rung, ladderLength, topClears = 0, reps = 1) {
     const cleared = Number.isFinite(score) && Number.isFinite(goal) && score >= goal;
     if (!cleared) return { action: 'hold', nextRung: rung };
     const atTop = rung >= ladderLength - 1;
-    if (atTop) return { action: 'graduate', nextRung: rung };
+    if (atTop) {
+        // Stay on the drill and reinforce at full speed before returning to the
+        // song — graduate only once enough full-speed reps are banked.
+        if (topClears + 1 >= Math.max(1, reps)) return { action: 'graduate', nextRung: rung };
+        return { action: 'consolidate', nextRung: rung };
+    }
     return { action: 'advance', nextRung: rung + 1 };
 }
 
@@ -2214,6 +2223,7 @@ function createNoteDetector(options = {}) {
     let drillConductorGoal = _ND_DRILL_DEFAULT_GOAL;  // 0..1 iteration accuracy to advance
     let drillConductorBest = 0;             // best iteration accuracy (0..1) at the current rung
     let drillConductorFailStreak = 0;       // consecutive sub-goal passes at the current rung → auto-slowdown at 3
+    let drillConductorTopClears = 0;        // consecutive full-speed clears banked → graduate at _ND_DRILL_FULLSPEED_REPS
     let drillConductorFocus = null;         // coaching string shown in the HUD ("Late by 30ms")
     let drillConductorLabel = null;
     let drillConductorSavedSpeed = null;    // host speed before the drill, restored on end
@@ -5864,6 +5874,7 @@ function createNoteDetector(options = {}) {
         drillConductorGoal = Number.isFinite(goal) ? Math.max(0, Math.min(1, goal)) : _ND_DRILL_DEFAULT_GOAL;
         drillConductorBest = 0;
         drillConductorFailStreak = 0;
+        drillConductorTopClears = 0;
         drillConductorFocus = focus;
         drillConductorLabel = label || `${judgeStart.toFixed(1)}–${judgeEnd.toFixed(1)}s`;
         drillConductorRange = { loopStart, loopEnd, judgeStart, judgeEnd };
@@ -5960,22 +5971,35 @@ function createNoteDetector(options = {}) {
         if (score > drillConductorBest) drillConductorBest = score;
 
         const decision = _ndDrillRampDecision(
-            score, drillConductorGoal, drillConductorRung, drillConductorLadder.length);
+            score, drillConductorGoal, drillConductorRung, drillConductorLadder.length,
+            drillConductorTopClears, _ND_DRILL_FULLSPEED_REPS);
         if (decision.action === 'graduate') {
+            drillConductorTopClears++;
             _drillConductorUpdateHud({ lastScore: score, graduated: true });
             endDrill('graduated');
             return;
         }
-        if (decision.action === 'advance') {
+        if (decision.action === 'consolidate') {
+            // Cleared the goal at full speed, but stay on the drill and lock it
+            // in — the user often didn't KNOW this hotspot until now, so a few
+            // full-speed reps reinforce it before returning to the song.
+            drillConductorTopClears++;
+            drillConductorFailStreak = 0;
+            const repsLeft = Math.max(0, _ND_DRILL_FULLSPEED_REPS - drillConductorTopClears);
+            _drillConductorUpdateHud({ lastScore: score, consolidate: true, repsLeft });
+        } else if (decision.action === 'advance') {
             // Step up one rung: faster playback, fresh best for the new
             // speed (the goal must be re-earned at the harder tempo).
             drillConductorRung = decision.nextRung;
             drillConductorBest = 0;
             drillConductorFailStreak = 0;
+            drillConductorTopClears = 0;   // not consolidating until we're at the top
             const toPct = Math.round((drillConductorLadder[drillConductorRung] || 1) * 100);
             _hostSetSpeed(drillConductorLadder[drillConductorRung]);
             _drillConductorUpdateHud({ lastScore: score, advanced: true, toPct });
         } else {
+            // Missed the goal — a full-speed flub breaks the consolidation streak.
+            drillConductorTopClears = 0;
             // Held below the goal. Struggling for 3 straight passes → SLOW DOWN
             // (the user asked for this): step back to a slower rung if we
             // advanced too soon, or extend the ladder below the floor (down to
@@ -6160,7 +6184,7 @@ function createNoteDetector(options = {}) {
     function _drillConductorUpdateHud(extra = {}) {
         const hud = document.getElementById('nd-drill-hud');
         if (!hud) return;
-        const { lastScore = null, graduated = false, advanced = false, toPct = null, slowedToPct = null, misses = null } = extra;
+        const { lastScore = null, graduated = false, advanced = false, consolidate = false, repsLeft = null, toPct = null, slowedToPct = null, misses = null } = extra;
         const speedPct = drillConductorLadder
             ? Math.round((drillConductorLadder[drillConductorRung] || 1) * 100) : 100;
         const goalPct = Math.round((drillConductorGoal || 0) * 100);
@@ -6174,6 +6198,9 @@ function createNoteDetector(options = {}) {
             banner = `<div class="text-green-300 font-bold text-sm">✓ Nailed it at full speed — drill complete!</div>`;
         } else if (advanced) {
             banner = `<div class="text-green-300 font-bold text-sm">▲ Time to go faster — now ${toPct != null ? toPct : speedPct}% speed</div>`;
+        } else if (consolidate) {
+            const n = repsLeft != null ? repsLeft : 0;
+            banner = `<div class="text-green-300 font-bold text-sm">✓ Clean at full speed! ${n > 0 ? `Lock it in — ${n} more to graduate` : 'One more to graduate'}</div>`;
         } else if (slowedToPct != null) {
             banner = `<div class="text-blue-300 font-bold text-sm">▼ Slowing to ${slowedToPct}% — get it solid here first</div>`;
         } else if (lastPct != null) {

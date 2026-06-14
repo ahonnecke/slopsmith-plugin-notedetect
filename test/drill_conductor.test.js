@@ -77,6 +77,18 @@ test('_ndDrillRampDecision: clearing the goal at the top rung graduates', () => 
     assertDecision(drillRampDecision(1.0, 0.85, 0, 1), 'graduate', 0);
 });
 
+test('_ndDrillRampDecision: at the top, clears CONSOLIDATE until enough reps, then graduate', () => {
+    const { drillRampDecision } = loadDetectionCore();
+    // reps=3: first two top-rung clears consolidate, the third graduates.
+    assertDecision(drillRampDecision(0.95, 0.85, 2, 3, /*topClears*/ 0, /*reps*/ 3), 'consolidate', 2);
+    assertDecision(drillRampDecision(0.95, 0.85, 2, 3, 1, 3), 'consolidate', 2);
+    assertDecision(drillRampDecision(0.95, 0.85, 2, 3, 2, 3), 'graduate', 2);
+    // reps defaults to 1 → graduate on the first clear (legacy behaviour).
+    assertDecision(drillRampDecision(0.95, 0.85, 2, 3), 'graduate', 2);
+    // A miss at the top still just holds, regardless of banked reps.
+    assertDecision(drillRampDecision(0.5, 0.85, 2, 3, 2, 3), 'hold', 2);
+});
+
 test('_ndDrillRampDecision: non-finite score never clears the goal', () => {
     const { drillRampDecision } = loadDetectionCore();
     assert.equal(drillRampDecision(NaN, 0.85, 0, 3).action, 'hold');
@@ -178,15 +190,47 @@ test('clearing the goal steps the speed up one rung per iteration, then graduate
     assert.equal(det.getConductorState().rung, 2);
     assert.equal(det.getConductorState().speed, 1.0);
 
-    // Pass 4: clear the goal at full speed → graduate.
+    // At full speed the drill now CONSOLIDATES: it stays put for a few clean
+    // full-speed reps (reinforcement) before graduating, instead of bailing on
+    // the first clear. _ND_DRILL_FULLSPEED_REPS = 3.
+    // Full-speed clear #1 → consolidate, still drilling at the top rung.
     runIteration(core, det, 9);
-    assert.equal(det.isDrilling(), false, 'graduated → drill ended');
+    assert.equal(det.isDrilling(), true, 'first full-speed clear consolidates, does not graduate');
+    assert.equal(det.getConductorState().rung, 2, 'stays at the top rung while consolidating');
+    // Full-speed clear #2 → still consolidating.
+    runIteration(core, det, 10);
+    assert.equal(det.isDrilling(), true, 'second full-speed clear still consolidating');
+    // Full-speed clear #3 → graduate.
+    runIteration(core, det, 9);
+    assert.equal(det.isDrilling(), false, 'third full-speed clear graduates → drill ended');
     assert.equal(spies.clearLoop.length, 1, 'dropped the A-B loop on graduation');
     const grad = spies.emit.find(([e]) => e === 'notedetect:drill-ended');
     assert.ok(grad, 'emitted notedetect:drill-ended');
     assert.equal(grad[1].graduated, true);
     // Speed restored to the pre-drill 1.0× (slider was 100 at startDrill).
     assert.equal(spies.speed[spies.speed.length - 1], 1.0, 'restored pre-drill speed');
+    det.destroy();
+});
+
+test('a full-speed flub resets the consolidation streak (must re-earn the reps)', async () => {
+    const { core } = loadConductorCore();
+    const det = core.createNoteDetector();
+    await det.startDrill(30, 50, { goal: 0.8, speedLadder: [1.0] });  // single-rung: starts AT full speed
+    assert.equal(det.getConductorState().rung, 0);
+    // Two clean full-speed reps banked…
+    runIteration(core, det, 9);
+    runIteration(core, det, 10);
+    assert.equal(det.isDrilling(), true, 'two reps banked, not yet graduated');
+    // …then a flub (4/10) — breaks the streak, stays drilling.
+    runIteration(core, det, 4);
+    assert.equal(det.isDrilling(), true, 'a flub does not graduate');
+    // Must re-earn all three: two more is only two, still drilling…
+    runIteration(core, det, 9);
+    runIteration(core, det, 10);
+    assert.equal(det.isDrilling(), true, 'streak reset — two clean reps is not yet three');
+    // …third clean rep graduates.
+    runIteration(core, det, 9);
+    assert.equal(det.isDrilling(), false, 'three clean reps after the reset graduates');
     det.destroy();
 });
 
