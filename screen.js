@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.30.0';
+const _ND_VERSION = '1.31.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -301,6 +301,14 @@ const _ND_HARMONIC_FALLBACK_RATIOS = [1, 2, 3, 4, 5];
 const _ND_HARMONIC_FALLBACK_HALF_CENTS = 80; // ±half-window around each harmonic (≈1.5 coarse low bins)
 const _ND_HARMONIC_FALLBACK_PEAK_FRAC = 0.40; // each counted harmonic ≥ this fraction of the band peak
 const _ND_HARMONIC_FALLBACK_MIN_HARMONICS = 3; // need this many coherent harmonics to accept
+// Post-miss PRESENCE check (coaching fault attribution, not hit/miss): how many
+// coherent harmonics of the EXPECTED note must show in the rescue buffer for a
+// conceded miss to count as "the note WAS played, the detector dropped it" vs a
+// genuine flub. Lower than MIN_HARMONICS (a clear case would have been rescued
+// to a hit) — this catches the marginal "present but under the hit gate" reads
+// that, hand-checked, were real notes the tool lost. Promotes coaching's fault
+// verdict from a guess (detector_suspect) to a measurement (confirmed_detector_bug).
+const _ND_PRESENCE_MIN_COMB = 2;
 
 // Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
 // `fundamentalRatio` feed both the setChart payload and the scoreChord
@@ -3767,6 +3775,10 @@ function createNoteDetector(options = {}) {
             // Open string rang in place of the charted fretted note (fret/mute
             // fail) — a specific, valid miss reason for coaching to surface.
             mf:  judgment.muteFail ? true : undefined,
+            // Expected note WAS present at a conceded miss (player played it, the
+            // detector dropped it) — lets coaching confirm a tool miss vs a flub.
+            np:  judgment.notePresent ? true : undefined,
+            nc:  Number.isFinite(judgment.presenceComb) ? judgment.presenceComb : undefined,
         };
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
             _diagEvents.push(eventObj);
@@ -4576,6 +4588,38 @@ function createNoteDetector(options = {}) {
         } catch (_) { return false; }
     }
 
+    // Was the EXPECTED note actually present in the audio at a conceded miss?
+    // Runs the same fresh _rescueBuf window as the per-string energy / mute-fail
+    // checks and counts the expected pitch's coherent harmonics. A miss with the
+    // note clearly present means the player played it and the detector dropped it
+    // (a real tool miss) — coaching promotes that from detector_suspect to
+    // confirmed_detector_bug. Bass only (the blind spot). Returns the comb count
+    // (0 = nothing played; >= _ND_PRESENCE_MIN_COMB = present-but-dropped).
+    function _notePresenceAtNote(chartNote, noteTime) {
+        if (currentArrangement !== 'bass') return 0;
+        if (_rescueBuf.length < _RESCUE_WIN) return 0;
+        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+        if (!(sr > 0)) return 0;
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const center = _rescueBuf.length - samplesBack;
+        const start = center - (_RESCUE_WIN >> 1);
+        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return 0;
+        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
+        try {
+            const { magnitudes, binHz } = _ndFftMagnitude(win, sr);
+            const expectedMidi = _ndMidiFromStringFret(chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+            const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const loBin = Math.max(0, Math.floor(loHz / binHz));
+            const hiBin = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
+            let bandPk = 0;
+            for (let k = loBin; k <= hiBin; k++) if (magnitudes[k] > bandPk) bandPk = magnitudes[k];
+            return _ndHarmonicCombCount(magnitudes, binHz, expHz, bandPk);
+        } catch (_) { return 0; }
+    }
+
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4627,6 +4671,12 @@ function createNoteDetector(options = {}) {
                     // Open string rang in place of the fretted note? → mute/fret
                     // fail (a valid, specific miss reason), surfaced to coaching.
                     if (_muteFailAtNote(chartNote, noteTime)) judgment.muteFail = true;
+                    // Was the expected note actually present though the matcher
+                    // dropped it? Promotes coaching's fault verdict from a guess
+                    // to a measurement (detector_suspect → confirmed_detector_bug).
+                    const presence = _notePresenceAtNote(chartNote, noteTime);
+                    if (presence >= _ND_PRESENCE_MIN_COMB) judgment.notePresent = true;
+                    if (presence > 0) judgment.presenceComb = presence;
                 }
                 recordJudgment(key, judgment);
             }

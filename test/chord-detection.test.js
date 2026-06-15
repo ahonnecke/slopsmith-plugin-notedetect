@@ -235,6 +235,19 @@ test('detectMuteFail: nothing played (silence) → NOT a mute fail', () => {
     assert.equal(core.detectMuteFail(magnitudes, binHz, C2_HZ, A1_HZ, bandPk), false);
 });
 
+test('note presence: a played low note shows coherent harmonics; silence shows none', () => {
+    const longDur = 16384 / SR;
+    // C#2 played with harmonics → presence comb is high (≥ the presence floor of 2).
+    const played = mixComponents([[C2_HZ, 0.4], [C2_HZ * 2, 0.5], [C2_HZ * 3, 0.5], [C2_HZ * 4, 0.45]], SR, longDur);
+    const a = bandPeakOf(played, 1, 'bass', 4, BASS_4.offsets);
+    assert.ok(core.harmonicCombCount(a.magnitudes, a.binHz, C2_HZ, a.bandPk) >= 2,
+        'a genuinely-played note registers as present (player played it, detector dropped it)');
+    // Silence → no harmonics → not present (a real no-play / flub).
+    const silent = new Float32Array(16384);
+    const b = bandPeakOf(silent, 1, 'bass', 4, BASS_4.offsets);
+    assert.equal(core.harmonicCombCount(b.magnitudes, b.binHz, C2_HZ, b.bandPk), 0);
+});
+
 test('describeMiss: a mute-fail judgment reports the open-string-rang reason', () => {
     const d = core.describeMiss({ muteFail: true, detectedMidi: null });
     assert.equal(d.how, 'mute');
