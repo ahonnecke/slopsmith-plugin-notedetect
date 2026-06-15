@@ -311,6 +311,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
         drillRampDecision: sandbox._ndDrillRampDecision,
         describeMiss: sandbox._ndDescribeMiss,
+        keysToReopenOnSeek: sandbox._ndKeysToReopenOnSeek,
         summarizeWindowMisses: sandbox._ndSummarizeWindowMisses,
         aggregatePlays: sandbox._ndAggregatePlays,
         statsForRow: sandbox._ndStatsForRow,

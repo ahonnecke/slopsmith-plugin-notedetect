@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.31.0';
+const _ND_VERSION = '1.32.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -581,6 +581,23 @@ function _ndDrillRampDecision(score, goal, rung, ladderLength, topClears = 0, re
 // Describe HOW a missed note failed, from its judgment. Pure → testable.
 // `how` is a short category (for colour-coding); `detail` is the human
 // phrase shown per note in the drill HUD.
+// Which already-judged note keys to RE-OPEN when the playhead jumps backward
+// (a seek-back / restart), so a replayed section re-scores instead of keeping
+// its stale first-pass verdict. Pure → testable. `keys` are noteResults keys
+// of the form "<chartTime>_<s>_<f>". Returns [] unless this is a genuine
+// backward jump (> 0.25s, past normal frame jitter / pause); then returns every
+// key whose chart time is at/after the new playhead (minus the timing window).
+function _ndKeysToReopenOnSeek(lastT, t, tolerance, keys) {
+    if (!Number.isFinite(lastT) || !(t < lastT - 0.25)) return [];
+    const floor = t - (Number.isFinite(tolerance) ? tolerance : 0);
+    const out = [];
+    for (const key of keys) {
+        const nt = parseFloat(String(key).split('_')[0]);
+        if (Number.isFinite(nt) && nt >= floor) out.push(key);
+    }
+    return out;
+}
+
 function _ndDescribeMiss(j) {
     if (!j) return { how: 'missed', detail: 'no note' };
     // Open string rang in place of the charted fretted note — a real play
@@ -2370,6 +2387,12 @@ function createNoteDetector(options = {}) {
     // _ndDrainEngineVerdicts spot a backward jump (drill A-B loop wrap or a
     // manual seek-back) and clear the dedup entries the engine is re-opening.
     let _ndLastPushedPlayhead = 0;
+    // Last playhead checkMisses() saw, for spotting a backward seek on the
+    // BROWSER path (the engine path uses _ndLastPushedPlayhead). A seek-back /
+    // restart must re-open the already-judged notes or a replay re-uses the
+    // stale first-pass verdicts (you nail the intro on the retry but it still
+    // scores as missed). null until the first scan.
+    let _ndLastMissScanT = null;
     // Whether the desktop engine's polyphonic ML detector (Basic Pitch) is
     // actually active this session — queried once at bridge startup via
     // `audio.isMlNoteDetection()`. false on a downlevel addon or when the ML
@@ -4630,6 +4653,18 @@ function createNoteDetector(options = {}) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
+        // Backward seek / restart: the playhead jumped back, so the user is
+        // replaying a section (e.g. flubbed the intro, backed up, played it
+        // clean). Re-open every note at/after the new playhead — otherwise the
+        // first pass's verdicts stick and the replay never re-scores (the bug:
+        // "the detector didn't see the notes the second time; it stayed a
+        // hotspot"). Seeking back to the start clears everything → a clean
+        // fresh attempt. Decision is the pure _ndKeysToReopenOnSeek (tested).
+        for (const key of _ndKeysToReopenOnSeek(_ndLastMissScanT, t, tolerance, noteResults.keys())) {
+            noteResults.delete(key);
+            _susActiveUntil.delete(key);
+        }
+        _ndLastMissScanT = t;
         const missDeadline = t - tolerance * 2;
         // Mirror matchNotes' sus-late-grace policy. Without this, a sus
         // note whose match window matchNotes is willing to extend gets
@@ -5708,6 +5743,7 @@ function createNoteDetector(options = {}) {
         bestStreak = 0;
         noteResults.clear();
         _susActiveUntil.clear();
+        _ndLastMissScanT = null;
         _chordLastResult.clear();
         _diagResetCounters();
         sectionStats = [];
