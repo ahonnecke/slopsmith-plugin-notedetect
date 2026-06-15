@@ -3183,6 +3183,9 @@ function createNoteDetector(options = {}) {
             populateDevices();
             _bindStreamHealth(stream);
             _inputLost = false;
+            // Refresh the button so a recovered re-acquire clears any stale
+            // "input lost" label immediately rather than on the next tick.
+            try { updateButton(); } catch (_) {}
 
             return true;
         } catch (e) {
@@ -3219,7 +3222,14 @@ function createNoteDetector(options = {}) {
         if (!s || typeof s.getAudioTracks !== 'function') return;
         const track = s.getAudioTracks()[0];
         if (!track) return;
+        // Tie these listeners to the session that bound them. restartAudio()
+        // bumps sessionGen, so a late mute/ended from a SUPERSEDED track (the
+        // old one stopping during a restart) no longer matches and is ignored —
+        // otherwise it would falsely flip _inputLost and trigger a needless
+        // re-acquire while a fresh stream is already live.
+        const boundGen = sessionGen;
         const markLost = (why) => {
+            if (sessionGen !== boundGen) return;
             if (_inputLost || !enabled) return;
             _inputLost = true;
             console.warn(`[note_detect] input ${why} — the audio interface dropped the input stream`);
@@ -3228,6 +3238,7 @@ function createNoteDetector(options = {}) {
             // _inputLost). If still lost after it, re-acquire — but no more
             // than once per 4 s so a USB glitch storm can't thrash the device.
             setTimeout(() => {
+                if (sessionGen !== boundGen) return;
                 if (!enabled || !_inputLost) return;
                 const now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
                 if (now - _lastInputRecover < 4000) return;
@@ -3240,6 +3251,7 @@ function createNoteDetector(options = {}) {
             track.addEventListener('ended', () => markLost('ended'));
             track.addEventListener('mute', () => markLost('muted'));
             track.addEventListener('unmute', () => {
+                if (sessionGen !== boundGen) return;
                 if (!_inputLost) return;
                 _inputLost = false;
                 try { updateButton(); } catch (_) {}
@@ -3249,6 +3261,12 @@ function createNoteDetector(options = {}) {
 
     function stopAudio() {
         _inputLost = false;
+        // Reset the recovery throttle so a fresh enable starts clean — otherwise
+        // a quick re-enable after a prior recover could hit the 4 s window and
+        // skip recovery on the first new dropout. Refresh the button so a
+        // lingering "input lost" label doesn't survive the teardown.
+        _lastInputRecover = 0;
+        try { updateButton(); } catch (_) {}
         stopLevelMeter();
         stopBridgeLevelMeter();
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
