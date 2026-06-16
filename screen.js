@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.32.0';
+const _ND_VERSION = '1.33.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -596,6 +596,27 @@ function _ndKeysToReopenOnSeek(lastT, t, tolerance, keys) {
         if (Number.isFinite(nt) && nt >= floor) out.push(key);
     }
     return out;
+}
+
+// Was the input SILENT across a ±halfWin window of `samples` ({songT, level})
+// centred on `centerT`? Peak level below `threshold` with at least one sample in
+// window → true (player stopped / didn't play). null when no samples cover the
+// window (startup / post-seek reset) so callers don't treat "unknown" as silent.
+// Pure → testable; the same peak-in-window logic the engine silence gate uses.
+function _ndIsSilentWindow(samples, centerT, halfWin, threshold) {
+    if (!Array.isArray(samples) || samples.length === 0) return null;
+    let peak = 0;
+    let inWindow = 0;
+    for (let i = samples.length - 1; i >= 0; i--) {
+        const s = samples[i];
+        if (!s) continue;
+        if (s.songT > centerT + halfWin) continue;
+        if (s.songT < centerT - halfWin) break;
+        inWindow++;
+        if (s.level > peak) peak = s.level;
+    }
+    if (inWindow === 0) return null;
+    return peak < threshold;
 }
 
 function _ndDescribeMiss(j) {
@@ -3368,6 +3389,27 @@ function createNoteDetector(options = {}) {
             _rescueBuf = nb;
             if (hw && hw.getTime) _rescueBufEndT = hw.getTime();
         }
+        // Record the per-frame input level into the level-history time series so
+        // the silence gate / "was the player silent here" check works on the
+        // BROWSER path too (it was desktop-only — fed from the engine's level
+        // callback). Without this, a stretch where the player stopped playing is
+        // indistinguishable from a low-bass detection gap downstream. Same rms*5
+        // scaling + 0.02 threshold the desktop path uses. Skip on the bridge
+        // path (its level callback already records). Pruning/backward-jump reset
+        // mirror the desktop block.
+        if (!usingDesktopBridge && buffer && buffer.length && hw && typeof hw.getTime === 'function') {
+            let sum = 0;
+            for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
+            const lvl = Math.min(1, Math.max(0, Math.sqrt(sum / buffer.length) * 5));
+            const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+            const songT = hw.getTime() + avO;
+            const last = _ndLevelSamples.length ? _ndLevelSamples[_ndLevelSamples.length - 1].songT : -Infinity;
+            if (songT < last - 0.05) _ndLevelSamples.length = 0;   // seek / drill-wrap → reset
+            _ndLevelSamples.push({ songT, level: lvl });
+            const cutoff = songT - _ND_LEVEL_HISTORY_S;
+            while (_ndLevelSamples.length > 0 && _ndLevelSamples[0].songT < cutoff) _ndLevelSamples.shift();
+            while (_ndLevelSamples.length > 240) _ndLevelSamples.shift();
+        }
         let result;
         let detectorUsed;
         // Capture the session generation at frame start. disable()
@@ -3802,6 +3844,9 @@ function createNoteDetector(options = {}) {
             // detector dropped it) — lets coaching confirm a tool miss vs a flub.
             np:  judgment.notePresent ? true : undefined,
             nc:  Number.isFinite(judgment.presenceComb) ? judgment.presenceComb : undefined,
+            // Player was SILENT here (stopped / didn't play) — a confident
+            // "not played", distinct from the detector's low-string blind spot.
+            sil: judgment.silent ? true : undefined,
         };
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
             _diagEvents.push(eventObj);
@@ -4643,6 +4688,15 @@ function createNoteDetector(options = {}) {
         } catch (_) { return 0; }
     }
 
+    // Was the player SILENT at a missed note's time (stopped / didn't play),
+    // vs the detector's low-string blind spot (string ringing, pitch unresolved)?
+    // Peak input level below the silence threshold = silence. Level samples are
+    // in visual time (songT = getTime + avOffset); the note's audio time maps to
+    // visual time + latencyOffset. true/false, or null if no level telemetry.
+    function _wasSilentAtNote(noteTime) {
+        return _ndIsSilentWindow(_ndLevelSamples, noteTime + latencyOffset, _ND_LEVEL_WIN_HALF, _ND_SILENCE_THRESHOLD);
+    }
+
     function checkMisses() {
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
@@ -4712,6 +4766,10 @@ function createNoteDetector(options = {}) {
                     const presence = _notePresenceAtNote(chartNote, noteTime);
                     if (presence >= _ND_PRESENCE_MIN_COMB) judgment.notePresent = true;
                     if (presence > 0) judgment.presenceComb = presence;
+                    // Was the player silent here (stopped / didn't play) vs the
+                    // detector's blind spot? Lets coaching/the LLM call "you
+                    // stopped" confidently instead of hedging every no_detection.
+                    if (_wasSilentAtNote(noteTime) === true) judgment.silent = true;
                 }
                 recordJudgment(key, judgment);
             }
