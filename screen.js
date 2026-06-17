@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.33.0';
+const _ND_VERSION = '1.34.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -4206,10 +4206,18 @@ function createNoteDetector(options = {}) {
                     // matches at most once; noteResults guards re-entry), and
                     // never allowed to block the judgment.
                     try {
-                        const _sr = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || 44100);
-                        judgment.stringEnergy = _ndPerStringEnergy(
-                            frameBuffer, _sr, currentArrangement, currentStringCount, tuningOffsets, capo
-                        ).perString;
+                        // Per-HIT string energy is diagnostic-only — coaching reads
+                        // stringEnergy only on MISSES (a hit isn't a mistake). A
+                        // 16384-pt FFT on every hit during normal play piles onto
+                        // the main thread and stutters the render, so compute it
+                        // only in tuning mode (record-replay sweeps), where the
+                        // per-hit signal is actually inspected.
+                        if (tuningMode) {
+                            const _sr = audioCtx ? audioCtx.sampleRate : (bridgeSampleRate || 44100);
+                            judgment.stringEnergy = _ndPerStringEnergy(
+                                frameBuffer, _sr, currentArrangement, currentStringCount, tuningOffsets, capo
+                            ).perString;
+                        }
                     } catch (_) { /* energy is diagnostic-only */ }
                     recordJudgment(key, judgment);
                 }
@@ -4608,75 +4616,35 @@ function createNoteDetector(options = {}) {
     // band quiet + a NEIGHBOUR's band lit = wrong string; broad low energy =
     // ambient / unmuted; ~nothing = simply not played. Bass only (the rescue
     // buffer is bass-only); returns null when unavailable.
-    function _perStringEnergyAtNote(noteTime) {
-        if (currentArrangement !== 'bass' || _rescueBuf.length < _RESCUE_WIN) return null;
+    // Single-FFT miss analysis. Per-string energy, mute-fail, and note-presence
+    // all read the SAME fresh _rescueBuf window — so compute its FFT ONCE and
+    // share it, instead of three separate 16384-pt FFTs per conceded miss. A
+    // burst of misses (a stopped / miss-heavy stretch) was firing 3 FFTs each on
+    // the main thread, starving the render loop → the highway-stutter regression.
+    // Bass only. Returns { stringEnergy, muteFail, presenceComb }; the caller
+    // attaches them to the miss judgment.
+    function _missAnalysisAtNote(chartNote, noteTime) {
+        const blank = { stringEnergy: null, muteFail: false, presenceComb: 0 };
+        if (currentArrangement !== 'bass' || _rescueBuf.length < _RESCUE_WIN) return blank;
         const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        if (!(sr > 0)) return null;
+        if (!(sr > 0)) return blank;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const noteHwTime = noteTime - avOffsetSec + latencyOffset;
         const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
         const center = _rescueBuf.length - samplesBack;
         const start = center - (_RESCUE_WIN >> 1);
-        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return null;
+        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return blank;
         const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
         try {
-            return _ndPerStringEnergy(win, sr, currentArrangement, currentStringCount, tuningOffsets, capo).perString;
-        } catch (_) { return null; }
-    }
-
-    // Did the open string ring instead of the charted fretted note? Runs the
-    // same _rescueBuf window the per-string energy uses, comparing the harmonic
-    // comb at the fretted pitch vs the open-string pitch. Bass + fretted notes
-    // only. Surfaces the "mute/fret fail" coaching reason (see _ndDetectMuteFail).
-    function _muteFailAtNote(chartNote, noteTime) {
-        if (currentArrangement !== 'bass') return false;
-        if (!(Number.isFinite(chartNote.f) && chartNote.f > 0)) return false;
-        if (_rescueBuf.length < _RESCUE_WIN) return false;
-        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        if (!(sr > 0)) return false;
-        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
-        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
-        const center = _rescueBuf.length - samplesBack;
-        const start = center - (_RESCUE_WIN >> 1);
-        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return false;
-        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
-        try {
-            const { magnitudes, binHz } = _ndFftMagnitude(win, sr);
-            const expectedMidi = _ndMidiFromStringFret(chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo);
-            const openMidi = _ndMidiFromStringFret(chartNote.s, 0, currentArrangement, currentStringCount, tuningOffsets, capo);
-            const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
-            const openHz = 440 * Math.pow(2, (openMidi - 69) / 12);
-            const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
-            const loBin = Math.max(0, Math.floor(loHz / binHz));
-            const hiBin = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
-            let bandPk = 0;
-            for (let k = loBin; k <= hiBin; k++) if (magnitudes[k] > bandPk) bandPk = magnitudes[k];
-            return _ndDetectMuteFail(magnitudes, binHz, expHz, openHz, bandPk);
-        } catch (_) { return false; }
-    }
-
-    // Was the EXPECTED note actually present in the audio at a conceded miss?
-    // Runs the same fresh _rescueBuf window as the per-string energy / mute-fail
-    // checks and counts the expected pitch's coherent harmonics. A miss with the
-    // note clearly present means the player played it and the detector dropped it
-    // (a real tool miss) — coaching promotes that from detector_suspect to
-    // confirmed_detector_bug. Bass only (the blind spot). Returns the comb count
-    // (0 = nothing played; >= _ND_PRESENCE_MIN_COMB = present-but-dropped).
-    function _notePresenceAtNote(chartNote, noteTime) {
-        if (currentArrangement !== 'bass') return 0;
-        if (_rescueBuf.length < _RESCUE_WIN) return 0;
-        const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        if (!(sr > 0)) return 0;
-        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
-        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
-        const center = _rescueBuf.length - samplesBack;
-        const start = center - (_RESCUE_WIN >> 1);
-        if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return 0;
-        const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
-        try {
-            const { magnitudes, binHz } = _ndFftMagnitude(win, sr);
+            const { magnitudes, binHz } = _ndFftMagnitude(win, sr);   // the ONE FFT
+            const total = _ndTotalEnergy(magnitudes);
+            // Per-string energy — the wrong-string / ambient signal on a miss.
+            const stringEnergy = new Array(currentStringCount);
+            for (let s = 0; s < currentStringCount; s++) {
+                const [lo, hi] = _ndStringBandHz(s, currentArrangement, currentStringCount, tuningOffsets, capo);
+                stringEnergy[s] = Math.round(_ndBandEnergy(magnitudes, binHz, lo, hi, total) * 1000) / 1000;
+            }
+            // Charted string's expected pitch + band peak — shared by both checks.
             const expectedMidi = _ndMidiFromStringFret(chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo);
             const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
             const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
@@ -4684,8 +4652,17 @@ function createNoteDetector(options = {}) {
             const hiBin = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
             let bandPk = 0;
             for (let k = loBin; k <= hiBin; k++) if (magnitudes[k] > bandPk) bandPk = magnitudes[k];
-            return _ndHarmonicCombCount(magnitudes, binHz, expHz, bandPk);
-        } catch (_) { return 0; }
+            // Mute-fail (fretted notes only): did the open string ring instead?
+            let muteFail = false;
+            if (Number.isFinite(chartNote.f) && chartNote.f > 0) {
+                const openMidi = _ndMidiFromStringFret(chartNote.s, 0, currentArrangement, currentStringCount, tuningOffsets, capo);
+                const openHz = 440 * Math.pow(2, (openMidi - 69) / 12);
+                muteFail = _ndDetectMuteFail(magnitudes, binHz, expHz, openHz, bandPk);
+            }
+            // Presence: was the expected note actually there (player played it)?
+            const presenceComb = _ndHarmonicCombCount(magnitudes, binHz, expHz, bandPk);
+            return { stringEnergy, muteFail, presenceComb };
+        } catch (_) { return blank; }
     }
 
     // Was the player SILENT at a missed note's time (stopped / didn't play),
@@ -4753,22 +4730,18 @@ function createNoteDetector(options = {}) {
                 let judgment = _tryBassRescue(chartNote, noteTime, expectedMidi);
                 if (!judgment) {
                     judgment = makeMissJudgment(chartNote, noteTime, t, expectedMidi);
-                    // Attach what rang at the note's expected time so coaching
-                    // can call wrong-string vs ambient vs not-played on the miss.
-                    const se = _perStringEnergyAtNote(noteTime);
-                    if (se) judgment.stringEnergy = se;
-                    // Open string rang in place of the fretted note? → mute/fret
-                    // fail (a valid, specific miss reason), surfaced to coaching.
-                    if (_muteFailAtNote(chartNote, noteTime)) judgment.muteFail = true;
-                    // Was the expected note actually present though the matcher
-                    // dropped it? Promotes coaching's fault verdict from a guess
-                    // to a measurement (detector_suspect → confirmed_detector_bug).
-                    const presence = _notePresenceAtNote(chartNote, noteTime);
-                    if (presence >= _ND_PRESENCE_MIN_COMB) judgment.notePresent = true;
-                    if (presence > 0) judgment.presenceComb = presence;
-                    // Was the player silent here (stopped / didn't play) vs the
-                    // detector's blind spot? Lets coaching/the LLM call "you
-                    // stopped" confidently instead of hedging every no_detection.
+                    // ONE FFT of the note's rescue window feeds all three signals
+                    // coaching reads on a miss: per-string energy (wrong-string /
+                    // ambient), mute-fail (open string rang instead of the fret),
+                    // and note-presence (player played it → confirmed_detector_bug).
+                    const an = _missAnalysisAtNote(chartNote, noteTime);
+                    if (an.stringEnergy) judgment.stringEnergy = an.stringEnergy;
+                    if (an.muteFail) judgment.muteFail = true;
+                    if (an.presenceComb >= _ND_PRESENCE_MIN_COMB) judgment.notePresent = true;
+                    if (an.presenceComb > 0) judgment.presenceComb = an.presenceComb;
+                    // Cheap (no FFT): was the player silent here (stopped / didn't
+                    // play) vs the detector's blind spot? Lets coaching/the LLM
+                    // call "you stopped" instead of hedging every no_detection.
                     if (_wasSilentAtNote(noteTime) === true) judgment.silent = true;
                 }
                 recordJudgment(key, judgment);
