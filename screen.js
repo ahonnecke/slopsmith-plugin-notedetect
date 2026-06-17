@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.34.0';
+const _ND_VERSION = '1.35.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -4567,8 +4567,15 @@ function createNoteDetector(options = {}) {
         // position, so a rescued note is credited at roughly its real moment.
         // Widened to ±160 ms (was ±120) — live drift on dense low passages was
         // landing just outside the old window and conceding present notes.
+        // PERF: 80 ms step (was 40) → 5 windows (0, ±80, ±160) instead of 9.
+        // Each window is a 16384-pt FFT on the MAIN thread inside checkMisses;
+        // a trace showed checkMisses spiking to ~20 ms (a dropped frame) on
+        // miss-heavy passages from 9 FFTs per conceded miss. The 340 ms windows
+        // overlap by ~260 ms at this step, so a mis-timed played note is still
+        // caught — only the sampling between ±160 ms is coarser. Keeps the full
+        // ±160 ms reach (the drift coverage from the widen).
         const SEARCH = Math.round(0.16 * sr);
-        const STEP = Math.round(0.04 * sr);
+        const STEP = Math.round(0.08 * sr);
         const maxK = Math.floor(SEARCH / STEP);
         // Cheap early-out: the center window is 340 ms wide and the search only
         // ±160 ms, so a note anywhere in range contributes energy to the CENTER
